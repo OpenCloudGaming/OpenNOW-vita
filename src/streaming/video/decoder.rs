@@ -214,9 +214,11 @@ mod vita {
                                 reserved: [0; 14],
                             },
                         },
-                        // Second plane pointer: Vita3K writes all planes contiguously through
-                        // pPicture[0], but real hardware expects the chroma base here for
-                        // YUV output. Points just past the luma plane either way.
+                        // Second plane pointer, only exercised by the Vita3K-only Iyuv
+                        // fallback (real hardware always uses Bgr565 - see
+                        // `shell::surface::ensure_direct_video_output`). Vita3K writes all
+                        // planes contiguously through pPicture[0]; this offset is unverified
+                        // against real AVCDEC firmware and should not be relied on there.
                         pPicture: match format {
                             VideoPixelFormat::Bgr565 => {
                                 [output_ptr.cast(), std::ptr::null_mut()]

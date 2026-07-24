@@ -26,6 +26,11 @@ pub struct VitaSurface {
     video_height: u32,
     last_frame_id: u64,
     egui_painter: SdlEguiPainter,
+    /// Set once the decode thread reports Bgr565 is producing blank frames (Vita3K's HLE
+    /// AVCDEC gap - see `streaming::video::worker::BLANK_FRAME_FALLBACK_STREAK`). Sticky for
+    /// the rest of the process: once we know Bgr565 doesn't actually work in this environment,
+    /// there's no reason to keep retrying it on every subsequent stream.
+    force_iyuv: bool,
 }
 
 impl VitaSurface {
@@ -55,6 +60,7 @@ impl VitaSurface {
             video_height: 0,
             last_frame_id: 0,
             egui_painter: SdlEguiPainter::default(),
+            force_iyuv: false,
         })
     }
 
@@ -70,6 +76,13 @@ impl VitaSurface {
             self.detach_direct_video_output();
             return Ok(());
         };
+        if !self.force_iyuv
+            && let Some(output) = &self.direct_video_output
+            && output.take_format_fallback_request()
+        {
+            self.force_iyuv = true;
+            self.detach_direct_video_output();
+        }
         self.ensure_direct_video_output(streaming)?;
 
         let Some((frame_id, frame)) = streaming.video_frame() else {
@@ -108,10 +121,19 @@ impl VitaSurface {
 
         self.detach_direct_video_output();
         let (width, height) = (output.width, output.height);
-        // Prefer planar YUV: Vita3K's sceAvcdec only implements YUV420 output (RGBA decodes
-        // to silent black), and it saves the color conversion on real hardware too. Fall back
-        // to BGR565 when the renderer can't do IYUV textures.
-        let mut format = VideoPixelFormat::Iyuv;
+        // Prefer BGR565: this is the decode contract green-vita ships and has proven on real
+        // Vita hardware (single RGBA565 output plane, no chroma-plane pointer guesswork). IYUV
+        // was tried as the default here to work around Vita3K's HLE AVCDEC only implementing
+        // YUV420 output, but on real hardware the untested YUV420_RASTER/chroma-pointer path
+        // produced black frames and constant decoder-recreate stalls (see
+        // `HwVideoDecoder::decode`'s pPicture comment) - so real hardware now gets the proven
+        // format and only the emulator falls back to IYUV, via the pitch-mismatch check below.
+        // `force_iyuv` is set once the decode thread has proven Bgr565 doesn't actually work
+        // in this environment (see `DirectVideoOutput::request_format_fallback`) - skip
+        // straight to Iyuv instead of re-discovering the same blank-frame streak on every
+        // subsequent stream.
+        let force_iyuv = self.force_iyuv;
+        let mut format = VideoPixelFormat::Bgr565;
         let mut create_pair = |pixel_format: PixelFormatEnum| -> Result<[Texture; 2]> {
             let mut create_one = || {
                 self.canvas
@@ -121,12 +143,17 @@ impl VitaSurface {
             };
             Ok([create_one()?, create_one()?])
         };
-        let mut textures = match create_pair(PixelFormatEnum::IYUV) {
-            Ok(textures) => textures,
-            Err(error) => {
-                eprintln!("IYUV video textures unavailable ({error:#}); using BGR565");
-                format = VideoPixelFormat::Bgr565;
-                create_pair(PixelFormatEnum::BGR565)?
+        let mut textures = if force_iyuv {
+            format = VideoPixelFormat::Iyuv;
+            create_pair(PixelFormatEnum::IYUV)?
+        } else {
+            match create_pair(PixelFormatEnum::BGR565) {
+                Ok(textures) => textures,
+                Err(error) => {
+                    eprintln!("BGR565 video textures unavailable ({error:#}); using IYUV");
+                    format = VideoPixelFormat::Iyuv;
+                    create_pair(PixelFormatEnum::IYUV)?
+                }
             }
         };
         let mut targets = [VideoTextureTarget {
@@ -147,8 +174,11 @@ impl VitaSurface {
                 .context("failed to lock direct SDL video texture")?;
         }
         // For IYUV the decoder writes tightly-packed planes at exactly `width` bytes per luma
-        // row; a padded SDL pitch would skew every row, so fall back to BGR565 if they differ.
-        if format == VideoPixelFormat::Iyuv
+        // row; a padded SDL pitch would skew every row, so fall back to BGR565 if they differ -
+        // unless we're here *because* Bgr565 was already proven not to work, in which case
+        // falling back to it would just reintroduce the blank-frame bug.
+        if !force_iyuv
+            && format == VideoPixelFormat::Iyuv
             && targets.iter().any(|target| target.pitch != width)
         {
             eprintln!(

@@ -50,6 +50,19 @@ const DEFAULT_STREAM_HEIGHT: u32 = 720;
 // feeds that channel, so it shouldn't hold more backlog than the channel behind it does.
 const MAX_PENDING_AUDIO_PACKETS: usize = 6;
 
+/// Pins the calling thread to the given user-CPU mask, logging (not failing) on error - a
+/// missed pin just risks scheduler jitter, not correctness. Mirrors
+/// `streaming::video::worker::pin_decoder_thread`.
+#[cfg(target_os = "vita")]
+fn pin_thread_to_cpu(mask: u32, thread_label: &str) {
+    let thread_id = unsafe { vitasdk_sys::sceKernelGetThreadId() };
+    let result =
+        unsafe { vitasdk_sys::sceKernelChangeThreadCpuAffinityMask(thread_id, mask as i32) };
+    if result < 0 {
+        eprintln!("Failed to pin {thread_label} thread to CPU mask {mask:#x}: {result:#x}");
+    }
+}
+
 /// The resolution NVIDIA actually streams at, per the session response.
 fn stream_dimensions(session: &SessionInfo) -> (u32, u32) {
     session
@@ -126,6 +139,11 @@ impl PeerEngine {
         std::thread::Builder::new()
             .name("jade-vita-peer".to_owned())
             .spawn(move || {
+                // Pin to the same core green-vita's RTC worker uses, so the OS scheduler can't
+                // migrate/contend this thread against the UI (default core) or video decode
+                // (pinned to USER_2 - see streaming::video::worker) threads under load.
+                #[cfg(target_os = "vita")]
+                pin_thread_to_cpu(vitasdk_sys::SCE_KERNEL_CPU_MASK_USER_1, "peer");
                 // The sans-I/O peer loop gets its own runtime so its socket/timer waits never
                 // touch the single-threaded runtime driving the UI (see main.rs).
                 let runtime = match tokio::runtime::Builder::new_current_thread()

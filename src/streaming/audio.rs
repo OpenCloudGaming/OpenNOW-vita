@@ -38,6 +38,19 @@ const MAX_PENDING_PCM_BUFFERS: usize = 3;
 
 const OPUS_OK: i32 = 0;
 
+/// Pins the calling thread to the given user-CPU mask, logging (not failing) on error - a
+/// missed pin just risks scheduler jitter, not correctness. Mirrors
+/// `streaming::video::worker::pin_decoder_thread` / `gfn::peer::pin_thread_to_cpu`.
+#[cfg(target_os = "vita")]
+fn pin_thread_to_cpu(mask: u32, thread_label: &str) {
+    let thread_id = unsafe { vitasdk_sys::sceKernelGetThreadId() };
+    let result =
+        unsafe { vitasdk_sys::sceKernelChangeThreadCpuAffinityMask(thread_id, mask as i32) };
+    if result < 0 {
+        eprintln!("Failed to pin {thread_label} thread to CPU mask {mask:#x}: {result:#x}");
+    }
+}
+
 #[repr(C)]
 struct OpusDecoderState {
     _private: [u8; 0],
@@ -223,6 +236,11 @@ fn spawn_decode_worker() -> Result<(SyncSender<Bytes>, Receiver<Vec<i16>>)> {
     std::thread::Builder::new()
         .name("jade-vita-audio-decode".to_owned())
         .spawn(move || {
+            // Opus decode is cheap (see module docs), so this shares the peer/network
+            // thread's core rather than claiming a dedicated one - the goal here is just to
+            // stop the scheduler migrating it, not to isolate it the way video decode is.
+            #[cfg(target_os = "vita")]
+            pin_thread_to_cpu(vitasdk_sys::SCE_KERNEL_CPU_MASK_USER_1, "audio-decode");
             let mut decode_buf = vec![0i16; MAX_OPUS_FRAME_SAMPLES_PER_CHANNEL * AUDIO_CHANNELS];
             while let Ok(packet) = packets_rx.recv() {
                 let samples_per_channel = match decoder.decode(&packet, &mut decode_buf) {

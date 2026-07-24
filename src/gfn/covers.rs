@@ -195,7 +195,14 @@ async fn fetch_and_decode(client: &Client, url: &str) -> Result<TitleImage> {
         .bytes()
         .await
         .context("failed to read cover response body")?;
-    decode_rgba(&bytes)
+    // `covers::request`'s task runs on the same single-threaded tokio runtime as the render
+    // loop (see module docs above) - decoding a JPEG and resizing it synchronously here would
+    // stall that runtime, and with it every frame's UI/input polling, for the duration of the
+    // decode. `spawn_blocking` moves that CPU-bound work onto tokio's separate blocking-thread
+    // pool so the render loop keeps ticking while covers decode in the background.
+    tokio::task::spawn_blocking(move || decode_rgba(&bytes))
+        .await
+        .context("cover decode task panicked")?
 }
 
 /// Decodes JPEG/PNG bytes to RGBA. Resizes if larger than `MAX_COVER_DIM` along its largest

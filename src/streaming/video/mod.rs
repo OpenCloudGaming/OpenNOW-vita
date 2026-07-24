@@ -18,9 +18,10 @@ use std::time::Duration;
 
 /// Pixel format negotiated between the render thread (which knows what SDL texture formats
 /// the platform supports) and the decoder (which asks sceAvcdec for matching output).
-/// Vita3K's sceAvcdec only implements YUV420 output (RGBA silently produces black frames),
-/// while SDL's GXM renderer on real hardware is happiest with RGB565 - so the surface tries
-/// IYUV first and falls back, recording its choice here for the decoder to follow.
+/// Bgr565 is the default: it's the exact decode contract green-vita ships and has proven on
+/// real Vita hardware. Iyuv only exists as a fallback for Vita3K's HLE AVCDEC, whose YUV420
+/// output path is emulator-only - on real hardware it produced black frames, so the surface
+/// tries Bgr565 first and records its choice here for the decoder to follow.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VideoPixelFormat {
     Bgr565,
@@ -58,6 +59,13 @@ pub struct DirectVideoOutput {
     /// 0 = not yet registered, 1 = Bgr565, 2 = Iyuv. Set by the render thread together with
     /// `set_targets`; read by the decode thread on every frame.
     pixel_format: AtomicU8,
+    /// Set by the decode thread when Bgr565 keeps decoding "successfully" but the output is
+    /// suspiciously blank - Vita3K's HLE AVCDEC silently zeroes RGB565 output instead of
+    /// erroring (see `worker::BLANK_FRAME_FALLBACK_STREAK`), so a decode error is not a
+    /// reliable signal there. The render thread polls this once per frame and, if set, forces
+    /// the Iyuv fallback instead of retrying Bgr565 (which real hardware needs and proved
+    /// correct, so this must never fire spuriously there).
+    format_fallback_requested: AtomicBool,
     pub width: u32,
     pub height: u32,
 }
@@ -74,9 +82,21 @@ impl DirectVideoOutput {
             frame_displayed: Condvar::new(),
             decoder_ready: AtomicBool::new(false),
             pixel_format: AtomicU8::new(0),
+            format_fallback_requested: AtomicBool::new(false),
             width,
             height,
         }
+    }
+
+    /// Called by the decode thread once it's confident Bgr565 isn't actually working here
+    /// (see `worker::BLANK_FRAME_FALLBACK_STREAK`).
+    pub fn request_format_fallback(&self) {
+        self.format_fallback_requested.store(true, Ordering::Release);
+    }
+
+    /// Polled once per frame by the render thread; clears the flag on read.
+    pub fn take_format_fallback_request(&self) -> bool {
+        self.format_fallback_requested.swap(false, Ordering::AcqRel)
     }
 
     pub fn set_pixel_format(&self, format: VideoPixelFormat) {

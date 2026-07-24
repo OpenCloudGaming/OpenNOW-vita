@@ -5,7 +5,7 @@
 // `(frame id, DecodedFrame)` slot the shell polls. See THIRD_PARTY_NOTICES.md.
 
 use super::decoder::HwVideoDecoder;
-use super::{DecodedFrame, DecoderConfig, DirectVideoOutput};
+use super::{DecodedFrame, DecoderConfig, DirectVideoOutput, VideoPixelFormat, VideoTextureTarget};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased, unbounded};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -15,6 +15,28 @@ use std::sync::{Arc, Mutex};
 // Two compressed frames of queue (~66ms at 30 fps) - green-vita's minimum. Anything deeper
 // converts network jitter into steady-state latency; when the queue is full we drop instead.
 const MAX_PENDING_ACCESS_UNITS: usize = 2;
+
+// Vita3K's HLE AVCDEC doesn't error on Bgr565 output - it just leaves the buffer zeroed (see
+// `shell::surface::ensure_direct_video_output`'s comment). A single black frame can happen on
+// real hardware too (e.g. a black loading screen in the streamed game), so only treat a long
+// run of *consecutive* blank "successful" decodes as the emulator signal, not one frame.
+const BLANK_FRAME_FALLBACK_STREAK: u32 = 30;
+// How many leading bytes of the output buffer to sample - cheap, and real video content is
+// never actually all-zero across this many bytes in the frame's top-left corner.
+const BLANK_FRAME_SAMPLE_BYTES: usize = 512;
+
+/// Best-effort check for "the decoder said it produced a frame, but the buffer is all zero" -
+/// see `BLANK_FRAME_FALLBACK_STREAK`.
+fn output_looks_blank(target: VideoTextureTarget) -> bool {
+    let len = (target.capacity as usize).min(BLANK_FRAME_SAMPLE_BYTES);
+    if len == 0 {
+        return false;
+    }
+    // SAFETY: `target` was just written into by `HwVideoDecoder::decode` on this same thread;
+    // `len` is bounded by the texture's own reported capacity.
+    let sample = unsafe { std::slice::from_raw_parts(target.ptr as *const u8, len) };
+    sample.iter().all(|&byte| byte == 0)
+}
 
 struct QueuedAccessUnit {
     data: Vec<u8>,
@@ -123,6 +145,7 @@ fn run_decode_loop(
 ) {
     let mut decoder = Some(initial_decoder);
     let mut frame_id: u64 = 0;
+    let mut blank_streak: u32 = 0;
 
     loop {
         select_biased! {
@@ -143,6 +166,7 @@ fn run_decode_loop(
                     &mut frame_id,
                     access_unit,
                     &direct_output,
+                    &mut blank_streak,
                 );
             }
         }
@@ -157,6 +181,7 @@ fn decode_queued_access_unit(
     frame_id: &mut u64,
     access_unit: QueuedAccessUnit,
     direct_output: &DirectVideoOutput,
+    blank_streak: &mut u32,
 ) {
     if access_unit.generation != generation.load(Ordering::Acquire) {
         return;
@@ -193,6 +218,21 @@ fn decode_queued_access_unit(
 
     match decode_result {
         Ok(Ok(true)) => {
+            if pixel_format == VideoPixelFormat::Bgr565 {
+                if output_looks_blank(direct_target.target()) {
+                    *blank_streak += 1;
+                    if *blank_streak >= BLANK_FRAME_FALLBACK_STREAK {
+                        eprintln!(
+                            "Bgr565 decoded {BLANK_FRAME_FALLBACK_STREAK} frames in a row with \
+                             blank output (Vita3K-style HLE gap); requesting Iyuv fallback"
+                        );
+                        direct_output.request_format_fallback();
+                        *blank_streak = 0;
+                    }
+                } else {
+                    *blank_streak = 0;
+                }
+            }
             let (texture_index, generation) = direct_target.publish();
             *frame_id += 1;
             if let Ok(mut slot) = latest_frame.lock() {

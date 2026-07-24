@@ -1,3 +1,6 @@
 reference/
 /target
 /docs
+/.claude
+/.agents
+skills-lock.json

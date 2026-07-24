@@ -23,6 +23,11 @@ const DIRECTION_REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(350);
 const DIRECTION_REPEAT_INTERVAL: Duration = Duration::from_millis(90);
 
 pub(crate) const TARGET_FRAME_TIME: Duration = Duration::from_millis(16);
+// How often the end-of-frame wait wakes up to drain SDL's event queue and refresh the
+// streamed gamepad state, mirroring green-vita's `STREAM_INPUT_POLL_INTERVAL`. A single long
+// sleep left input events queued (and the game's controller state stale) for up to a whole
+// frame; polling every 4ms keeps both close to real-time without busy-waiting.
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(4);
 
 pub async fn run(mut app: App) -> Result<()> {
     let sdl = sdl2::init().map_err(anyhow::Error::msg)?;
@@ -202,9 +207,23 @@ pub async fn run(mut app: App) -> Result<()> {
         )?;
 
         let frame_deadline = loop_started_at + TARGET_FRAME_TIME;
-        let now = Instant::now();
-        if now < frame_deadline {
-            sleep(frame_deadline - now).await;
+        if Instant::now() < frame_deadline {
+            while Instant::now() < frame_deadline {
+                let remaining = frame_deadline.saturating_duration_since(Instant::now());
+                sleep(remaining.min(INPUT_POLL_INTERVAL)).await;
+                if Instant::now() >= frame_deadline {
+                    break;
+                }
+                // Drain SDL's controller/button events independently of the render pass so a
+                // long tail of the frame budget doesn't leave input stale - events themselves
+                // stay queued for the normal mapping pass at the top of the next frame.
+                event_pump.pump_events();
+                if let (AppState::Streaming { peer, .. }, Some(active_controller)) =
+                    (&app.state, controller.as_ref())
+                {
+                    peer.send_gamepad(gamepad_snapshot(active_controller));
+                }
+            }
         } else {
             tokio::task::yield_now().await;
         }
