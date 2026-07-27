@@ -1,88 +1,87 @@
-screen-signing-in = INICIANDO SESIÓN
-screen-token-setup = CONFIGURAR TOKEN
-screen-mode-select = ELEGIR MODO
-screen-cloud-titles = TÍTULOS EN LA NUBE
-screen-consoles = CONSOLAS
-screen-connecting = CONECTANDO
-screen-streaming = STREAMING
-screen-paused = MENÚ RÁPIDO
-screen-settings = AJUSTES
-screen-error = ERROR
+# Login / flujo de código de dispositivo
+login-subtitle = Cliente no oficial de GeForce NOW para PS Vita
+login-hint = Pulsa Confirmar (X) para iniciar sesión con tu cuenta de NVIDIA.
+login-last-input = Última entrada detectada: { $input }
+login-requesting-code = Solicitando un código de acceso a NVIDIA...
 
-menu-settings = Ajustes
-menu-logout = Cerrar sesión de NVIDIA
+device-title = Inicia sesión en otro dispositivo
+device-step-open = 1. Abre esta dirección en el navegador de tu teléfono u ordenador:
+device-step-scan = 2. O escanea el código QR e introduce este código:
+device-waiting = Esperando a que completes el inicio de sesión... (Atrás para cancelar)
 
-settings-cloud = Nube
-settings-home = Casa
-settings-locale = Idioma/región
-settings-game = Ajustes del juego
-settings-swap-shoulders-triggers = Intercambiar L1/L2 y R1/R2
-settings-front-touch-auxiliary-buttons = Usar la pantalla táctil frontal para L2/R2/L3/R3 en vez del ratón
-settings-rear-touch-enabled = Activar controles del panel táctil trasero
-settings-cloud-host = Host de la nube: { $host }
-settings-home-host = Host local: { $host }
-settings-stream-debug-info = Mostrar información de depuración del streaming
-action-back = Atrás
-
-mode-select-cloud-subtitle = Juegos mediante GeForce NOW
-mode-select-home-subtitle = Aún no implementado — usa xVita por ahora
-
-paused-resume = Volver al juego
-paused-nvidia-button = Botón NVIDIA
-paused-exit-game = Salir del juego
-
-streaming-hold-back = Mantén Back para abrir el menú rápido
-connecting-cancel = Pulsa Círculo para cancelar
-token-starting-sign-in = Iniciando sesión en NVIDIA...
-token-at-uri = en { $uri }
-
-title-loading = Cargando títulos...
-title-select-details = Selecciona un título para ver detalles
-title-play = ▶ JUGAR
-title-no-description = No hay descripción disponible
-title-search = Buscar juegos...
-title-search-empty = No se encontraron juegos
-screen-language-select = IDIOMA
-language-select-prompt = Elige el idioma de la aplicación antes de iniciar sesión.
-language-select-continue = Continuar al inicio de sesión
-token-source-warning = Aviso de seguridad: descarga GreenVita únicamente desde GitHub (Day-OS/green-vita) o VitaDB. Ten cuidado con versiones de cualquier otra fuente.
-signing-in-starting = Iniciando GreenVita...
-signing-in-requesting-code = Solicitando inicio de sesión de NVIDIA...
-signing-in-loading-credentials = Iniciando sesión en NVIDIA...
-title-requesting = Solicitando lista de juegos...
-title-none-returned = No se devolvieron juegos
-title-token-hint = Comprueba la autenticación y el servidor de GeForce NOW
-console-requesting = Solicitando lista de consolas...
-console-none-returned = No se devolvieron consolas
-console-remote-play-hint = Comprueba que Uso a distancia esté activado en NVIDIA
-console-token-hint = Comprueba la autenticación y el servidor de NVIDIA Home
-console-account-hint = La consola debe usar la misma cuenta NVIDIA
-connecting-target = Destino: { $value }
-connecting-session-preparing = Sesión: preparando
-connecting-starting = Iniciando transmisión para { $value }
-connecting-session = Sesión: { $value }
-connecting-status = Estado: { $value }
-stream-state-starting = Iniciando
-stream-state-provisioning = Preparando la sesión
-stream-state-queued-seconds = En cola — espera estimada de { $first }s
-stream-state-queued-minutes = En cola — espera estimada de { $first }m { $seconds }s
-stream-state-queued = En cola — esperando un servidor libre
-stream-state-handshake = Finalizando autenticación
-stream-state-ready = Listo
-stream-state-failed = Falló
-error-sign-in-request = Error al solicitar el inicio de sesión
-error-title-request = Error al solicitar los juegos
-error-console-request = Error al solicitar las consolas
-error-start-stream = Error al iniciar la transmisión
-error-webrtc-negotiation = Error de negociación WebRTC
-error-stream-state = Error al comprobar la transmisión
-error-webrtc-session = Error en la sesión WebRTC
-error-stream-ended = La sesión de transmisión terminó
-error-technical-details = Detalles técnicos: { $error }
-
-catalog-search-hint = [ ] Buscar juegos...
+# Catálogo
+catalog-welcome = Bienvenido, { $name }
+catalog-loading = Cargando tu catálogo de GeForce NOW...
+catalog-search-hint = Buscar juegos...
 catalog-search-button = Buscar
-catalog-showing-count = Mostrando { $shown } de { $total } juegos
+catalog-library-title = JUEGOS EN LA NUBE
+catalog-sort-button = Orden: { $sort }
+catalog-sort-last-played = Jugado recientemente
+catalog-sort-relevance = Recomendado
+catalog-sort-title-asc = Título (A-Z)
+catalog-sort-title-desc = Título (Z-A)
 catalog-no-games-api = No se encontraron juegos disponibles (la API no devolvió ninguno).
 catalog-no-match = Ningún juego coincide con la búsqueda.
-catalog-footer-hint = Arriba/Abajo/Izquierda/Derecha para navegar · Confirmar (X) para ver detalle · Atrás (O) para volver
+catalog-footer-hint = Arriba/Abajo para navegar · Confirmar (X) para jugar · Atrás (O) para limpiar la búsqueda
+catalog-count = { $shown } de { $total }
+catalog-count-loading = { $shown } de { $total } · cargando más...
+
+# Panel de detalle (lado derecho del catálogo)
+detail-play = JUGAR
+detail-app-id = ID de aplicación: { $id }
+detail-last-played = Última partida: { $date }
+detail-never-played = Nunca jugado con esta cuenta
+detail-press = Pulsa
+detail-to-start = para empezar
+detail-play-hint = Pulsa Confirmar (X) o toca JUGAR para empezar a transmitir este juego.
+detail-empty = Selecciona un juego de la lista para ver sus detalles.
+
+# Creación de sesión / cola
+session-creating-title = Iniciando transmisión
+session-stop-button = Detener sesión
+session-preparing-game = Preparando una sesión para "{ $game }"...
+session-preparing = Preparando sesión...
+session-queue-position = Posición en la cola de NVIDIA: n.º { $position }
+session-eta-minutes = Espera estimada: ~{ $minutes } min { $seconds } s
+session-eta-seconds = Espera estimada: ~{ $seconds } segundos
+session-queue-live = Actualizando el estado en directo (comprobación { $attempt })...
+session-connecting-attempt = Conectando con el servidor de NVIDIA (comprobación { $attempt })...
+session-waiting-ready = Esperando a que el servidor de NVIDIA esté listo...
+session-exit-hint = Toca "Detener sesión" o pulsa Atrás (O) para confirmar la salida
+
+# Sesión lista (pantalla de depuración/transición)
+session-ready-title = Sesión lista
+session-game = Juego: { $game }
+session-id = ID de sesión: { $id }
+session-server-ip = IP del servidor: { $ip }
+session-signaling = Señalización: { $server }
+session-signaling-url = URL de señalización: { $url }
+session-resolution = Resolución: { $value }
+session-fps = FPS: { $value }
+session-codec = Códec: { $value }
+session-ready-hint = Pulsa Confirmar (X) para conectar la señalización de NVIDIA.
+session-ready-footer = Confirmar (X) para conectar · Toca "Detener sesión" para salir
+
+# Señalización WebRTC
+signaling-title = Señalización
+signaling-session = Sesión: { $id }
+signaling-offer-received = Offer SDP recibido ({ $bytes } bytes).
+signaling-waiting-offer = Esperando el offer SDP del servidor de GFN...
+
+# Confirmación de salida
+exit-window-title = Confirmar salida
+exit-heading = ¿Detener la sesión de transmisión?
+exit-body = ¿Seguro que quieres salir y cancelar la sesión activa de GeForce NOW?
+exit-cancel = Volver a la sesión
+exit-confirm = Sí, salir y detener
+
+# Transmisión
+streaming-game = Transmitiendo "{ $game }"
+streaming-generic = Transmitiendo juego...
+streaming-signaling-done = Señalización WebRTC e intercambio SDP completados
+streaming-waiting-negotiation = Esperando la negociación WebRTC...
+
+# Errores
+error-title = Error
+error-hint = Confirmar o Atrás para volver.
+error-game-not-found = No se encontró el juego seleccionado.

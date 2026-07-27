@@ -42,6 +42,12 @@ pub enum AppCommand {
     ConfirmExitSession,
     /// Emitted by the catalog screen's language picker.
     SetLocale(crate::locale::Locale),
+    /// Emitted by the catalog screen's sort picker.
+    SetSort(crate::app::CatalogSort),
+    /// Emitted when a row in the catalog list is tapped/clicked. Carries an index into
+    /// `filtered_indices` (same space as `AppState::Catalog::selected`), so the touchscreen can
+    /// move the selection without going through d-pad navigation.
+    SelectGame(usize),
 }
 
 impl From<InputCommand> for AppCommand {

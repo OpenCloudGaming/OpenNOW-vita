@@ -3,7 +3,7 @@ pub mod ui;
 use crate::gfn::auth::{self, AuthTokens, DeviceCodeChallenge, DevicePollOutcome, GfnUser};
 use crate::gfn::catalog::{self, GameSummary};
 use crate::gfn::cloudmatch::{self, SessionInfo};
-use crate::gfn::covers::CoverStore;
+use crate::gfn::covers::{self, CoverStore};
 use crate::gfn::signaling::{self, SignalingEvent, SignalingHandle};
 use crate::input::{AppCommand, InputCommand};
 use crate::jobs::{PollJob, poll_job};
@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 pub enum ErrorRetry {
     RestartLogin,
     ReloadCatalog(GfnUser),
-    BackToGameDetail {
+    BackToCatalog {
         user: GfnUser,
         games: Vec<GameSummary>,
         selected: usize,
@@ -29,50 +29,160 @@ pub enum ErrorRetry {
     },
 }
 
-/// How many game tiles fit side-by-side on the Vita's 960x544 display at our UI scale. Picked
-/// empirically to leave room for legible titles under each cover without forcing horizontal
-/// scrolling; exposed as a sibling module-level const so `move_in_grid` and the renderer in
-/// `app::ui::catalog_screen` agree on the geometry.
-pub(crate) const GRID_COLUMNS: usize = 4;
-
 #[derive(Clone, Copy)]
-enum GridStep {
+enum ListStep {
     Up,
     Down,
-    Left,
-    Right,
 }
 
-/// Moves `selected` through the grid by one cell in `step`'s direction, clamping at the
-/// edges/matrix bounds. Rows and columns match what the renderer draws (`GRID_COLUMNS` per
-/// row); `Left`/`Right` wrap across the last row's ragged end without going out of range.
-fn move_in_grid(len: usize, columns: usize, selected: usize, step: GridStep) -> usize {
+/// Moves `selected` through the single-column library list by one row in `step`'s direction,
+/// clamping at either end.
+fn move_in_list(len: usize, selected: usize, step: ListStep) -> usize {
     if len == 0 {
         return selected;
     }
     let max = len - 1;
-    let next = match step {
-        GridStep::Up => selected.saturating_sub(columns),
-        GridStep::Down => (selected + columns).min(max),
-        GridStep::Left => selected.saturating_sub(1),
-        GridStep::Right => (selected + 1).min(max),
-    };
-    next
+    match step {
+        ListStep::Up => selected.saturating_sub(1),
+        ListStep::Down => (selected + 1).min(max),
+    }
 }
 
-/// Returns the indices of `games` whose title contains `query` (case-insensitive). An empty
-/// query returns all indices.
-fn filter_indices(games: &[GameSummary], query: &str) -> Vec<usize> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return (0..games.len()).collect();
+/// Library sort order, picked from the catalog screen's sort dropdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatalogSort {
+    /// Most-recently-launched-by-this-account first (`GameSummary::last_played`), titles never
+    /// played pushed to the end in whatever order they already had. Mirrors OpenNOW/GFN's own
+    /// default "Last Played" library view - the default here too.
+    #[default]
+    LastPlayed,
+    /// GFN's own server-side ranking (relevance + name) - the order `games` already arrives
+    /// in, so this is a no-op past filtering.
+    Relevance,
+    TitleAsc,
+    TitleDesc,
+}
+
+impl CatalogSort {
+    pub const ALL: [CatalogSort; 4] =
+        [Self::LastPlayed, Self::Relevance, Self::TitleAsc, Self::TitleDesc];
+
+    /// Fluent message id for this option's label in the sort dropdown.
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Self::LastPlayed => "catalog-sort-last-played",
+            Self::Relevance => "catalog-sort-relevance",
+            Self::TitleAsc => "catalog-sort-title-asc",
+            Self::TitleDesc => "catalog-sort-title-desc",
+        }
     }
-    games
-        .iter()
-        .enumerate()
-        .filter(|(_, game)| game.title.to_lowercase().contains(&query))
-        .map(|(index, _)| index)
-        .collect()
+}
+
+/// How many catalog pages (`CATALOG_PAGE_SIZE` titles each) are walked before we stop. Pages
+/// stream in behind the UI, so this trades background requests on the Vita's single Wi-Fi radio
+/// for how much of the catalog is reachable by scrolling. ~1000 titles is about 400 KiB of
+/// `GameSummary`, negligible next to one decoded cover.
+///
+/// Server-side search reaches the *whole* catalog regardless of this cap, so it only bounds
+/// browsing. The reference client stops at 3 pages of 120.
+const MAX_CATALOG_PAGES: usize = 5;
+
+/// Which local filter to apply on top of a set of server results.
+///
+/// When the server answered the query that's still in the search box, its results are already
+/// the answer - and it matched on more than the title (publisher, aliases), so re-applying our
+/// title-only filter would *drop* legitimate hits. Once the user types further, the extra
+/// characters haven't been sent yet, so narrowing locally is exactly right.
+fn effective_local_query<'a>(typed: &'a str, server_query: &str) -> &'a str {
+    if typed.trim().eq_ignore_ascii_case(server_query.trim()) {
+        ""
+    } else {
+        typed
+    }
+}
+
+/// Cursor-pagination bookkeeping for the catalog currently in `AppState::Catalog`.
+#[derive(Default)]
+struct CatalogPaging {
+    /// The server query these pages belong to (`""` = plain browse). Also what
+    /// `effective_local_query` compares the search box against.
+    server_query: String,
+    /// Cursor for the next page, `None` once the server says there are no more.
+    next_cursor: Option<String>,
+    pages_loaded: usize,
+    total_count: Option<usize>,
+    /// In-flight next-page fetch, tagged with the `generation` it was spawned under.
+    job: Option<(u64, PollJob<catalog::CatalogPage>)>,
+    /// Bumped whenever `games` is replaced wholesale (new search, reload). `PollJob` carries no
+    /// identity of its own, so this is what stops page 2 of a superseded query being appended
+    /// onto a different result set - which would silently corrupt the list rather than fail.
+    generation: u64,
+}
+
+impl CatalogPaging {
+    /// Resets to "page 1 of `server_query` just landed", invalidating any in-flight page job.
+    fn restart(&mut self, server_query: String, page: &catalog::CatalogPage) {
+        self.abort_job();
+        self.generation = self.generation.wrapping_add(1);
+        self.server_query = server_query;
+        self.next_cursor = page.next_cursor.clone();
+        self.pages_loaded = 1;
+        self.total_count = page.total_count;
+    }
+
+    fn abort_job(&mut self) {
+        if let Some((_, PollJob::Pending(handle))) = self.job.take() {
+            handle.abort();
+        }
+    }
+
+    fn has_more(&self) -> bool {
+        self.next_cursor.is_some() && self.pages_loaded < MAX_CATALOG_PAGES
+    }
+}
+
+/// Returns the indices of `games` whose title contains `query` (case-insensitive), ordered per
+/// `sort`. An empty query keeps every index before sorting.
+///
+/// Runs on every keystroke, so it leans entirely on `GameSummary::search_key` (lowercased once
+/// at parse time): the needle is lowercased once per call and nothing else allocates.
+fn filter_indices(games: &[GameSummary], query: &str, sort: CatalogSort) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    let mut indices: Vec<usize> = if query.is_empty() {
+        (0..games.len()).collect()
+    } else {
+        games
+            .iter()
+            .enumerate()
+            .filter(|(_, game)| game.search_key.contains(&query))
+            .map(|(index, _)| index)
+            .collect()
+    };
+    match sort {
+        CatalogSort::Relevance => {}
+        // Unstable is fine here: `search_key` ties are titles that differ only by case, whose
+        // relative order isn't meaningful.
+        CatalogSort::TitleAsc => {
+            indices.sort_unstable_by(|&a, &b| games[a].search_key.cmp(&games[b].search_key))
+        }
+        CatalogSort::TitleDesc => {
+            indices.sort_unstable_by(|&a, &b| games[b].search_key.cmp(&games[a].search_key))
+        }
+        CatalogSort::LastPlayed => {
+            // `last_played` is an ISO-8601 string, so plain string comparison already sorts
+            // chronologically. `None` (never played) sorts after every `Some`, keeping its
+            // relative order (stable sort) rather than being interleaved by title.
+            indices.sort_by(|&a, &b| {
+                match (&games[a].last_played, &games[b].last_played) {
+                    (Some(x), Some(y)) => y.cmp(x),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            })
+        }
+    }
+    indices
 }
 
 /// Top-level screen the shell is currently rendering.
@@ -88,10 +198,11 @@ pub enum AppState {
         poll_job: Option<PollJob<DevicePollOutcome>>,
         next_poll_at: Instant,
     },
-    /// Fetching the VPC id + browsable game catalog after a successful (or restored) login.
+    /// Fetching the VPC id + the catalog's first page after a successful (or restored) login.
+    /// Later pages stream in from `advance_catalog_paging` once we're already on `Catalog`.
     LoadingCatalog {
         user: GfnUser,
-        job: PollJob<Vec<GameSummary>>,
+        job: PollJob<catalog::CatalogPage>,
     },
     /// Fase 2 stops here - Fase 3 adds actually creating a streaming session for the selected
     /// game (`games[selected].app_id`) instead of just showing a placeholder note.
@@ -105,7 +216,7 @@ pub enum AppState {
         search_query: String,
         /// Set to `true` when the user presses the search button; the shell uses SDL's text input
         /// API to open the system/on-screen keyboard and feed the resulting text back via
-        /// `AppCommand::SetSearchQuery`. Mirrors green-vita's `title_search_requested`.
+        /// `AppCommand::SetSearchQuery`.
         search_requested: bool,
         /// Shared cover-art cache: lazily filled by async download tasks spawned from the UI
         /// loop as tiles become visible (see `app::ui::catalog_screen`). The `Arc` lets the
@@ -115,21 +226,8 @@ pub enum AppState {
         /// from this screen.
         covers: CoverStore,
     },
-    /// Detail view for a single game, opened from the catalog grid with Confirm (×).
-    /// Keeps the same `games`/`selected`/`filtered_indices`/`search_query`/`search_requested`/
-    /// `covers` so Back returns to the catalog without refetching anything and preserving scroll
-    /// position / cover cache / search state.
-    GameDetail {
-        user: GfnUser,
-        games: Vec<GameSummary>,
-        selected: usize,
-        filtered_indices: Vec<usize>,
-        search_query: String,
-        search_requested: bool,
-        covers: CoverStore,
-    },
-    /// CloudMatch session creation + polling in progress. Spawned from `GameDetail` when the
-    /// user presses Confirm to "launch" the selected game.
+    /// CloudMatch session creation + polling in progress. Spawned from `Catalog` when the
+    /// user presses Confirm (or taps PLAY) to launch the selected game.
     CreatingSession {
         user: GfnUser,
         games: Vec<GameSummary>,
@@ -211,7 +309,10 @@ pub struct App {
     /// touching every one of that variant's many match arms just to move fields they don't care
     /// about. Cleared (and any in-flight job left to finish orphaned) whenever the current state
     /// isn't `AppState::Catalog` - see `advance_catalog_search`.
-    search_job: Option<PollJob<Vec<GameSummary>>>,
+    /// The in-flight server search paired with the query it was dispatched for, so a result that
+    /// arrives after the user has typed further can be recognized as stale and dropped instead of
+    /// clobbering `games` and resetting the selection.
+    search_job: Option<(String, PollJob<catalog::CatalogPage>)>,
     /// Set when the query changed and a debounced server search hasn't fired for it yet.
     search_pending_since: Option<Instant>,
     /// The last query a server search was actually dispatched for - avoids re-firing once the
@@ -223,6 +324,13 @@ pub struct App {
     /// still has its Spanish strings hardcoded (see `src/i18n.rs` for the (unwired) fluent
     /// setup that would translate the rest).
     pub(crate) locale: Locale,
+    /// Library sort order, changed via the sort dropdown next to the library header.
+    pub(crate) catalog_sort: CatalogSort,
+    /// Cached account VPC id, shared with every spawned catalog task so the id is fetched once
+    /// per session instead of before every catalog/search request.
+    vpc_id_cache: catalog::VpcIdCache,
+    /// Background cursor-pagination state for the catalog list.
+    paging: CatalogPaging,
 }
 
 impl App {
@@ -231,12 +339,23 @@ impl App {
         self.tokens.as_ref().map(|tokens| tokens.bearer())
     }
 
+    /// How many titles the server says match in total, for the catalog header's "N of M".
+    pub(crate) fn catalog_total_count(&self) -> Option<usize> {
+        self.paging.total_count
+    }
+
+    /// Whether another catalog page is on its way, so the UI can say the list is still growing.
+    pub(crate) fn is_loading_more_catalog(&self) -> bool {
+        self.paging.job.is_some()
+    }
+
     pub fn new() -> Result<Self> {
         let http_client = auth::client();
         let tokens = auth::load_tokens();
+        let vpc_id_cache = catalog::VpcIdCache::default();
         let state = match &tokens {
             Some(tokens) => match auth::user_from_tokens(tokens) {
-                Ok(user) => Self::start_catalog_fetch(&http_client, tokens, user),
+                Ok(user) => Self::start_catalog_fetch(&http_client, tokens, &vpc_id_cache, user),
                 Err(error) => {
                     eprintln!("Saved GFN login could not be decoded, clearing it: {error:#}");
                     auth::clear_tokens();
@@ -256,7 +375,10 @@ impl App {
             search_pending_since: None,
             last_dispatched_search_query: None,
             confirm_exit: false,
-            locale: Locale::EsEs,
+            locale: Locale::default(),
+            catalog_sort: CatalogSort::default(),
+            vpc_id_cache,
+            paging: CatalogPaging::default(),
         })
     }
 
@@ -297,6 +419,51 @@ impl App {
                 self.locale = locale;
                 current_state
             }
+            AppCommand::SelectGame(index) => {
+                // `current_state` (not `self.state`) is the live state here - it was moved out
+                // by the `mem::replace` above.
+                let mut state = current_state;
+                if let AppState::Catalog {
+                    selected,
+                    filtered_indices,
+                    ..
+                } = &mut state
+                    && index < filtered_indices.len()
+                {
+                    *selected = index;
+                }
+                state
+            }
+            AppCommand::SetSort(sort) => {
+                self.catalog_sort = sort;
+                match current_state {
+                    AppState::Catalog {
+                        user,
+                        games,
+                        selected: _,
+                        filtered_indices: _,
+                        search_query,
+                        search_requested,
+                        covers,
+                    } => {
+                        // Must go through `effective_local_query`: passing `search_query`
+                        // unconditionally re-narrowed a *server* result set to title matches
+                        // only, silently dropping rows the server matched on publisher/alias.
+                        let local = effective_local_query(&search_query, &self.paging.server_query);
+                        let filtered_indices = filter_indices(&games, local, sort);
+                        AppState::Catalog {
+                            user,
+                            games,
+                            selected: 0,
+                            filtered_indices,
+                            search_query,
+                            search_requested,
+                            covers,
+                        }
+                    }
+                    other => other,
+                }
+            }
             AppCommand::Input(input) => {
                 self.last_input = Some(input);
                 self.handle_input_command(current_state, input, bearer_token, http_client)
@@ -317,7 +484,7 @@ impl App {
                 search_requested,
                 covers,
             } => {
-                let filtered_indices = filter_indices(&games, &query);
+                let filtered_indices = filter_indices(&games, &query, self.catalog_sort);
                 // Reset selection to the first matching result whenever the query changes.
                 let selected = 0;
                 // Arms the debounce timer for a server-side search - see `advance_catalog_search`.
@@ -416,7 +583,7 @@ impl App {
                 search_requested,
                 covers,
                 ..
-            } => AppState::GameDetail {
+            } => AppState::Catalog {
                 user,
                 games,
                 selected,
@@ -436,7 +603,7 @@ impl App {
                 session,
             } => {
                 self.stop_cloudmatch_session(&session);
-                AppState::GameDetail {
+                AppState::Catalog {
                     user,
                     games,
                     selected,
@@ -477,7 +644,7 @@ impl App {
                 // server to tear down.
                 handle.close();
                 self.stop_cloudmatch_session(&session);
-                AppState::GameDetail {
+                AppState::Catalog {
                     user,
                     games,
                     selected,
@@ -526,8 +693,7 @@ impl App {
                         covers,
                     }
                 } else {
-                    let selected =
-                        move_in_grid(filtered_indices.len(), GRID_COLUMNS, selected, GridStep::Up);
+                    let selected = move_in_list(filtered_indices.len(), selected, ListStep::Up);
                     AppState::Catalog {
                         user,
                         games,
@@ -562,92 +728,7 @@ impl App {
                         covers,
                     }
                 } else {
-                    let selected = move_in_grid(
-                        filtered_indices.len(),
-                        1,
-                        selected,
-                        GridStep::Down,
-                    );
-                    AppState::Catalog {
-                        user,
-                        games,
-                        selected,
-                        filtered_indices,
-                        search_query,
-                        search_requested,
-                        covers,
-                    }
-                }
-            }
-            (
-                AppState::Catalog {
-                    user,
-                    games,
-                    selected,
-                    filtered_indices,
-                    search_query,
-                    search_requested,
-                    covers,
-                },
-                InputCommand::MoveLeft,
-            ) => {
-                if search_requested {
-                    AppState::Catalog {
-                        user,
-                        games,
-                        selected,
-                        filtered_indices,
-                        search_query,
-                        search_requested,
-                        covers,
-                    }
-                } else {
-                    let selected = move_in_grid(
-                        filtered_indices.len(),
-                        GRID_COLUMNS,
-                        selected,
-                        GridStep::Left,
-                    );
-                    AppState::Catalog {
-                        user,
-                        games,
-                        selected,
-                        filtered_indices,
-                        search_query,
-                        search_requested,
-                        covers,
-                    }
-                }
-            }
-            (
-                AppState::Catalog {
-                    user,
-                    games,
-                    selected,
-                    filtered_indices,
-                    search_query,
-                    search_requested,
-                    covers,
-                },
-                InputCommand::MoveRight,
-            ) => {
-                if search_requested {
-                    AppState::Catalog {
-                        user,
-                        games,
-                        selected,
-                        filtered_indices,
-                        search_query,
-                        search_requested,
-                        covers,
-                    }
-                } else {
-                    let selected = move_in_grid(
-                        filtered_indices.len(),
-                        GRID_COLUMNS,
-                        selected,
-                        GridStep::Right,
-                    );
+                    let selected = move_in_list(filtered_indices.len(), selected, ListStep::Down);
                     AppState::Catalog {
                         user,
                         games,
@@ -672,7 +753,7 @@ impl App {
                 InputCommand::Confirm,
             ) => {
                 if search_requested {
-                    // Close the system keyboard and return to grid navigation.
+                    // Close the system keyboard and return to list navigation.
                     AppState::Catalog {
                         user,
                         games,
@@ -683,15 +764,83 @@ impl App {
                         covers,
                     }
                 } else {
-                    // Open the detail/info screen for the selected game.
-                    AppState::GameDetail {
-                        user,
-                        games,
-                        selected,
-                        filtered_indices,
-                        search_query,
-                        search_requested,
-                        covers,
+                    // Launch the selected game: kick off the CloudMatch session creation flow.
+                    // This hits NVIDIA's REST API and polls until the session reports ready.
+                    let game_index = filtered_indices.get(selected).copied();
+                    match (
+                        game_index.and_then(|index| games.get(index)),
+                        bearer_token.clone(),
+                    ) {
+                        (Some(game), Some(token)) => {
+                            let app_id = game.app_id.clone();
+                            let queue_tracker = Arc::new(std::sync::Mutex::new(
+                                cloudmatch::QueueStatus::default(),
+                            ));
+                            let tracker_clone = queue_tracker.clone();
+                            let handle: JoinHandle<Result<SessionInfo>> =
+                                tokio::spawn(async move {
+                                    let settings = cloudmatch::StreamSettings::for_vita();
+                                    let session = cloudmatch::create_session(
+                                        &http_client,
+                                        cloudmatch::CreateSessionRequest {
+                                            token: token.as_str(),
+                                            app_id: &app_id,
+                                            vpc_id: "", // VPC id is not required by the v2/session endpoint; serverInfo is optional for MVP.
+                                            settings: &settings,
+                                        },
+                                    )
+                                    .await?;
+                                    let polled = cloudmatch::poll_session(
+                                        &http_client,
+                                        cloudmatch::PollSessionRequest {
+                                            token: token.as_str(),
+                                            session_id: &session.session_id,
+                                            session: &session,
+                                        },
+                                        Some(tracker_clone),
+                                    )
+                                    .await;
+                                    // `create_session` already seated a session on NVIDIA's side;
+                                    // if polling then fails we must hand it back. Without this,
+                                    // every failed launch leaks a live session against the
+                                    // account, and since GFN caps concurrent sessions the next
+                                    // attempt is *more* likely to fail - which shows up as
+                                    // escalating HTTP 503s that look like an NVIDIA outage.
+                                    if polled.is_err() {
+                                        cloudmatch::stop_session(
+                                            &http_client,
+                                            token.as_str(),
+                                            &session,
+                                        )
+                                        .await;
+                                    }
+                                    polled
+                                });
+                            AppState::CreatingSession {
+                                user,
+                                games,
+                                selected,
+                                filtered_indices,
+                                search_query,
+                                search_requested,
+                                covers,
+                                job: PollJob::Pending(handle),
+                                queue_tracker,
+                            }
+                        }
+                        _ => {
+                            self.status_note =
+                                Some("No se pudo iniciar sesion: falta login o juego.".to_owned());
+                            AppState::Catalog {
+                                user,
+                                games,
+                                selected,
+                                filtered_indices,
+                                search_query,
+                                search_requested,
+                                covers,
+                            }
+                        }
                     }
                 }
             }
@@ -721,7 +870,7 @@ impl App {
                 } else if !search_query.is_empty() {
                     // Clear the search query and restore full list
                     let new_query = String::new();
-                    let new_filtered = (0..games.len()).collect();
+                    let new_filtered = filter_indices(&games, "", self.catalog_sort);
                     // Crucial: trigger a server search for the empty string to restore full catalog
                     self.search_pending_since = Some(std::time::Instant::now());
                     AppState::Catalog {
@@ -747,26 +896,6 @@ impl App {
                     }
                 }
             }
-            (
-                AppState::GameDetail {
-                    user,
-                    games,
-                    selected,
-                    filtered_indices,
-                    search_query,
-                    search_requested,
-                    covers,
-                },
-                InputCommand::Back,
-            ) => AppState::Catalog {
-                user,
-                games,
-                selected,
-                filtered_indices,
-                search_query,
-                search_requested,
-                covers,
-            },
             (
                 state @ (AppState::CreatingSession { .. }
                 | AppState::SessionReady { .. }
@@ -821,81 +950,6 @@ impl App {
                 }
             }
             (
-                AppState::GameDetail {
-                    user,
-                    games,
-                    selected,
-                    filtered_indices,
-                    search_query,
-                    search_requested,
-                    covers,
-                },
-                InputCommand::Confirm,
-            ) => {
-                // Start the CloudMatch session creation flow for the selected game. This is the
-                // first real Fase 3 step the user can exercise: it will hit NVIDIA's REST API and
-                // poll until the session reports ready.
-                let game_index = filtered_indices.get(selected).copied();
-                match (
-                    game_index.and_then(|index| games.get(index)),
-                    bearer_token.clone(),
-                ) {
-                    (Some(game), Some(token)) => {
-                        let app_id = game.app_id.clone();
-                        let queue_tracker =
-                            Arc::new(std::sync::Mutex::new(cloudmatch::QueueStatus::default()));
-                        let tracker_clone = queue_tracker.clone();
-                        let handle: JoinHandle<Result<SessionInfo>> = tokio::spawn(async move {
-                            let settings = cloudmatch::StreamSettings::for_vita();
-                            let session = cloudmatch::create_session(
-                                &http_client,
-                                cloudmatch::CreateSessionRequest {
-                                    token: token.as_str(),
-                                    app_id: &app_id,
-                                    vpc_id: "", // VPC id is not required by the v2/session endpoint; serverInfo is optional for MVP.
-                                    settings: &settings,
-                                },
-                            )
-                            .await?;
-                            cloudmatch::poll_session(
-                                &http_client,
-                                cloudmatch::PollSessionRequest {
-                                    token: token.as_str(),
-                                    session_id: &session.session_id,
-                                    session: &session,
-                                },
-                                Some(tracker_clone),
-                            )
-                            .await
-                        });
-                        AppState::CreatingSession {
-                            user,
-                            games,
-                            selected,
-                            filtered_indices,
-                            search_query,
-                            search_requested,
-                            covers,
-                            job: PollJob::Pending(handle),
-                            queue_tracker,
-                        }
-                    }
-                    _ => {
-                        self.status_note =
-                            Some("No se pudo iniciar sesion: falta login o juego.".to_owned());
-                        AppState::GameDetail {
-                            user,
-                            games,
-                            selected,
-                            filtered_indices,
-                            search_query,
-                            search_requested,
-                            covers,
-                        }
-                    }
-                }
-            }
-            (
                 AppState::Error {
                     retry: ErrorRetry::RestartLogin,
                     ..
@@ -911,12 +965,13 @@ impl App {
             ) => Self::start_catalog_fetch(
                 &self.http_client,
                 self.tokens.as_ref().expect("retry requires a saved login"),
+                &self.vpc_id_cache,
                 user,
             ),
             (
                 AppState::Error {
                     retry:
-                        ErrorRetry::BackToGameDetail {
+                        ErrorRetry::BackToCatalog {
                             user,
                             games,
                             selected,
@@ -928,7 +983,7 @@ impl App {
                     ..
                 },
                 InputCommand::Confirm,
-            ) => AppState::GameDetail {
+            ) => AppState::Catalog {
                 user,
                 games,
                 selected,
@@ -949,21 +1004,36 @@ impl App {
         AppState::StartingDeviceLogin(PollJob::Pending(handle))
     }
 
-    fn start_catalog_fetch(client: &Client, tokens: &AuthTokens, user: GfnUser) -> AppState {
+    /// Kicks off the catalog load. Only **page 1** is fetched here, so the catalog screen appears
+    /// as soon as the first 200 titles land; `advance_catalog_paging` streams the rest in behind
+    /// the UI.
+    fn start_catalog_fetch(
+        client: &Client,
+        tokens: &AuthTokens,
+        vpc_id_cache: &catalog::VpcIdCache,
+        user: GfnUser,
+    ) -> AppState {
         let client = client.clone();
         let bearer = tokens.bearer().to_owned();
-        let handle: JoinHandle<Result<Vec<GameSummary>>> =
-            tokio::spawn(async move { catalog::fetch_catalog_for_account(&client, &bearer).await });
+        let cache = vpc_id_cache.clone();
+        let handle: JoinHandle<Result<catalog::CatalogPage>> = tokio::spawn(async move {
+            catalog::fetch_catalog_page_for_account(&client, &bearer, &cache, None, "").await
+        });
         AppState::LoadingCatalog {
             user,
             job: PollJob::Pending(handle),
         }
     }
 
-    /// How long to wait after the last keystroke before actually hitting the network - matches
-    /// a typical "search-as-you-type" debounce. Long enough that a fast typist doesn't fire one
-    /// request per character, short enough that the full-catalog results still feel responsive.
-    const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(400);
+    /// How long to wait after the last keystroke before actually hitting the network. Long enough
+    /// that typing doesn't fire one request per character, short enough that results still feel
+    /// immediate. The reference client uses 220ms for a desktop keyboard; 250ms lands on a clean
+    /// ~16-frame boundary given the loop only samples this timer once per frame, and the Vita's
+    /// on-screen keyboard is slower between keystrokes anyway.
+    ///
+    /// No minimum query length: real titles are short ("R6", "GTA"), and
+    /// `last_dispatched_search_query` already suppresses redundant fires.
+    const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 
     /// Drives server-side catalog search: polls any in-flight search job to completion, then -
     /// once the debounce timer has elapsed for the current query and that query hasn't already
@@ -983,22 +1053,29 @@ impl App {
         };
         let query = search_query.clone();
 
-        if let Some(PollJob::Pending(handle)) = self.search_job.take() {
+        if let Some((job_query, PollJob::Pending(handle))) = self.search_job.take() {
             match poll_job(handle).await {
                 PollJob::Pending(handle) => {
-                    self.search_job = Some(PollJob::Pending(handle));
+                    self.search_job = Some((job_query, PollJob::Pending(handle)));
                 }
-                PollJob::Done(Ok(games)) => {
-                    let result_count = games.len();
+                // A result for a query the user has since typed past is worse than no result: it
+                // would replace `games` with the wrong set and reset the selection. Drop it and
+                // let the debounce dispatch the current query.
+                PollJob::Done(_) if job_query != query => {}
+                PollJob::Done(Ok(page)) => {
+                    let result_count = page.games.len();
+                    self.paging.restart(job_query, &page);
                     if let AppState::Catalog {
-                        games: state_games,
+                        games,
                         filtered_indices,
                         selected,
                         ..
                     } = &mut self.state
                     {
-                        *filtered_indices = (0..games.len()).collect();
-                        *state_games = games;
+                        // Server results are already the answer for this query - see
+                        // `effective_local_query`.
+                        *filtered_indices = filter_indices(&page.games, "", self.catalog_sort);
+                        *games = page.games;
                         *selected = 0;
                     }
                     self.status_note = Some(format!("{result_count} resultado(s) para \"{query}\""));
@@ -1026,24 +1103,163 @@ impl App {
             return;
         };
 
+        // A pending page belongs to the query we're about to replace - stop it before it can
+        // append onto a different result set.
+        self.paging.abort_job();
         self.search_pending_since = None;
         self.last_dispatched_search_query = Some(query.clone());
         let client = self.http_client.clone();
-        let handle: JoinHandle<Result<Vec<GameSummary>>> = tokio::spawn(async move {
-            if query.trim().is_empty() {
-                catalog::fetch_catalog_for_account(&client, &token).await
-            } else {
-                catalog::search_catalog_for_account(&client, &token, &query).await
-            }
+        let cache = self.vpc_id_cache.clone();
+        let dispatched = query.clone();
+        let handle: JoinHandle<Result<catalog::CatalogPage>> = tokio::spawn(async move {
+            let trimmed = dispatched.trim();
+            let server_query = (!trimmed.is_empty()).then_some(trimmed);
+            catalog::fetch_catalog_page_for_account(&client, &token, &cache, server_query, "").await
         });
-        self.search_job = Some(PollJob::Pending(handle));
+        self.search_job = Some((query, PollJob::Pending(handle)));
+    }
+
+    /// Streams the remaining catalog pages in behind the UI, appending each to `games` as it
+    /// lands so the list grows while the user browses.
+    ///
+    /// Deliberately yields to search: no page is dispatched while a search is in flight or its
+    /// debounce is armed, because on a console with one Wi-Fi radio a background page competing
+    /// with the query the user is actively typing feels worse than the shorter list did.
+    async fn advance_catalog_paging(&mut self) {
+        if !matches!(self.state, AppState::Catalog { .. }) {
+            self.paging.abort_job();
+            return;
+        }
+
+        if let Some((generation, PollJob::Pending(handle))) = self.paging.job.take() {
+            match poll_job(handle).await {
+                PollJob::Pending(handle) => {
+                    self.paging.job = Some((generation, PollJob::Pending(handle)));
+                }
+                // Superseded by a newer query - `games` is a different set now, so appending
+                // this page would corrupt the list.
+                PollJob::Done(_) if generation != self.paging.generation => {}
+                PollJob::Done(Ok(page)) => {
+                    self.paging.next_cursor = page.next_cursor.clone();
+                    self.paging.pages_loaded += 1;
+                    if page.total_count.is_some() {
+                        self.paging.total_count = page.total_count;
+                    }
+                    self.append_catalog_page(page.games);
+                }
+                PollJob::Done(Err(error)) => {
+                    // Non-fatal: the user keeps whatever pages already landed.
+                    eprintln!("catalog page fetch failed (non-fatal): {error:#}");
+                    self.paging.next_cursor = None;
+                }
+            }
+            return;
+        }
+
+        if !self.paging.has_more()
+            || self.search_job.is_some()
+            || self.search_pending_since.is_some()
+        {
+            return;
+        }
+        let (Some(token), Some(cursor)) = (
+            self.bearer_token().map(str::to_owned),
+            self.paging.next_cursor.clone(),
+        ) else {
+            return;
+        };
+
+        let client = self.http_client.clone();
+        let cache = self.vpc_id_cache.clone();
+        let server_query = self.paging.server_query.clone();
+        let generation = self.paging.generation;
+        let handle: JoinHandle<Result<catalog::CatalogPage>> = tokio::spawn(async move {
+            let trimmed = server_query.trim();
+            let query = (!trimmed.is_empty()).then_some(trimmed);
+            catalog::fetch_catalog_page_for_account(&client, &token, &cache, query, &cursor).await
+        });
+        self.paging.job = Some((generation, PollJob::Pending(handle)));
+    }
+
+    /// Appends a freshly fetched page to the catalog, keeping the highlighted title highlighted.
+    ///
+    /// `games` is append-only within a paging generation, which makes a `games` index stable
+    /// identity for the selected title - whereas its position in `filtered_indices` can move as
+    /// soon as new titles sort in above it. So we record the selection as a `games` index first
+    /// and look it back up afterwards.
+    fn append_catalog_page(&mut self, incoming: Vec<GameSummary>) {
+        let sort = self.catalog_sort;
+        let server_query = self.paging.server_query.clone();
+        let AppState::Catalog {
+            games,
+            filtered_indices,
+            selected,
+            search_query,
+            ..
+        } = &mut self.state
+        else {
+            return;
+        };
+
+        let anchor = filtered_indices.get(*selected).copied();
+        // Cursor pagination shouldn't overlap, but a duplicate would be more than cosmetic:
+        // `app_id` is the egui texture key for covers, so two rows sharing one id would look
+        // like a rendering bug.
+        let seen: std::collections::HashSet<&str> =
+            games.iter().map(|game| game.app_id.as_str()).collect();
+        let fresh: Vec<GameSummary> = incoming
+            .into_iter()
+            .filter(|game| !seen.contains(game.app_id.as_str()))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        games.extend(fresh);
+
+        let local = effective_local_query(search_query, &server_query);
+        *filtered_indices = filter_indices(games, local, sort);
+        *selected = anchor
+            .and_then(|anchor| filtered_indices.iter().position(|&index| index == anchor))
+            .unwrap_or_else(|| (*selected).min(filtered_indices.len().saturating_sub(1)));
+    }
+
+    /// Bounds how much decoded cover art stays resident, pruned on every tick.
+    ///
+    /// On the catalog screen the selected title's cover is pinned and a small LRU of recently
+    /// visited ones is kept, so stepping back up the list is instant. Everywhere else - i.e.
+    /// once a streaming session is being set up - every cover is released: that frees the RGBA
+    /// buffers *and* their VRAM textures before `PeerEngine` claims the direct-video textures
+    /// and the decoder's CDRAM, which is the app's peak memory pressure.
+    ///
+    /// Must run before the `mem::replace` in `tick`, since it reads the real `self.state`.
+    fn prune_covers(&self) {
+        match &self.state {
+            AppState::Catalog {
+                games,
+                selected,
+                filtered_indices,
+                covers,
+                ..
+            } => {
+                let keep = ui::selected_game(games, filtered_indices, *selected)
+                    .map(|game| game.app_id.as_str());
+                covers.prune(keep, covers::MAX_CACHED_COVERS);
+            }
+            AppState::CreatingSession { covers, .. }
+            | AppState::SessionReady { covers, .. }
+            | AppState::Signaling { covers, .. }
+            | AppState::Streaming { covers, .. } => covers.prune(None, 0),
+            _ => {}
+        }
     }
 
     /// Per-frame housekeeping: advances whatever async step is in flight. Kept out of the render
-    /// closure (mirrors `green-vita`'s `App::tick`) so `build_ui` stays a pure function of the
+    /// closure so `build_ui` stays a pure function of the
     /// current state.
     pub async fn tick(&mut self) -> Result<()> {
+        self.prune_covers();
         self.advance_catalog_search().await;
+        self.advance_catalog_paging().await;
         match std::mem::replace(&mut self.state, AppState::Login) {
             AppState::StartingDeviceLogin(job) => self.state = self.advance_login_start(job).await,
             AppState::WaitingForDeviceAuthorization {
@@ -1056,7 +1272,7 @@ impl App {
                     .await
             }
             AppState::LoadingCatalog { user, job } => {
-                self.state = Self::advance_catalog_load(user, job).await
+                self.state = self.advance_catalog_load(user, job).await
             }
             AppState::CreatingSession {
                 user,
@@ -1179,7 +1395,7 @@ impl App {
                     self.stop_cloudmatch_session(&session);
                     self.state = AppState::Error {
                         message,
-                        retry: ErrorRetry::BackToGameDetail {
+                        retry: ErrorRetry::BackToCatalog {
                             user,
                             games,
                             selected,
@@ -1285,7 +1501,7 @@ impl App {
             self.stop_cloudmatch_session(&session);
             return AppState::Error {
                 message: format!("Señalización desconectada: {reason}"),
-                retry: ErrorRetry::BackToGameDetail {
+                retry: ErrorRetry::BackToCatalog {
                     user,
                     games,
                     selected,
@@ -1422,12 +1638,19 @@ impl App {
                 };
             }
         };
-        let state = Self::start_catalog_fetch(&self.http_client, &tokens, user);
+        // The VPC id is per-account: a different login must not inherit the previous one.
+        self.vpc_id_cache = catalog::VpcIdCache::default();
+        let state =
+            Self::start_catalog_fetch(&self.http_client, &tokens, &self.vpc_id_cache, user);
         self.tokens = Some(tokens);
         state
     }
 
-    async fn advance_catalog_load(user: GfnUser, job: PollJob<Vec<GameSummary>>) -> AppState {
+    async fn advance_catalog_load(
+        &mut self,
+        user: GfnUser,
+        job: PollJob<catalog::CatalogPage>,
+    ) -> AppState {
         let PollJob::Pending(handle) = job else {
             return AppState::LoadingCatalog { user, job };
         };
@@ -1436,11 +1659,13 @@ impl App {
                 user,
                 job: PollJob::Pending(handle),
             },
-            PollJob::Done(Ok(games)) => {
-                let filtered_indices = filter_indices(&games, "");
+            PollJob::Done(Ok(page)) => {
+                // Seed paging from page 1 so `advance_catalog_paging` can stream the rest.
+                self.paging.restart(String::new(), &page);
+                let filtered_indices = filter_indices(&page.games, "", self.catalog_sort);
                 AppState::Catalog {
                     user,
-                    games,
+                    games: page.games,
                     selected: 0,
                     filtered_indices,
                     search_query: String::new(),
@@ -1452,6 +1677,8 @@ impl App {
                 let err_str = format!("{error:#}");
                 if err_str.contains("401 Unauthorized") || err_str.contains("Invalid or expired token") {
                     crate::gfn::auth::clear_tokens();
+                    // Tokens are gone, so the cached id no longer belongs to anyone.
+                    self.vpc_id_cache = catalog::VpcIdCache::default();
                     AppState::Error {
                         message: "Tu sesion ha expirado. Por favor, vuelve a iniciar sesion.".to_owned(),
                         retry: ErrorRetry::RestartLogin,
@@ -1514,7 +1741,7 @@ impl App {
             },
             PollJob::Done(Err(error)) => AppState::Error {
                 message: format!("No se pudo crear la sesión de streaming: {error:#}"),
-                retry: ErrorRetry::BackToGameDetail {
+                retry: ErrorRetry::BackToCatalog {
                     user,
                     games,
                     selected,

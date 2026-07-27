@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
     // Kept alive for the app's whole lifetime: the GFN token encryption key lives in Safe
     // Memory (see gfn::auth), which requires AppUtil to be initialized first.
     let _app_util = safe_memory::AppUtil::initialize()?;
-    // Grab CDRAM for the hardware H.264 decoder before anything can fragment it (green-vita's
+    // Grab CDRAM for the hardware H.264 decoder before anything can fragment it (the
     // pattern); the decoder swaps it for an exact-size block when a stream starts.
     #[cfg(target_os = "vita")]
     streaming::video::reserve_decoder_cdram();

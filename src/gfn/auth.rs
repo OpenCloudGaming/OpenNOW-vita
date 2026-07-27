@@ -445,7 +445,7 @@ fn ensure_token_store_dir() -> Result<()> {
 
 fn write_file_truncating(path: &str, data: impl AsRef<[u8]>) -> Result<()> {
     // std::fs::write alone doesn't reliably truncate an existing file on the Vita's newlib
-    // filesystem (same caveat green-vita's fs_utils documents).
+    // filesystem.
     let _ = std::fs::remove_file(path);
     std::fs::write(path, data).with_context(|| format!("failed to write {path}"))
 }

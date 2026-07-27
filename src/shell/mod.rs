@@ -24,7 +24,7 @@ const DIRECTION_REPEAT_INTERVAL: Duration = Duration::from_millis(90);
 
 pub(crate) const TARGET_FRAME_TIME: Duration = Duration::from_millis(16);
 // How often the end-of-frame wait wakes up to drain SDL's event queue and refresh the
-// streamed gamepad state, mirroring green-vita's `STREAM_INPUT_POLL_INTERVAL`. A single long
+// streamed gamepad state. A single long
 // sleep left input events queued (and the game's controller state stale) for up to a whole
 // frame; polling every 4ms keeps both close to real-time without busy-waiting.
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(4);
@@ -41,6 +41,9 @@ pub async fn run(mut app: App) -> Result<()> {
     let mut audio_renderer =
         AudioRenderer::new(&audio).context("failed to set up audio renderer")?;
     let egui_ctx = egui::Context::default();
+    // Style/palette/touch tuning is installed once here rather than per frame - see
+    // `app::ui::apply_theme`.
+    crate::app::ui::apply_theme(&egui_ctx);
     let start_time = Instant::now();
     let mut pointer_pos = egui::Pos2::ZERO;
     let mut held_direction = None;

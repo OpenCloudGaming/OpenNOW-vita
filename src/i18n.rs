@@ -18,8 +18,25 @@ impl I18n {
     }
 
     /// Resolves `id` in the current locale, falling back to `en-US`, then to `id` itself.
+    ///
+    /// Memoized per `(locale, id)`. The UI is rebuilt every frame and resolves a dozen-plus
+    /// argument-less ids per frame; going through Fluent each time (bundle lookup + pattern
+    /// resolution + format) for strings that cannot change was pure per-frame cost. Cloning the
+    /// cached `String` is one short allocation instead.
     pub fn text(&self, id: &'static str) -> String {
-        self.text_with_args(id, None)
+        thread_local! {
+            static CACHE: RefCell<HashMap<(Locale, &'static str), String>> =
+                RefCell::new(HashMap::new());
+        }
+        CACHE.with(|cell| {
+            if let Some(cached) = cell.borrow().get(&(self.locale, id)) {
+                return cached.clone();
+            }
+            let resolved = self.text_with_args(id, None);
+            cell.borrow_mut()
+                .insert((self.locale, id), resolved.clone());
+            resolved
+        })
     }
 
     /// Like [`I18n::text`], with Fluent arguments interpolated into the message.

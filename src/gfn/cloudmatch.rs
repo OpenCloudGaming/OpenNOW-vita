@@ -6,10 +6,10 @@
 //! not support network-test sessions, alliance partners, ad reporting, or resume/claim flows.
 //!
 //! Forced stream profile for Vita hardware (see `docs/protocol-notes.md` §5):
-//! - Resolution 960x544, 30 fps
+//! - Resolution 960x544 (native panel), 60 fps
 //! - H.264 only (hardware decoder on Vita)
 //! - 8-bit 4:2:0 color quality
-//! - Conservative bitrate (max ~8 Mbps)
+//! - Bitrate capped at ~15 Mbps
 
 use super::headers::{self, error_for_status_with_body};
 use anyhow::{Context, Result, bail};
@@ -42,16 +42,28 @@ pub struct StreamSettings {
 }
 
 impl StreamSettings {
-    /// Default Vita profile: 960x544@30, H.264 (forced later via `codec` field), moderate bitrate.
+    /// Default Vita profile: 960x544@60, H.264 (forced later via `codec` field).
+    ///
+    /// 60 fps, not 30: `fps` is sent to NVIDIA as `a=video.maxFPS` (see `gfn::sdp`) and as
+    /// `framesPerSecond` in the session request, so it decides what the *encoder* produces -
+    /// asking for 30 is what made the stream look choppy.
+    /// Framerate costs no VRAM here (the two direct video textures are sized by resolution
+    /// alone), and the hardware decoder has the headroom: it sustains 1280x720 (~0.92 MP)
+    /// on the same `sceAvcdec` with one reference frame, while this is 960x544 (~0.52 MP).
+    ///
+    /// Resolution stays at the panel's native 960x544 - that *is* the RAM-bound knob, and
+    /// matching the panel also avoids any scaling on the blit.
     pub fn for_vita() -> Self {
         Self {
             resolution: "960x544".to_owned(),
-            fps: 30,
-            max_bitrate_mbps: 8,
+            fps: 60,
+            // 8 Mbps was tuned for 30 fps; at 60 the same ceiling halves the per-frame budget and
+            // the encoder's DRC starts trading away sharpness. Still conservative for 0.52 MP.
+            max_bitrate_mbps: 15,
         }
     }
 
-    fn parse_resolution(&self) -> (u32, u32) {
+    pub fn dimensions(&self) -> (u32, u32) {
         let mut parts = self.resolution.split('x');
         let width = parts.next().and_then(|s| s.parse().ok()).unwrap_or(960);
         let height = parts.next().and_then(|s| s.parse().ok()).unwrap_or(544);
@@ -124,7 +136,7 @@ pub async fn create_session(
         device_id: stable_device_id(),
     };
     let base_url = DEFAULT_CLOUDMATCH_BASE_URL.trim_end_matches('/');
-    let (width, height) = request.settings.parse_resolution();
+    let (width, height) = request.settings.dimensions();
 
     let body = build_session_request_body(
         request.app_id,
@@ -159,6 +171,22 @@ pub async fn create_session(
                     if status.is_success() {
                         let payload: CloudMatchResponse = serde_json::from_str(&body_text)
                             .context("failed to decode CloudMatch create session response")?;
+                        if payload.request_status.status_code != 1 {
+                            // NVIDIA's own request-level rejection (distinct from the HTTP
+                            // status, which is 2xx here) - `status_message` is frequently
+                            // empty for these, so surface the raw body too: it's the only
+                            // place any extra diagnostic field NVIDIA sent would show up,
+                            // and `CloudMatchResponse` silently drops unrecognized fields.
+                            bail!(
+                                "CloudMatch create session error {} ({}): {body_text}",
+                                payload.request_status.status_code,
+                                payload
+                                    .request_status
+                                    .status_message
+                                    .as_deref()
+                                    .unwrap_or("unknown")
+                            );
+                        }
                         return Ok((payload, false));
                     }
 
@@ -175,12 +203,31 @@ pub async fn create_session(
                                     old_ids.push(id.as_string());
                                 }
                             }
-                            for old_id in old_ids {
-                                if !old_id.is_empty() {
-                                    stop_session_by_id(client, request.token, &old_id).await;
+                            if !old_ids.is_empty() {
+                                for old_id in &old_ids {
+                                    if !old_id.is_empty() {
+                                        stop_session_by_id(client, request.token, old_id).await;
+                                    }
                                 }
+                                return Ok((limit_payload, true));
                             }
-                            return Ok((limit_payload, true));
+                            // A 403/SESSION_LIMIT_EXCEEDED-shaped response with no actual old
+                            // session to reap isn't a recoverable "stop the stale one and
+                            // retry" case - retrying identically would just fail the same way.
+                            // Whatever NVIDIA is really rejecting the request for (this is
+                            // where a bare "CloudMatch error: 50 (unknown)" with no body was
+                            // coming from - the old code assumed FORBIDDEN always meant a
+                            // reapable session limit and blindly retried instead of surfacing
+                            // it), show the real code/body instead of masking it as a retry.
+                            bail!(
+                                "CloudMatch create session error {} ({}): {body_text}",
+                                limit_payload.request_status.status_code,
+                                limit_payload
+                                    .request_status
+                                    .status_message
+                                    .as_deref()
+                                    .unwrap_or("unknown")
+                            );
                         }
                     }
 
@@ -269,14 +316,18 @@ pub async fn poll_session(
             .await
             .with_context(|| format!("CloudMatch poll attempt {attempt} rejected"))?;
 
-        let payload: CloudMatchResponse = response
-            .json()
+        let body_text = response
+            .text()
             .await
+            .context("failed to read CloudMatch poll response body")?;
+        let payload: CloudMatchResponse = serde_json::from_str(&body_text)
             .context("failed to decode CloudMatch poll response")?;
 
         if payload.request_status.status_code != 1 {
+            // See the matching bail in `create_session`'s `send_request`: keep the raw body,
+            // `status_message` alone is often empty on these.
             bail!(
-                "CloudMatch poll error: {} ({})",
+                "CloudMatch poll error: {} ({}): {body_text}",
                 payload.request_status.status_code,
                 payload
                     .request_status
@@ -871,7 +922,7 @@ mod tests {
             fps: 30,
             max_bitrate_mbps: 5,
         };
-        assert_eq!(settings.parse_resolution(), (1280, 720));
+        assert_eq!(settings.dimensions(), (1280, 720));
     }
 
     #[test]

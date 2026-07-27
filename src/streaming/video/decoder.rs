@@ -15,8 +15,10 @@ mod vita {
     use std::os::raw::c_void;
     use vitasdk_sys::*;
 
-    // The idea of reducing the reference frames came from MattKC's Vanilla project.
-    const AVCDEC_NUM_REF_FRAMES: u32 = 1;
+    // Kept in lockstep with the `a=video.maxNumReferenceFrames` we send GFN - see the constant's
+    // docs. 1 works only where the encoder itself uses a single reference; GFN does not, so
+    // that value silently broke decoding on real hardware.
+    use super::super::AVCDEC_NUM_REF_FRAMES;
 
     struct AvcdecLibrary {
         module_loaded: bool,

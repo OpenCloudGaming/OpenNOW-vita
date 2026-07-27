@@ -15,30 +15,29 @@
 //! reference client passes an **empty** `filters: {}` when the user hasn't picked any browse
 //! filter, which browses the whole live catalog instead - that's what this fetches now.
 //!
-//! This is a deliberate simplification of that reference: no pagination, no per-title artwork,
-//! no search box, no genre/filter UI - just enough to list launchable titles and their `appId`.
+//! Still simplified vs. that reference: no genre/filter UI and no persisted-query transport (we
+//! always POST the literal document). Cursor pagination *is* implemented - see
+//! [`fetch_catalog_page`] - but the caller decides how many pages to walk
+//! (`app::MAX_CATALOG_PAGES`) rather than exhausting the catalog.
 
 use super::headers::{self, error_for_status_with_body};
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 const GRAPHQL_ENDPOINT: &str = "https://games.geforce.com/graphql";
 const CLOUDMATCH_BASE_URL: &str = "https://prod.cloudmatchbeta.nvidiagrid.net/";
 const LOCALE: &str = "en_US";
 /// Same default sort `browseCatalogUncached` falls back to when nothing more specific applies.
 const CATALOG_SORT: &str = "itemMetadata.relevance:DESC,sortName:ASC";
-/// Simplification vs. the official client: fetches a single page instead of doing real
-/// pagination (`pageInfo.hasNextPage`/`endCursor`). 200 matches the reference client's own
-/// `LIBRARY_FETCH_COUNT`. A larger value (2000 was tried) gets the request rejected outright
-/// with an HTTP 400 - the server validates `first` against some undocumented maximum, so this is
-/// not just a slower/heavier request, it's a hard ceiling. Consequence: the in-app search box
-/// can only find titles within this first alphabetical page (up to roughly the "H" section) -
-/// reaching the full catalog needs either real `endCursor` pagination or switching to the
-/// server-side `searchQuery` argument instead of client-side filtering. Neither is implemented
-/// yet; flagged here so it isn't mistaken for an oversight later.
-const FETCH_COUNT: u32 = 200;
+/// Titles per page. 200 matches the reference client's own `LIBRARY_FETCH_COUNT` and is a hard
+/// server ceiling, not a tuning knob: a larger value (2000 was tried) gets the request rejected
+/// outright with HTTP 400, because the server validates `first` against some undocumented
+/// maximum.
+const CATALOG_PAGE_SIZE: u32 = 200;
 
 #[derive(Debug, Clone)]
 pub struct GameSummary {
@@ -47,6 +46,23 @@ pub struct GameSummary {
     /// Best-effort poster-style cover URL (portrait box art). `None` if the catalog response
     /// carried no image fields at all - the grid just draws a placeholder tile then.
     pub cover_url: Option<String>,
+    /// Storefront the launchable variant belongs to (`"STEAM"`, `"EPIC"`, `"EA_APP"`, ...),
+    /// straight from GFN's `variant.appStore` - mirrors OpenNOW's `appToVariants` (`games.ts`).
+    /// `None` if the matched variant didn't report one (some first-party/"GFN native" titles
+    /// don't have a storefront at all).
+    pub store: Option<String>,
+    /// ISO-8601 timestamp of this account's last session for the title, from
+    /// `variant.gfn.library.lastPlayedDate` - `None` for anything never launched from this
+    /// account (i.e. most of the catalog). Powers the "recently played" sort.
+    pub last_played: Option<String>,
+    /// Lowercased `title`, computed once here so the per-keystroke filter and the title sorts in
+    /// `app::filter_indices` never allocate. Before this existed, both lowercased on the fly -
+    /// including *inside the sort comparator*, i.e. O(n log n) `String` allocations (~44k for a
+    /// 2000-title catalog) on every single keystroke.
+    ///
+    /// Currently just the title. OpenNOW folds publisher/store/genre into the same haystack
+    /// (`buildSearchText`, `games.ts`); this is where that would go.
+    pub search_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +120,18 @@ struct CatalogData {
 #[derive(Debug, Deserialize)]
 struct CatalogApps {
     items: Vec<CatalogAppItem>,
+    #[serde(default, rename = "pageInfo")]
+    page_info: Option<CatalogPageInfo>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CatalogPageInfo {
+    #[serde(default, rename = "hasNextPage")]
+    has_next_page: bool,
+    #[serde(default, rename = "endCursor")]
+    end_cursor: Option<String>,
+    #[serde(default, rename = "totalCount")]
+    total_count: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +152,31 @@ struct CatalogAppItem {
 #[derive(Debug, Deserialize)]
 struct CatalogAppVariant {
     id: String,
+    #[serde(default, rename = "appStore")]
+    app_store: Option<String>,
+    #[serde(default)]
+    gfn: Option<CatalogAppVariantGfn>,
+}
+
+/// Only the `library.lastPlayedDate` leaf of `variant.gfn` - mirrors OpenNOW's
+/// `variant.gfn?.library?.lastPlayedDate` (`games.ts:585`). Populated only for variants the
+/// account has actually launched before; most catalog entries won't have one.
+#[derive(Debug, Deserialize)]
+struct CatalogAppVariantGfn {
+    #[serde(default)]
+    library: Option<CatalogAppVariantLibrary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogAppVariantLibrary {
+    #[serde(default, rename = "lastPlayedDate")]
+    last_played_date: Option<String>,
+}
+
+impl CatalogAppVariant {
+    fn last_played_date(&self) -> Option<&str> {
+        self.gfn.as_ref()?.library.as_ref()?.last_played_date.as_deref()
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -185,88 +238,107 @@ fn optimize_image(url: &str) -> String {
     }
 }
 
-const CATALOG_QUERY: &str = r#"
+/// Field selection shared by both catalog queries, including the cursor-pagination metadata.
+/// Mirrors the reference client's `appFields` fragment (`games.ts`).
+const CATALOG_PAGE_FIELDS: &str = r#"
+    items {
+      id
+      title
+      variants { id appStore gfn { library { lastPlayedDate } } }
+      images { GAME_BOX_ART KEY_IMAGE KEY_ART }
+    }
+    pageInfo { hasNextPage endCursor totalCount }
+"#;
+
+/// Browse one page of the catalog. `$cursor` is **non-nullable** (`String!`) and the first page
+/// passes the empty string, matching the reference client - sending `null` is a GraphQL
+/// validation error.
+fn catalog_query() -> String {
+    format!(
+        r#"
 query GetCatalogApps(
   $vpcId: String!,
   $locale: String!,
   $sortString: String!,
   $fetchCount: Int!,
+  $cursor: String!,
   $filters: AppFilterFields!
-) {
-  apps(vpcId: $vpcId, language: $locale, orderBy: $sortString, first: $fetchCount, filters: $filters) {
-    items {
-      id
-      title
-      variants { id }
-      images { GAME_BOX_ART KEY_IMAGE KEY_ART }
-    }
-  }
+) {{
+  apps(vpcId: $vpcId, language: $locale, orderBy: $sortString, first: $fetchCount, after: $cursor, filters: $filters) {{
+{CATALOG_PAGE_FIELDS}
+  }}
+}}
+"#
+    )
 }
-"#;
 
-/// Same shape as `CATALOG_QUERY` plus the `searchQuery` argument - matches the reference
+/// Same shape as [`catalog_query`] plus the `searchQuery` argument - matches the reference
 /// client's `GetSearchFilterResults` (`games.ts`). Passing the search term to the server instead
-/// of filtering `CATALOG_QUERY`'s results locally is what lets search reach the *entire* live
-/// catalog rather than only whatever fits in one `FETCH_COUNT`-sized page (see module docs and
-/// the `FETCH_COUNT` comment on why a bigger local page isn't a viable alternative).
-const CATALOG_SEARCH_QUERY: &str = r#"
+/// of filtering browse results locally is what lets search reach the *entire* live catalog
+/// rather than only the pages we happen to have fetched.
+fn catalog_search_query() -> String {
+    format!(
+        r#"
 query GetCatalogSearchApps(
   $vpcId: String!,
   $locale: String!,
   $sortString: String!,
   $fetchCount: Int!,
+  $cursor: String!,
   $searchString: String!,
   $filters: AppFilterFields!
-) {
-  apps(vpcId: $vpcId, language: $locale, orderBy: $sortString, first: $fetchCount, searchQuery: $searchString, filters: $filters) {
-    items {
-      id
-      title
-      variants { id }
-      images { GAME_BOX_ART KEY_IMAGE KEY_ART }
-    }
-  }
-}
-"#;
-
-pub async fn fetch_catalog(client: &Client, token: &str, vpc_id: &str) -> Result<Vec<GameSummary>> {
-    let body = json!({
-        "query": CATALOG_QUERY,
-        "variables": {
-            "vpcId": vpc_id,
-            "locale": LOCALE,
-            "sortString": CATALOG_SORT,
-            "fetchCount": FETCH_COUNT,
-            // Empty on purpose - see module docs. A non-empty filter here narrows to a specific
-            // genre/store/etc, which is what the reference client's filter UI builds up; we have
-            // no such UI yet.
-            "filters": {},
-        },
-    });
-    run_catalog_query(client, token, body, "catalog").await
+) {{
+  apps(vpcId: $vpcId, language: $locale, orderBy: $sortString, first: $fetchCount, after: $cursor, searchQuery: $searchString, filters: $filters) {{
+{CATALOG_PAGE_FIELDS}
+  }}
+}}
+"#
+    )
 }
 
-/// Server-side search across the whole GFN catalog for `query`. Empty `query` behaves like
-/// `fetch_catalog` on the server's end, but callers should just call `fetch_catalog` directly in
-/// that case - this function always takes the (slightly heavier) search code path.
-pub async fn search_catalog(
+/// One page of catalog results plus the cursor needed to ask for the next one.
+#[derive(Debug, Clone)]
+pub struct CatalogPage {
+    pub games: Vec<GameSummary>,
+    /// `pageInfo.endCursor`, `Some` only when `hasNextPage` was true *and* the cursor is
+    /// non-empty. The reference client treats an empty cursor as "stop" even when the server
+    /// claims another page exists, and so do we - otherwise a server quirk becomes an infinite
+    /// request loop.
+    pub next_cursor: Option<String>,
+    /// `pageInfo.totalCount` - how many titles match in total, which is generally far more than
+    /// we will ever page in. Shown in the catalog header so a truncated list is explicable.
+    pub total_count: Option<usize>,
+}
+
+/// Fetches one page. `query` is `None` to browse, `Some(q)` to run a server-side search;
+/// `cursor` is `""` for the first page and a previous page's `next_cursor` thereafter.
+pub async fn fetch_catalog_page(
     client: &Client,
     token: &str,
     vpc_id: &str,
-    query: &str,
-) -> Result<Vec<GameSummary>> {
-    let body = json!({
-        "query": CATALOG_SEARCH_QUERY,
-        "variables": {
-            "vpcId": vpc_id,
-            "locale": LOCALE,
-            "sortString": CATALOG_SORT,
-            "fetchCount": FETCH_COUNT,
-            "searchString": query,
-            "filters": {},
-        },
+    query: Option<&str>,
+    cursor: &str,
+) -> Result<CatalogPage> {
+    let (document, label) = match query {
+        Some(_) => (catalog_search_query(), "catalog search"),
+        None => (catalog_query(), "catalog"),
+    };
+    let mut variables = json!({
+        "vpcId": vpc_id,
+        "locale": LOCALE,
+        "sortString": CATALOG_SORT,
+        "fetchCount": CATALOG_PAGE_SIZE,
+        "cursor": cursor,
+        // Empty on purpose - see module docs. A non-empty filter here narrows to a specific
+        // genre/store/etc, which is what the reference client's filter UI builds up; we have
+        // no such UI yet.
+        "filters": {},
     });
-    run_catalog_query(client, token, body, "catalog search").await
+    if let Some(query) = query {
+        variables["searchString"] = json!(query);
+    }
+    run_catalog_query(client, token, json!({ "query": document, "variables": variables }), label)
+        .await
 }
 
 async fn run_catalog_query(
@@ -274,7 +346,7 @@ async fn run_catalog_query(
     token: &str,
     body: serde_json::Value,
     context_label: &str,
-) -> Result<Vec<GameSummary>> {
+) -> Result<CatalogPage> {
     let response = headers::apply_graphql_headers(client.post(GRAPHQL_ENDPOINT), token)
         .json(&body)
         .send()
@@ -301,48 +373,105 @@ async fn run_catalog_query(
     let data = envelope
         .data
         .with_context(|| format!("{context_label} GraphQL response had no data"))?;
-    Ok(data
-        .apps
-        .items
-        .into_iter()
-        .map(|item| {
-            let numeric_app_id = item
-                .variants
-                .iter()
-                .find(|v| v.id.chars().all(|c| c.is_ascii_digit()))
-                .map(|v| v.id.clone())
-                .or_else(|| {
-                    if item.id.chars().all(|c| c.is_ascii_digit()) {
-                        Some(item.id.clone())
-                    } else {
-                        item.variants.first().map(|v| v.id.clone())
-                    }
-                })
-                .unwrap_or(item.id);
+    let page_info = data.apps.page_info.unwrap_or_default();
+    let next_cursor = page_info
+        .end_cursor
+        .filter(|cursor| page_info.has_next_page && !cursor.is_empty());
 
-            GameSummary {
-                cover_url: item.images.as_ref().and_then(|images| images.poster_url()),
-                app_id: numeric_app_id,
-                title: item.title,
+    Ok(CatalogPage {
+        games: data.apps.items.into_iter().map(to_game_summary).collect(),
+        next_cursor,
+        total_count: page_info.total_count,
+    })
+}
+
+/// Shared `CatalogAppItem` -> `GameSummary` mapping for both catalog queries above - they
+/// request the same item shape (`id`, `title`, `variants`, `images`).
+fn to_game_summary(item: CatalogAppItem) -> GameSummary {
+    let numeric_variant = item
+        .variants
+        .iter()
+        .find(|v| v.id.chars().all(|c| c.is_ascii_digit()));
+    let numeric_app_id = numeric_variant
+        .map(|v| v.id.clone())
+        .or_else(|| {
+            if item.id.chars().all(|c| c.is_ascii_digit()) {
+                Some(item.id.clone())
+            } else {
+                item.variants.first().map(|v| v.id.clone())
             }
         })
-        .collect())
+        .unwrap_or_else(|| item.id.clone());
+    // Store badge: same variant the numeric app id came from when there was one,
+    // otherwise whichever variant is first - either way, "some plausible storefront"
+    // beats showing nothing.
+    let store = numeric_variant
+        .or_else(|| item.variants.first())
+        .and_then(|v| v.app_store.clone());
+    // Same "find the first variant that actually has one" approach as OpenNOW's
+    // `resolveAppData` (`games.ts:585`) - which specific variant reports a play date
+    // doesn't matter, only whether the account has played *a* launchable form of this
+    // title before.
+    let last_played = item
+        .variants
+        .iter()
+        .find_map(|v| v.last_played_date())
+        .map(str::to_owned);
+
+    GameSummary {
+        cover_url: item.images.as_ref().and_then(|images| images.poster_url()),
+        app_id: numeric_app_id,
+        search_key: item.title.to_lowercase(),
+        title: item.title,
+        store,
+        last_played,
+    }
 }
 
-/// Fetches the VPC id and then the catalog in one call - the two requests every caller needs
-/// together (there is no reason to ever want one without the other).
-pub async fn fetch_catalog_for_account(client: &Client, token: &str) -> Result<Vec<GameSummary>> {
-    let vpc_id = fetch_vpc_id(client, token).await?;
-    fetch_catalog(client, token, &vpc_id).await
+/// Process-lifetime cache for the account's VPC id, shared with every spawned catalog task.
+///
+/// The id is stable for the session but was previously re-fetched before *every* catalog call,
+/// so each debounced keystroke cost two HTTPS round trips instead of one on a console with a
+/// single Wi-Fi radio.
+pub type VpcIdCache = Arc<OnceCell<String>>;
+
+/// What to use when `/v2/serverInfo` can't be reached. Same literal the reference client falls
+/// back to (`getVpcId`, `games.ts`).
+const FALLBACK_VPC_ID: &str = "GFN-PC";
+
+/// Returns the cached VPC id, fetching it on first use.
+///
+/// On failure this returns [`FALLBACK_VPC_ID`] **without caching it**, so a transient
+/// `serverInfo` blip doesn't pin the whole session to the fallback - the next call retries. The
+/// failure is logged loudly on purpose: if GFN ever stops accepting the fallback, the symptom is
+/// an empty catalog behind a successful HTTP 200, which is miserable to diagnose from a Vita.
+pub async fn resolve_vpc_id(client: &Client, token: &str, cache: &VpcIdCache) -> String {
+    if let Some(cached) = cache.get() {
+        return cached.clone();
+    }
+    match fetch_vpc_id(client, token).await {
+        Ok(vpc_id) => {
+            let _ = cache.set(vpc_id.clone());
+            vpc_id
+        }
+        Err(error) => {
+            eprintln!(
+                "serverInfo VPC id lookup failed, falling back to {FALLBACK_VPC_ID}: {error:#}"
+            );
+            FALLBACK_VPC_ID.to_owned()
+        }
+    }
 }
 
-/// Fetches the VPC id and then runs a server-side search in one call, mirroring
-/// `fetch_catalog_for_account`.
-pub async fn search_catalog_for_account(
+/// Resolves the VPC id (cached) and fetches one catalog page - the pair every caller needs
+/// together.
+pub async fn fetch_catalog_page_for_account(
     client: &Client,
     token: &str,
-    query: &str,
-) -> Result<Vec<GameSummary>> {
-    let vpc_id = fetch_vpc_id(client, token).await?;
-    search_catalog(client, token, &vpc_id, query).await
+    cache: &VpcIdCache,
+    query: Option<&str>,
+    cursor: &str,
+) -> Result<CatalogPage> {
+    let vpc_id = resolve_vpc_id(client, token, cache).await;
+    fetch_catalog_page(client, token, &vpc_id, query, cursor).await
 }

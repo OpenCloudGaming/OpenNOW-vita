@@ -15,14 +15,14 @@ const AUDIO_BYTES_PER_SECOND: u32 = AUDIO_SAMPLE_RATE as u32 * AUDIO_CHANNELS as
 // latency" and drop it, vs. how much to accumulate before unpausing playback in the first
 // place. Both are measured in wall-clock milliseconds of audio.
 //
-// These (and the two backlog bounds below) were originally green-vita's defaults (240/80ms,
-// 32 packets, 8 buffers), tuned for Xbox Cloud Gaming's network profile. GFN's video pipeline
+// These (and the two backlog bounds below) started from much looser values (240/80ms,
+// 32 packets, 8 buffers) tuned for a different service's network profile. GFN's video pipeline
 // runs a much tighter ~66-100ms worst-case budget (see streaming/video/worker.rs's 2-AU decode
 // queue and DirectVideoOutput's 3-frame texture microbuffer), so audio was trailing video by
 // 150-200ms in steady state and producing an audible pause/clear/resync "jump" whenever it hit
 // its old, much looser ceiling. There is no cross-track RTP-timestamp or RTCP-Sender-Report
-// clock alignment here to keep the two in lockstep - neither green-vita nor OpenNOW (the two
-// reference clients under reference/) do that either; OpenNOW's GStreamer pipeline in fact
+// clock alignment here to keep the two in lockstep - the reference clients under reference/
+// don't do that either; OpenNOW's GStreamer pipeline in fact
 // disables GStreamer's own PTS/clock sync outright and instead just runs tiny, leaky,
 // count-bounded queues per track. So "sync" here means the same thing it means for them:
 // keep every stage's buffering close to video's own budget, not hold either track back.

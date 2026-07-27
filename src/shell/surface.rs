@@ -121,7 +121,7 @@ impl VitaSurface {
 
         self.detach_direct_video_output();
         let (width, height) = (output.width, output.height);
-        // Prefer BGR565: this is the decode contract green-vita ships and has proven on real
+        // Prefer BGR565: this is the decode contract proven on real
         // Vita hardware (single RGBA565 output plane, no chroma-plane pointer guesswork). IYUV
         // was tried as the default here to work around Vita3K's HLE AVCDEC only implementing
         // YUV420 output, but on real hardware the untested YUV420_RASTER/chroma-pointer path

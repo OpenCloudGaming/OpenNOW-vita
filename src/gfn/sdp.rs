@@ -36,8 +36,34 @@ pub fn extract_ice_credentials(sdp: &str) -> IceCredentials {
 
 /// The `x-nv-sdpver` NVST parameter blob sent next to the standard answer. Its ICE/DTLS
 /// credentials must be *ours* (from the answer we generated), not echoes of the server's.
-pub fn build_nvst_sdp_from_answer(answer_sdp: &str) -> String {
+///
+/// `settings` supplies the bitrate/resolution/fps hints GFN needs to actually honor our
+/// requested profile: without them (as before this took `settings`) NVIDIA had no bitrate cap
+/// or viewport size from us at all and could pick a rate the Vita's WiFi can't sustain.
+///
+/// `vqos.drc.enable`/`vqos.dfc.enable` are ON so the encoder can back off bitrate/fps when the
+/// Vita's WiFi degrades instead of continuing to push the fixed cap regardless of what the link
+/// can sustain (that mismatch - sharp picture, growing lag - is what disabling them caused).
+/// `vqos.dfc.adjustResAndFps` stays OFF: the resolution never changes, only bitrate/fps do.
+pub fn build_nvst_sdp_from_answer(
+    answer_sdp: &str,
+    settings: &crate::gfn::cloudmatch::StreamSettings,
+) -> String {
     let ours = extract_ice_credentials(answer_sdp);
+    let (width, height) = settings.dimensions();
+    let max_bitrate_kbps = settings.max_bitrate_mbps * 1000;
+    // Same 35%/70% floor OpenNOW derives its min/initial bitrate from
+    // (`native/opennow-streamer/src/sdp.rs`) - GFN wants a starting point below the cap, not
+    // just the cap itself.
+    let min_bitrate_kbps = 5_000.max(max_bitrate_kbps * 35 / 100);
+    let initial_bitrate_kbps = min_bitrate_kbps.max(max_bitrate_kbps * 70 / 100);
+    // Must match `streaming::video::decoder`'s `AVCDEC_NUM_REF_FRAMES`, which is what the Vita's
+    // hardware decoder is initialized to hold. Omitting this let GFN encode with its own default
+    // reference count while our decoder retained only one picture: `sceAvcdecDecode` then
+    // consumed P-frames referencing a picture it had already dropped and returned *no frame* -
+    // seen on real hardware as ~35 "decoded, no output" per second at 8 fps, while Vita3K was
+    // fine because its HLE AVCDEC (FFmpeg) ignores the limit. 4 is what OpenNOW requests.
+    let max_reference_frames = crate::streaming::video::AVCDEC_NUM_REF_FRAMES;
     format!(
         "v=0\r\n\
         o=SdpTest test_id_13 14 IN IPv4 127.0.0.1\r\n\
@@ -55,8 +81,8 @@ pub fn build_nvst_sdp_from_answer(answer_sdp: &str) -> String {
         a=vqos.fec.repairPercent:5\r\n\
         a=vqos.fec.repairMaxPercent:35\r\n\
         a=vqos.dynamicStreamingMode:0\r\n\
-        a=vqos.drc.enable:0\r\n\
-        a=vqos.dfc.enable:0\r\n\
+        a=vqos.drc.enable:1\r\n\
+        a=vqos.dfc.enable:1\r\n\
         a=vqos.dfc.adjustResAndFps:0\r\n\
         a=video.dx9EnableNv12:1\r\n\
         a=video.dx9EnableHdr:1\r\n\
@@ -68,10 +94,24 @@ pub fn build_nvst_sdp_from_answer(answer_sdp: &str) -> String {
         a=vqos.drc.bitrateIirFilterFactor:18\r\n\
         a=video.packetSize:1140\r\n\
         a=packetPacing.minNumPacketsPerGroup:15\r\n\
-        a=vqos.bllFec.enable:0\r\n",
+        a=vqos.bllFec.enable:0\r\n\
+        a=video.clientViewportWd:{width}\r\n\
+        a=video.clientViewportHt:{height}\r\n\
+        a=video.maxFPS:{fps}\r\n\
+        a=video.maxNumReferenceFrames:{max_reference_frames}\r\n\
+        a=video.initialBitrateKbps:{initial_bitrate_kbps}\r\n\
+        a=video.initialPeakBitrateKbps:{max_bitrate_kbps}\r\n\
+        a=vqos.bw.maximumBitrateKbps:{max_bitrate_kbps}\r\n\
+        a=vqos.bw.minimumBitrateKbps:{min_bitrate_kbps}\r\n\
+        a=vqos.bw.peakBitrateKbps:{max_bitrate_kbps}\r\n\
+        a=vqos.bw.enableBandwidthEstimation:1\r\n\
+        a=vqos.bw.disableBitrateLimit:0\r\n\
+        m=application 0 RTP/AVP\r\n\
+        a=msid:input_1\r\n",
         pwd = ours.pwd,
         ufrag = ours.ufrag,
         fingerprint = ours.fingerprint,
+        fps = settings.fps,
     )
 }
 

@@ -4,7 +4,7 @@
 //! `RTCPeerConnection` is driven there (UDP socket + timers + poll loop), decrypted video RTP
 //! is depacketized into H.264 access units, and those are fed to the hardware decode worker
 //! (`streaming::video::VideoDecodeWorker`), which writes decoded RGB565 frames straight into
-//! the SDL textures registered by the shell (green-vita's direct-texture path).
+//! the SDL textures registered by the shell (the direct-texture path).
 //!
 //! The app talks to this through the same non-blocking channel shape as `signaling`: commands
 //! in (`add_remote_ice`), events out (`try_recv` once per tick).
@@ -23,7 +23,11 @@ use rtc::peer_connection::RTCPeerConnectionBuilder;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::media_engine::MediaEngine;
 use rtc::peer_connection::configuration::setting_engine::SettingEngine;
-use rtc::peer_connection::event::RTCPeerConnectionEvent;
+use rtc::interceptor::Registry;
+use rtc::peer_connection::configuration::interceptor_registry::{
+    configure_nack, configure_rtcp_reports,
+};
+use rtc::peer_connection::event::{RTCDataChannelEvent, RTCPeerConnectionEvent, RTCTrackEvent};
 use rtc::peer_connection::message::RTCMessage;
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::state::RTCPeerConnectionState;
@@ -31,10 +35,11 @@ use rtc::peer_connection::transport::{
     CandidateConfig, CandidateHostConfig, RTCDtlsRole, RTCIceCandidate, RTCIceCandidateInit,
     RTCIceServer,
 };
-use rtc::rtp::codec::h264::H264Packet;
-use rtc::rtp::packetizer::Depacketizer;
+use rtc::rtp_transceiver::RTCRtpReceiverId;
+use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
+use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,9 +51,27 @@ use tokio::sync::mpsc;
 const DEFAULT_STREAM_WIDTH: u32 = 1280;
 const DEFAULT_STREAM_HEIGHT: u32 = 720;
 
+// The Vita's actual panel resolution. Real hardware's AVCDEC can decode at the stream's real
+// (larger) coded size while writing scaled-down output directly to this resolution (see
+// `SceAvcdecFrame::frameWidth/frameHeight` in `streaming::video::decoder`), so there's no
+// reason to allocate/upload textures any bigger than what the screen can ever show:
+// at 1280x720 the decoder-to-texture traffic is roughly double what 960x544 needs per frame.
+// NOTE: this path is for real hardware only - Vita3K's HLE AVCDEC doesn't reproduce this
+// scaling (it crops a 960x544 window out of the decoded picture instead), which is why this
+// was reverted once already. Re-enable only when testing on a real Vita.
+const NATIVE_OUTPUT_WIDTH: u32 = 960;
+const NATIVE_OUTPUT_HEIGHT: u32 = 544;
+
 // Sized to match `streaming::audio::MAX_PENDING_OPUS_PACKETS` - this Vec is the layer that
 // feeds that channel, so it shouldn't hold more backlog than the channel behind it does.
 const MAX_PENDING_AUDIO_PACKETS: usize = 6;
+
+// GFN's server has no NACK/retransmission for the video stream: a lost UDP packet corrupts
+// reference-frame decode until the next keyframe, which without prompting can be seconds away
+// (seen as a stutter-then-black-frame freeze on lossy WiFi). Requesting one via RTCP PLI as
+// soon as loss is detected recovers in one round-trip instead of waiting it out. Rate-limited
+// so a burst of losses in the same round-trip doesn't spam the server with PLIs.
+const PLI_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Pins the calling thread to the given user-CPU mask, logging (not failing) on error - a
 /// missed pin just risks scheduler jitter, not correctness. Mirrors
@@ -113,7 +136,13 @@ impl PeerEngine {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let is_connected = Arc::new(AtomicBool::new(false));
         let (stream_width, stream_height) = stream_dimensions(session);
-        let video_output = Arc::new(DirectVideoOutput::new(stream_width, stream_height));
+        // Textures are sized to the Vita's actual panel resolution, not the (larger) resolution
+        // GFN encodes at - AVCDEC downscales during decode-to-texture, see `NATIVE_OUTPUT_*`.
+        // Real-hardware-only: see the note on those constants about Vita3K.
+        let video_output = Arc::new(DirectVideoOutput::new(
+            NATIVE_OUTPUT_WIDTH,
+            NATIVE_OUTPUT_HEIGHT,
+        ));
         let latest_frame: Arc<Mutex<Option<(u64, DecodedFrame)>>> = Arc::new(Mutex::new(None));
         let pending_audio: Arc<Mutex<Vec<Bytes>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -129,6 +158,8 @@ impl PeerEngine {
                     credential: server.credential.clone().unwrap_or_default(),
                 })
                 .collect(),
+            stream_width,
+            stream_height,
         };
 
         let thread_events = event_tx.clone();
@@ -139,7 +170,7 @@ impl PeerEngine {
         std::thread::Builder::new()
             .name("jade-vita-peer".to_owned())
             .spawn(move || {
-                // Pin to the same core green-vita's RTC worker uses, so the OS scheduler can't
+                // Pin to a dedicated core, so the OS scheduler can't
                 // migrate/contend this thread against the UI (default core) or video decode
                 // (pinned to USER_2 - see streaming::video::worker) threads under load.
                 #[cfg(target_os = "vita")]
@@ -231,6 +262,8 @@ struct PeerSetup {
     offer_sdp: String,
     server_ip: String,
     ice_servers: Vec<RTCIceServer>,
+    stream_width: u32,
+    stream_height: u32,
 }
 
 /// Discover the local IP the OS routes toward the server - classic connected-UDP trick.
@@ -248,6 +281,32 @@ fn local_ip_toward(server_ip: &str) -> IpAddr {
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
 }
 
+/// Previous-tick values of the decoder counters, so the readout can show per-second rates.
+#[derive(Default)]
+struct MetricsSnapshot {
+    submitted: u64,
+    queue_full: u64,
+    decode_calls: u64,
+    decode_us: u64,
+    no_frame: u64,
+    decode_errors: u64,
+    target_stalls: u64,
+}
+
+impl MetricsSnapshot {
+    fn capture(metrics: &crate::streaming::video::VideoMetrics) -> Self {
+        Self {
+            submitted: metrics.submitted.load(Ordering::Relaxed),
+            queue_full: metrics.queue_full.load(Ordering::Relaxed),
+            decode_calls: metrics.decode_calls.load(Ordering::Relaxed),
+            decode_us: metrics.decode_us.load(Ordering::Relaxed),
+            no_frame: metrics.no_frame.load(Ordering::Relaxed),
+            decode_errors: metrics.decode_errors.load(Ordering::Relaxed),
+            target_stalls: metrics.target_stalls.load(Ordering::Relaxed),
+        }
+    }
+}
+
 async fn run_peer(
     setup: PeerSetup,
     mut command_rx: mpsc::UnboundedReceiver<PeerCommand>,
@@ -260,8 +319,8 @@ async fn run_peer(
     // --- Hardware decode worker (sets `decoder_ready` so the shell creates the textures) ---
     let decode_worker = match VideoDecodeWorker::spawn(
         DecoderConfig {
-            decode_width: video_output.width,
-            decode_height: video_output.height,
+            decode_width: setup.stream_width,
+            decode_height: setup.stream_height,
             output_width: video_output.width,
             output_height: video_output.height,
         },
@@ -292,6 +351,20 @@ async fn run_peer(
     media_engine
         .register_default_codecs()
         .context("failed to register codecs")?;
+    // Our NVST answer already tells NVIDIA we support NACK-based retransmission
+    // (`a=video.enableRtpNack:1` - see gfn::sdp::build_nvst_sdp_from_answer), but that's a
+    // no-op unless something on our side actually generates NACKs. Without this, every lost
+    // UDP packet corrupts the H.264 reference chain until a keyframe arrives, which is what
+    // showed up as random stutter/black-frame freezes that OpenNOW (whose GStreamer
+    // webrtcbin does this automatically) doesn't suffer from. This registers the same
+    // per-packet-loss NACK generator/responder pair as the free equivalent.
+    let registry = configure_nack(Registry::new(), &mut media_engine);
+    // Without this, NVIDIA's `bwe.useOwdCongestionControl` has nothing to react to from us -
+    // NACK alone tells it about specific lost packets, not the ongoing loss/jitter picture RTCP
+    // Receiver Reports give its congestion control. Cheap to add (also ships in this crate),
+    // pure upside: it's receiver-generated feedback about our own inbound video/audio, not
+    // something we depend on the server to also send.
+    let registry = configure_rtcp_reports(registry);
     // NVIDIA's server is ICE-lite, which makes us the ICE controlling agent; rtc's Auto rule
     // (controlling → DTLS server) would answer `a=setup:passive` and then both sides sit
     // waiting for the other's ClientHello. GFN servers never act as DTLS client, so force the
@@ -308,6 +381,7 @@ async fn run_peer(
         )
         .with_media_engine(media_engine)
         .with_setting_engine(setting_engine)
+        .with_interceptor_registry(registry)
         .build()
         .context("failed to build peer connection")?;
 
@@ -316,8 +390,8 @@ async fn run_peer(
     pc.set_remote_description(offer)
         .context("failed to apply NVIDIA offer")?;
 
-    // --- Input data channel (must exist before the answer so its SCTP stream is negotiated;
-    //     the offer already carries the m=application section) ---
+    // --- Input data channels (must exist before the answer so their SCTP streams are
+    //     negotiated; the offer already carries the m=application section) ---
     let input_channel_id = match pc.create_data_channel("input_channel_v1", None) {
         Ok(channel) => Some(channel.id()),
         Err(error) => {
@@ -327,6 +401,12 @@ async fn run_peer(
             None
         }
     };
+    // NOTE: NVST advertises a second `input_channel_partially_reliable_v1` channel for
+    // lower-latency unordered gamepad state, but that path hasn't been verified against the real
+    // GFN server yet - on hardware it connected fine (video/audio worked) while every
+    // button/stick press did nothing, meaning the server never picked up packets sent on that
+    // second channel. Sending gamepad state on the known-working reliable `input_channel_v1`
+    // instead until the partially-reliable framing can be confirmed against a real capture.
     let mut input_encoder = InputEncoder::default();
     let mut input_ready = false;
     let session_clock = Instant::now();
@@ -363,7 +443,10 @@ async fn run_peer(
         .context("failed to set local description")?;
     let answer_sdp = answer.sdp.clone();
     let _ = std::fs::write("ux0:data/jade-vita/answer.sdp", &answer_sdp);
-    let nvst_sdp = crate::gfn::sdp::build_nvst_sdp_from_answer(&answer_sdp);
+    let nvst_sdp = crate::gfn::sdp::build_nvst_sdp_from_answer(
+        &answer_sdp,
+        &crate::gfn::cloudmatch::StreamSettings::for_vita(),
+    );
     let our_ufrag = crate::gfn::sdp::extract_ice_credentials(&answer_sdp).ufrag;
     let _ = event_tx.send(PeerEvent::LocalAnswer {
         answer_sdp,
@@ -377,11 +460,18 @@ async fn run_peer(
     }));
 
     // --- Sans-I/O event loop ---
-    let mut depacketizer = H264Packet::default();
-    let mut access_unit: Vec<u8> = Vec::with_capacity(64 * 1024);
+    // Full reassembly + loss-aware recovery (buffered/sequence-verified frame assembly,
+    // damage-score-gated decoder resync, keyframe-gated resume) - see `gfn::rtp` for why this
+    // replaces a naive "extend on arrival, flush on marker" accumulator.
+    let mut video_rtp = crate::gfn::rtp::VideoRtp::new(setup.stream_width, setup.stream_height);
     let mut buf = vec![0u8; 2000];
     let mut first_rtp_seen = false;
     let mut first_au_submitted = false;
+    let mut video_receiver_id: Option<RTCRtpReceiverId> = None;
+    let mut video_ssrc: Option<u32> = None;
+    let mut last_pli_sent: Option<Instant> = None;
+    let mut pli_sent_count: u64 = 0;
+    let mut dropped_frames_total: u64 = 0;
     // Raw pipeline counters surfaced on-screen every few seconds - the fastest way to see
     // which stage a stalled stream died at without console access on the Vita. In/out packet
     // classes tell apart "our DTLS ClientHello never leaves" from "NVIDIA never answers it".
@@ -394,6 +484,15 @@ async fn run_peer(
     let mut rtp_packets: u64 = 0;
     let mut access_units_sent: u64 = 0;
     let mut frames_decoded_last: u64 = 0;
+    // Previous-tick snapshots, so the readout can report per-second *rates* rather than
+    // ever-growing totals. Rates are what identify the bottleneck stage: see the comment on
+    // the stats tick below.
+    let mut rtp_packets_last: u64 = 0;
+    let mut access_units_last: u64 = 0;
+    let mut dropped_frames_last: u64 = 0;
+    let mut stats_last_at = Instant::now();
+    let decoder_metrics = decode_worker.as_ref().map(|worker| worker.metrics());
+    let mut metrics_last = MetricsSnapshot::default();
     // First byte of a UDP payload: 0-3 STUN, 20-63 DTLS records, 128-191 RTP/RTCP.
     fn classify(first_byte: Option<&u8>) -> usize {
         match first_byte {
@@ -403,7 +502,9 @@ async fn run_peer(
             _ => 2,
         }
     }
-    let mut stats_interval = tokio::time::interval(Duration::from_secs(3));
+    // 1s, not 3s: this now reports live rates (fps etc.), and a 3s window smears a stutter that
+    // lasts under a second into an average that looks fine.
+    let mut stats_interval = tokio::time::interval(Duration::from_secs(1));
     stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(2));
     heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -440,8 +541,32 @@ async fn run_peer(
                 RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(state) => {
                     let _ = event_tx.send(PeerEvent::Status(format!("ICE: {state}")));
                 }
-                RTCPeerConnectionEvent::OnTrack(_) => {
+                RTCPeerConnectionEvent::OnTrack(track_event) => {
+                    if let RTCTrackEvent::OnOpen(init) = &track_event
+                        && let Some(receiver) = pc.rtp_receiver(init.receiver_id)
+                        && receiver.track().kind() == RtpCodecKind::Video
+                    {
+                        video_receiver_id = Some(init.receiver_id);
+                        // `OnOpen` fires on receipt of the first RTP packet for this stream, so
+                        // its ssrc is already known here - no need to wait for that packet to
+                        // reach the `RtpPacket` match arm below.
+                        video_ssrc = Some(init.ssrc);
+                    }
                     let _ = event_tx.send(PeerEvent::Status("Track de media abierto".to_owned()));
+                }
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(channel_id)) => {
+                    // The channel reaching "open" is WebRTC's own authoritative readiness
+                    // signal - it's what actually lets `channel.send` succeed, unlike the
+                    // handshake-byte sniff below, which depends on the server choosing to send
+                    // a specific payload we may never see (this was the actual bug: the server
+                    // apparently doesn't send it, so `input_ready` never flipped and every
+                    // button/stick press was silently dropped despite video/audio streaming
+                    // fine over the same connection).
+                    if Some(channel_id) == input_channel_id {
+                        input_ready = true;
+                        let _ = event_tx
+                            .send(PeerEvent::Status("Canal de input abierto".to_owned()));
+                    }
                 }
                 _ => {}
             }
@@ -449,9 +574,10 @@ async fn run_peer(
 
         while let Some(message) = pc.poll_read() {
             if let RTCMessage::DataChannelMessage(_channel_id, dc_message) = &message {
-                if !input_ready
-                    && let Some(version) = parse_input_handshake_version(&dc_message.data)
-                {
+                // Opportunistic: if the server *does* send its handshake, pick up the protocol
+                // version from it, but readiness itself no longer depends on this arriving -
+                // see the `OnDataChannel`/`OnOpen` handling above.
+                if let Some(version) = parse_input_handshake_version(&dc_message.data) {
                     input_ready = true;
                     input_encoder.set_protocol_version(version.min(u8::MAX as u16) as u8);
                     let _ = event_tx.send(PeerEvent::Status(format!(
@@ -490,27 +616,42 @@ async fn run_peer(
                 if !is_video {
                     continue;
                 }
-                match depacketizer.depacketize(&packet.payload) {
-                    Ok(nal_bytes) => {
-                        access_unit.extend_from_slice(&nal_bytes);
-                        if packet.header.marker && !access_unit.is_empty() {
-                            let au = std::mem::take(&mut access_unit);
-                            access_units_sent += 1;
-                            if !first_au_submitted {
-                                first_au_submitted = true;
-                                let _ = event_tx.send(PeerEvent::Status(format!(
-                                    "Decodificando H.264 ({} bytes/AU)",
-                                    au.len()
-                                )));
-                            }
-                            if let Some(worker) = &decode_worker {
-                                worker.submit_access_unit(au);
-                            }
-                        }
+                video_ssrc = Some(packet.header.ssrc);
+                let mut keyframe_requested = false;
+                let sample_stats = if let Some(worker) = &decode_worker {
+                    video_rtp.receive(worker, packet, &mut keyframe_requested)
+                } else {
+                    continue;
+                };
+                dropped_frames_total += u64::from(sample_stats.dropped);
+                if sample_stats.source_frame_duration_us.is_some() {
+                    access_units_sent += 1;
+                    if !first_au_submitted {
+                        first_au_submitted = true;
+                        let _ = event_tx.send(PeerEvent::Status("Decodificando H.264".to_owned()));
                     }
-                    Err(_) => {
-                        // Mid-fragment loss; drop the partial AU and wait for the next one.
-                        access_unit.clear();
+                }
+                // Ask the server for a fresh keyframe instead of waiting out the corrupted
+                // reference-frame chain until its next scheduled one (which is what showed up
+                // as random stutter-then-black-frame freezes on lossy WiFi).
+                if keyframe_requested
+                    && let (Some(receiver_id), Some(ssrc)) = (video_receiver_id, video_ssrc)
+                {
+                    let now = Instant::now();
+                    let should_send = last_pli_sent
+                        .map(|last| now.duration_since(last) >= PLI_MIN_INTERVAL)
+                        .unwrap_or(true);
+                    if should_send
+                        && let Some(mut receiver) = pc.rtp_receiver(receiver_id)
+                        && receiver
+                            .write_rtcp(vec![Box::new(PictureLossIndication {
+                                sender_ssrc: 0,
+                                media_ssrc: ssrc,
+                            })])
+                            .is_ok()
+                    {
+                        last_pli_sent = Some(now);
+                        pli_sent_count += 1;
                     }
                 }
             }
@@ -548,11 +689,109 @@ async fn run_peer(
                     .ok()
                     .and_then(|slot| slot.map(|(id, _)| id))
                     .unwrap_or(0);
-                // Only worth showing while the picture hasn't appeared or has frozen.
-                if frames == frames_decoded_last {
+
+                // Live pipeline rates, always shown while streaming. Previously this only
+                // reported when the picture was completely frozen (`frames == frames_decoded_last`),
+                // which meant a stream that was merely *slow* displayed nothing at all - leaving
+                // no way to tell which stage was losing frames without console access.
+                //
+                // How to read it, in pipeline order - the first rate that is too low is the
+                // culprit, and each rules out everything downstream of it:
+                //   rtp/s  - packets off the wire. Low => network or the encoder isn't sending.
+                //   au/s   - assembled H.264 access units. Much lower than the expected fps while
+                //            rtp/s is healthy => packet loss is destroying frames (check pli).
+                //   fps    - frames the decoder actually published. Below au/s => the hardware
+                //            decoder can't keep up and `submit_access_unit` is dropping.
+                //   drop/s - frames the RTP layer discarded as damaged.
+                //   pli    - keyframe requests; climbing steadily means sustained loss.
+                let elapsed = stats_last_at.elapsed().as_secs_f32().max(0.001);
+                stats_last_at = Instant::now();
+                let rate = |now: u64, then: u64| (now.saturating_sub(then)) as f32 / elapsed;
+                let fps = rate(frames, frames_decoded_last);
+                let rtp_rate = rate(rtp_packets, rtp_packets_last);
+                // Note: this counts frame *timestamps observed by RTP*, i.e. the source
+                // framerate - not access units handed to the decoder. `sub` below is the real
+                // "reached the decode queue" number.
+                let src_rate = rate(access_units_sent, access_units_last);
+                let drop_rate = rate(dropped_frames_total, dropped_frames_last);
+                rtp_packets_last = rtp_packets;
+                access_units_last = access_units_sent;
+                dropped_frames_last = dropped_frames_total;
+
+                // Decoder-side counters, which is where the frames were actually going missing.
+                let (sub, qfull, calls, dec_us, noframe, errs, rebuilds, stalls) = match &decoder_metrics {
+                    Some(m) => (
+                        rate(m.submitted.load(Ordering::Relaxed), metrics_last.submitted),
+                        rate(m.queue_full.load(Ordering::Relaxed), metrics_last.queue_full),
+                        m.decode_calls.load(Ordering::Relaxed),
+                        m.decode_us.load(Ordering::Relaxed),
+                        rate(m.no_frame.load(Ordering::Relaxed), metrics_last.no_frame),
+                        rate(m.decode_errors.load(Ordering::Relaxed), metrics_last.decode_errors),
+                        m.decoder_rebuilds.load(Ordering::Relaxed),
+                        rate(m.target_stalls.load(Ordering::Relaxed), metrics_last.target_stalls),
+                    ),
+                    None => (0.0, 0.0, 0, 0, 0.0, 0.0, 0, 0.0),
+                };
+                // Mean wall time inside `HwVideoDecoder::decode`. This is the number that says
+                // whether the hardware decoder itself is the bottleneck: at 60 fps it has to
+                // average under ~16ms.
+                let avg_decode_ms = if calls > metrics_last.decode_calls {
+                    (dec_us - metrics_last.decode_us) as f32
+                        / (calls - metrics_last.decode_calls) as f32
+                        / 1000.0
+                } else {
+                    0.0
+                };
+                if let Some(m) = &decoder_metrics {
+                    metrics_last = MetricsSnapshot::capture(m);
+                }
+
+                // `in:` is the input data channel. GFN ends a session it considers idle (see
+                // `userIdleWarningTimeoutInMs` in the CloudMatch response), and idleness is
+                // judged from what arrives on this channel - so `in:0` during play means the
+                // session will be terminated early no matter how good the video looks.
+                let _ = event_tx.send(PeerEvent::Status(format!(
+                    "fps:{fps:.0} src:{src_rate:.0} sub:{sub:.0} qf:{qfull:.0} dec:{avg_decode_ms:.0}ms nof:{noframe:.0} err:{errs:.0} reb:{rebuilds} stall:{stalls:.0} rtp:{rtp_rate:.0} drop:{drop_rate:.0} pli:{pli_sent_count} wfk:{} in:{}",
+                    u8::from(video_rtp.waiting_for_keyframe()),
+                    u8::from(input_ready)
+                )));
+
+                // Handshake/transport totals stay available, but only while no picture has
+                // arrived yet - that's the only time they're the interesting question.
+                if frames == 0 {
                     let _ = event_tx.send(PeerEvent::Status(format!(
-                        "IN s:{in_stun} d:{in_dtls} m:{in_media} | OUT s:{out_stun} d:{out_dtls} m:{out_media} | RTP:{rtp_packets} AU:{access_units_sent} F:{frames}"
+                        "IN s:{in_stun} d:{in_dtls} m:{in_media} | OUT s:{out_stun} d:{out_dtls} m:{out_media} | RTP:{rtp_packets} AU:{access_units_sent}"
                     )));
+                }
+
+                // Stall watchdog, as before - only when the picture is genuinely not advancing.
+                if fps == 0.0 {
+                    // Stall watchdog (generalized from an initial-keyframe deadline,
+                    // generalized to any stall, not just the first frame): the per-packet PLI
+                    // above only fires when new (damaged) RTP arrives, so if the stream has
+                    // gone fully silent - e.g. the one PLI that would have unstuck it got lost
+                    // too - nothing would ever ask again. Piggyback a periodic nudge on this
+                    // same stats tick (rate-limited by `PLI_MIN_INTERVAL` regardless).
+                    if is_connected.load(Ordering::Relaxed)
+                        && let (Some(receiver_id), Some(ssrc)) = (video_receiver_id, video_ssrc)
+                    {
+                        let now = Instant::now();
+                        let should_send = last_pli_sent
+                            .map(|last| now.duration_since(last) >= PLI_MIN_INTERVAL)
+                            .unwrap_or(true);
+                        if should_send
+                            && let Some(mut receiver) = pc.rtp_receiver(receiver_id)
+                            && receiver
+                                .write_rtcp(vec![Box::new(PictureLossIndication {
+                                    sender_ssrc: 0,
+                                    media_ssrc: ssrc,
+                                })])
+                                .is_ok()
+                        {
+                            last_pli_sent = Some(now);
+                            pli_sent_count += 1;
+                        }
+                    }
                 }
                 frames_decoded_last = frames;
             }
