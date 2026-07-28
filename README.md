@@ -1,6 +1,6 @@
 <div align="center">
 
-# Jade Vita
+# OpenNOW Vita
 
 **GeForce NOW on PlayStation Vita**
 
@@ -15,7 +15,7 @@ with hardware H.264 decode and full controller input.
 </div>
 
 > [!WARNING]
-> **Unofficial project.** Jade Vita is not affiliated with, endorsed by, or
+> **Unofficial project.** OpenNOW Vita is not affiliated with, endorsed by, or
 > associated with NVIDIA or GeForce NOW. You need your own GeForce NOW account
 > to use it.
 
