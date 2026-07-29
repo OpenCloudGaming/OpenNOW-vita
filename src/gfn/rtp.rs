@@ -271,6 +271,22 @@ impl VideoRtp {
             self.damage_score = self.damage_score.saturating_sub(1);
         }
 
+        // A damaged access unit is missing macroblocks the decoder cannot reconstruct. Handing it
+        // over anyway does not just corrupt this frame: every following P-frame predicts from it,
+        // so a smear in one region outlives the packet loss by seconds and stays anchored to
+        // whatever was moving there. Holding the previous frame instead keeps the damage from
+        // entering the reference chain at all - the visible cost is one stale frame rather than a
+        // patch of the picture that stops updating.
+        // Note this deliberately does *not* ask for a keyframe. Doing so per damaged frame turned
+        // a steady trickle of loss into a keyframe storm: an IDR costs several times a P-frame,
+        // so on a link already dropping packets the repair traffic crowds out the content and
+        // causes the next loss. `record_damage` above owns that escalation and only spends a
+        // keyframe once damage has actually accumulated past its fps-scaled threshold.
+        if frame_was_damaged {
+            stats.dropped = stats.dropped.saturating_add(1);
+            return stats;
+        }
+
         if !worker.submit_access_unit(data) {
             eprintln!("Video decoder queue is full; continuing while requesting a keyframe");
             *keyframe_requested = true;

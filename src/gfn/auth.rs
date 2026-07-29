@@ -17,6 +17,8 @@ const IDP_ID: &str = "PDiAhv2kJTFeQ7WOPqiQ2tRZ7lGhR2X11dXvM4TZSxg";
 const SCOPE: &str = "openid consent email tk_client age";
 const DEVICE_AUTHORIZE_ENDPOINT: &str = "https://login.nvidia.com/device/authorize";
 const TOKEN_ENDPOINT: &str = "https://login.nvidia.com/token";
+/// Issues the long-lived device credential that outlives the OAuth refresh token.
+const CLIENT_TOKEN_ENDPOINT: &str = "https://login.nvidia.com/client_token";
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; Steam Deck) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 const DISPLAY_NAME: &str = "OpenNOW Vita";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -132,6 +134,16 @@ struct TokenResponse {
     id_token: Option<String>,
     #[serde(default)]
     expires_in: Option<u64>,
+    #[serde(default)]
+    client_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientTokenResponse {
+    #[serde(default)]
+    client_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,12 +188,19 @@ pub async fn poll_device_login(
             .json()
             .await
             .context("failed to decode device token response")?;
-        return Ok(DevicePollOutcome::Authorized(AuthTokens {
+        let mut tokens = AuthTokens {
             access_token: payload.access_token,
             refresh_token: payload.refresh_token,
             id_token: payload.id_token,
             expires_at_unix: expires_at_unix(payload.expires_in),
-        }));
+            client_token: payload.client_token,
+            client_token_expires_at_unix: 0,
+        };
+        // Grab the long-lived credential right away, while the access token is certainly valid.
+        if tokens.client_token.is_none() {
+            request_client_token(client, &mut tokens).await;
+        }
+        return Ok(DevicePollOutcome::Authorized(tokens));
     }
 
     let error: TokenErrorResponse = response
@@ -214,6 +233,13 @@ pub struct AuthTokens {
     pub refresh_token: Option<String>,
     pub id_token: Option<String>,
     pub expires_at_unix: u64,
+    /// NVIDIA's long-lived device credential. Defaulted so token stores written before this field
+    /// existed still deserialize - they simply refresh via `refresh_token` until a client token is
+    /// fetched.
+    #[serde(default)]
+    pub client_token: Option<String>,
+    #[serde(default)]
+    pub client_token_expires_at_unix: u64,
 }
 
 impl AuthTokens {
@@ -223,6 +249,284 @@ impl AuthTokens {
     pub fn bearer(&self) -> &str {
         self.id_token.as_deref().unwrap_or(&self.access_token)
     }
+
+    /// Whether the access token is close enough to expiry to be worth replacing before use.
+    pub fn needs_refresh(&self) -> bool {
+        should_refresh(self.expires_at_unix, now_unix())
+    }
+
+    /// Whether anything about the saved login is worth renewing before the next request.
+    ///
+    /// Deliberately no "is it expired" counterpart driven by the local clock: the Vita's RTC can be
+    /// wrong by hours, and declaring a working credential dead is far more costly than sending one
+    /// request that comes back 401. NVIDIA decides when a token is finished.
+    pub fn needs_maintenance(&self) -> bool {
+        self.needs_refresh() || self.client_token_needs_refresh()
+    }
+
+    fn client_token_needs_refresh(&self) -> bool {
+        self.client_token.is_none() || should_refresh(self.client_token_expires_at_unix, now_unix())
+    }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Replace a token this long before it actually expires, so a request never races the deadline.
+const REFRESH_WINDOW_SECS: u64 = 10 * 60;
+
+fn should_refresh(expires_at_unix: u64, now: u64) -> bool {
+    expires_at_unix == 0 || expires_at_unix.saturating_sub(now) < REFRESH_WINDOW_SECS
+}
+
+/// Statuses worth retrying: a transient network failure or a server-side hiccup says nothing about
+/// whether the credential is still good.
+fn is_temporary_status(status: Option<u16>) -> bool {
+    match status {
+        None => true,
+        Some(status) => status == 408 || status == 429 || status >= 500,
+    }
+}
+
+fn refresh_retry_delay(completed_attempts: u32) -> Duration {
+    if completed_attempts <= 1 {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_millis(1_500)
+    }
+}
+
+/// Why a refresh failed, which decides whether the saved login survives.
+#[derive(Debug)]
+pub enum RefreshError {
+    /// The credential itself is no longer accepted - the only cure is a fresh device-code login.
+    ReauthenticationRequired(String),
+    /// Something transient. The saved login must be kept: discarding it here would turn a dropped
+    /// packet into a QR-code re-scan.
+    Temporary(anyhow::Error),
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReauthenticationRequired(message) => write!(formatter, "{message}"),
+            Self::Temporary(error) => write!(formatter, "{error:#}"),
+        }
+    }
+}
+
+/// Carries the fields NVIDIA leaves out of a refresh response over from the previous tokens.
+///
+/// This is not defensive tidiness - it is required. NVIDIA routinely omits `id_token` when
+/// refreshing, and `bearer()` prefers `id_token`, so blindly taking the response would swap the
+/// signed JWT that CloudMatch needs for an access token it rejects.
+fn merge_refreshed(previous: &AuthTokens, response: TokenResponse) -> AuthTokens {
+    let client_token_rotated = response
+        .client_token
+        .as_ref()
+        .is_some_and(|token| Some(token) != previous.client_token.as_ref());
+    AuthTokens {
+        access_token: response.access_token,
+        refresh_token: response.refresh_token.or_else(|| previous.refresh_token.clone()),
+        id_token: response.id_token.or_else(|| previous.id_token.clone()),
+        expires_at_unix: expires_at_unix(response.expires_in),
+        // A rotated client token needs its own lifetime from /client_token, so mark it unknown (0)
+        // rather than inheriting the old one's deadline.
+        client_token_expires_at_unix: if client_token_rotated {
+            0
+        } else if response.client_token.is_some() {
+            expires_at_unix(response.expires_in)
+        } else {
+            previous.client_token_expires_at_unix
+        },
+        client_token: response.client_token.or_else(|| previous.client_token.clone()),
+    }
+}
+
+async fn post_token_form(
+    client: &Client,
+    form: &[(&str, &str)],
+) -> Result<TokenResponse, RefreshError> {
+    let mut last_error = None;
+    for attempt in 1..=3u32 {
+        let response = client
+            .post(TOKEN_ENDPOINT)
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Origin", "https://play.geforcenow.com")
+            .header("Referer", "https://play.geforcenow.com/")
+            .form(form)
+            .send()
+            .await;
+
+        let status = match &response {
+            Ok(response) => Some(response.status().as_u16()),
+            Err(_) => None,
+        };
+
+        match response {
+            Ok(response) if response.status().is_success() => {
+                return response
+                    .json::<TokenResponse>()
+                    .await
+                    .map_err(|error| RefreshError::Temporary(error.into()));
+            }
+            // 400 and 401 are NVIDIA saying the credential is dead, not that we should try again.
+            Ok(response) if matches!(response.status().as_u16(), 400 | 401) => {
+                return Err(RefreshError::ReauthenticationRequired(format!(
+                    "saved GFN login is no longer valid (HTTP {})",
+                    response.status().as_u16()
+                )));
+            }
+            Ok(response) => {
+                last_error = Some(anyhow::anyhow!(
+                    "token refresh rejected with HTTP {}",
+                    response.status().as_u16()
+                ));
+            }
+            Err(error) => last_error = Some(anyhow::Error::from(error)),
+        }
+
+        if !is_temporary_status(status) || attempt == 3 {
+            break;
+        }
+        tokio::time::sleep(refresh_retry_delay(attempt)).await;
+    }
+
+    Err(RefreshError::Temporary(last_error.unwrap_or_else(|| {
+        anyhow::anyhow!("token refresh failed for an unknown reason")
+    })))
+}
+
+/// Exchanges the long-lived client token for a fresh access token.
+async fn refresh_with_client_token(
+    client: &Client,
+    tokens: &AuthTokens,
+    user_id: &str,
+) -> Result<AuthTokens, RefreshError> {
+    let Some(client_token) = tokens.client_token.as_deref() else {
+        return Err(RefreshError::Temporary(anyhow::anyhow!(
+            "no client token saved"
+        )));
+    };
+    if user_id.is_empty() {
+        return Err(RefreshError::Temporary(anyhow::anyhow!(
+            "client-token refresh needs the account subject id"
+        )));
+    }
+
+    let response = post_token_form(
+        client,
+        &[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:client_token"),
+            ("client_token", client_token),
+            ("client_id", CLIENT_ID),
+            ("sub", user_id),
+        ],
+    )
+    .await?;
+    Ok(merge_refreshed(tokens, response))
+}
+
+/// The standard OAuth refresh, used when there is no client token or it was rejected.
+async fn refresh_with_refresh_token(
+    client: &Client,
+    tokens: &AuthTokens,
+) -> Result<AuthTokens, RefreshError> {
+    let Some(refresh_token) = tokens.refresh_token.as_deref() else {
+        return Err(RefreshError::ReauthenticationRequired(
+            "saved GFN login cannot be refreshed".to_owned(),
+        ));
+    };
+
+    let response = post_token_form(
+        client,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", CLIENT_ID),
+        ],
+    )
+    .await?;
+    Ok(merge_refreshed(tokens, response))
+}
+
+/// Fetches a client token for the current access token, if NVIDIA will issue one.
+///
+/// Best-effort: the OAuth refresh token still works without it, this just outlives it.
+async fn request_client_token(client: &Client, tokens: &mut AuthTokens) {
+    let response = client
+        .get(CLIENT_TOKEN_ENDPOINT)
+        .header("Accept", "application/json, text/plain, */*")
+        .header("Origin", "https://play.geforcenow.com")
+        .header("Referer", "https://play.geforcenow.com/")
+        .header("Authorization", format!("Bearer {}", tokens.access_token))
+        .send()
+        .await;
+
+    let Ok(response) = response else { return };
+    if !response.status().is_success() {
+        return;
+    }
+    let Ok(payload) = response.json::<ClientTokenResponse>().await else {
+        return;
+    };
+    if let Some(client_token) = payload.client_token {
+        tokens.client_token = Some(client_token);
+        tokens.client_token_expires_at_unix = expires_at_unix(payload.expires_in);
+    }
+}
+
+/// Replaces the access token, preferring the long-lived client token and falling back to OAuth.
+pub async fn refresh_tokens(
+    client: &Client,
+    tokens: &AuthTokens,
+    user_id: &str,
+) -> Result<AuthTokens, RefreshError> {
+    if tokens.client_token.is_some() {
+        match refresh_with_client_token(client, tokens, user_id).await {
+            Ok(refreshed) => return Ok(refreshed),
+            Err(RefreshError::ReauthenticationRequired(message)) => {
+                // The client token is dead, but the OAuth refresh token may well not be.
+                eprintln!("Client-token refresh rejected ({message}); trying OAuth refresh");
+            }
+            Err(RefreshError::Temporary(error)) => {
+                eprintln!("Client-token refresh failed ({error:#}); trying OAuth refresh");
+            }
+        }
+    }
+    refresh_with_refresh_token(client, tokens).await
+}
+
+/// Returns tokens good for immediate use, refreshing and re-saving them only when needed.
+///
+/// Called before work that authenticates, so an idle Vita picks up where it left off instead of
+/// sending the player back to the QR code.
+pub async fn ensure_fresh_tokens(
+    client: &Client,
+    tokens: &AuthTokens,
+    user_id: &str,
+) -> Result<AuthTokens, RefreshError> {
+    if !tokens.needs_refresh() && !tokens.client_token_needs_refresh() {
+        return Ok(tokens.clone());
+    }
+
+    let mut refreshed = if tokens.needs_refresh() {
+        refresh_tokens(client, tokens, user_id).await?
+    } else {
+        tokens.clone()
+    };
+    if refreshed.client_token_needs_refresh() {
+        request_client_token(client, &mut refreshed).await;
+    }
+    if let Err(error) = save_tokens(&refreshed) {
+        // Losing the write is survivable - the tokens in memory are still good for this session.
+        eprintln!("Could not persist refreshed GFN tokens: {error:#}");
+    }
+    Ok(refreshed)
 }
 
 pub struct GfnUser {
@@ -454,5 +758,110 @@ fn decode_hex_digit(digit: u8) -> Result<u8> {
         b'a'..=b'f' => Ok(digit - b'a' + 10),
         b'A'..=b'F' => Ok(digit - b'A' + 10),
         _ => bail!("invalid hex digit"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn saved_tokens() -> AuthTokens {
+        AuthTokens {
+            access_token: "old-access".to_owned(),
+            refresh_token: Some("old-refresh".to_owned()),
+            id_token: Some("old-id".to_owned()),
+            expires_at_unix: 1_000,
+            client_token: Some("old-client".to_owned()),
+            client_token_expires_at_unix: 2_000,
+        }
+    }
+
+    fn response(access: &str) -> TokenResponse {
+        TokenResponse {
+            access_token: access.to_owned(),
+            refresh_token: None,
+            id_token: None,
+            expires_in: Some(3_600),
+            client_token: None,
+        }
+    }
+
+    /// The bug this guards against is subtle and total: `bearer()` prefers `id_token`, so dropping
+    /// an omitted one swaps the JWT CloudMatch requires for a token it refuses.
+    #[test]
+    fn refresh_keeps_the_id_token_nvidia_omitted() {
+        let merged = merge_refreshed(&saved_tokens(), response("new-access"));
+        assert_eq!(merged.access_token, "new-access");
+        assert_eq!(merged.id_token.as_deref(), Some("old-id"));
+        assert_eq!(merged.bearer(), "old-id");
+    }
+
+    #[test]
+    fn refresh_keeps_the_refresh_and_client_tokens_when_omitted() {
+        let merged = merge_refreshed(&saved_tokens(), response("new-access"));
+        assert_eq!(merged.refresh_token.as_deref(), Some("old-refresh"));
+        assert_eq!(merged.client_token.as_deref(), Some("old-client"));
+        assert_eq!(merged.client_token_expires_at_unix, 2_000);
+    }
+
+    #[test]
+    fn refresh_takes_new_values_when_nvidia_sends_them() {
+        let mut fresh = response("new-access");
+        fresh.id_token = Some("new-id".to_owned());
+        fresh.refresh_token = Some("new-refresh".to_owned());
+        let merged = merge_refreshed(&saved_tokens(), fresh);
+        assert_eq!(merged.id_token.as_deref(), Some("new-id"));
+        assert_eq!(merged.refresh_token.as_deref(), Some("new-refresh"));
+    }
+
+    #[test]
+    fn a_rotated_client_token_invalidates_its_old_deadline() {
+        let mut fresh = response("new-access");
+        fresh.client_token = Some("rotated-client".to_owned());
+        let merged = merge_refreshed(&saved_tokens(), fresh);
+        assert_eq!(merged.client_token.as_deref(), Some("rotated-client"));
+        assert_eq!(
+            merged.client_token_expires_at_unix, 0,
+            "a rotated client token needs a fresh lifetime from /client_token"
+        );
+    }
+
+    #[test]
+    fn refresh_window_fires_before_the_token_actually_dies() {
+        let now = 10_000;
+        assert!(should_refresh(now + 60, now), "inside the window");
+        assert!(!should_refresh(now + REFRESH_WINDOW_SECS + 60, now));
+        // An unknown expiry has to be treated as due, or it would never be renewed.
+        assert!(should_refresh(0, now));
+    }
+
+    #[test]
+    fn a_missing_client_token_counts_as_maintenance_due() {
+        let mut tokens = saved_tokens();
+        tokens.expires_at_unix = now_unix() + REFRESH_WINDOW_SECS * 10;
+        tokens.client_token = None;
+        assert!(
+            tokens.needs_maintenance(),
+            "an upgraded login with no client token must still get one"
+        );
+    }
+
+    #[test]
+    fn only_transient_statuses_are_retried() {
+        assert!(is_temporary_status(None), "a network failure says nothing");
+        assert!(is_temporary_status(Some(429)));
+        assert!(is_temporary_status(Some(503)));
+        assert!(!is_temporary_status(Some(400)));
+        assert!(!is_temporary_status(Some(401)));
+    }
+
+    #[test]
+    fn stored_tokens_without_a_client_token_still_load() {
+        // Token stores written before the client-token fields existed must keep working.
+        let legacy = r#"{"access_token":"a","refresh_token":"r","id_token":"i","expires_at_unix":5}"#;
+        let tokens: AuthTokens = serde_json::from_str(legacy).expect("legacy store should load");
+        assert_eq!(tokens.client_token, None);
+        assert_eq!(tokens.client_token_expires_at_unix, 0);
+        assert_eq!(tokens.bearer(), "i");
     }
 }

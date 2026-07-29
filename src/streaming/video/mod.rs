@@ -29,6 +29,15 @@ pub enum VideoPixelFormat {
 
 const MAX_PENDING_TEXTURE_WAIT: Duration = Duration::from_millis(34);
 
+/// How many textures the decoder and the render thread pass between them.
+///
+/// Two is the intuitive answer - one on screen, one being drawn - but it makes the handoff
+/// lock-step: with both slots occupied the decoder has nowhere to write and parks until the
+/// shell's next iteration hands one back. Measured on hardware that was 14.5 ms of waiting per
+/// 2.8 ms of decoding. The third texture is the slack that lets the decoder keep working while
+/// one frame is displayed and another waits its turn; it costs ~1 MiB.
+pub const VIDEO_TEXTURE_COUNT: usize = 3;
+
 /// One SDL streaming texture's writable memory, registered by the shell (`shell::surface`).
 #[derive(Clone, Copy)]
 pub struct VideoTextureTarget {
@@ -38,10 +47,25 @@ pub struct VideoTextureTarget {
 }
 
 struct DirectVideoOutputState {
-    targets: Option<[VideoTextureTarget; 2]>,
+    targets: Option<[VideoTextureTarget; VIDEO_TEXTURE_COUNT]>,
     displayed: Option<usize>,
+    /// Decoded and waiting to be shown. Newest-wins rather than a queue: an undisplayed frame that
+    /// has already been superseded is worth less than the latency a queue would add.
     pending: Option<(usize, u64)>,
+    /// Handed out to the decode thread and being written into right now.
+    writing: Option<usize>,
     next_generation: u64,
+}
+
+impl DirectVideoOutputState {
+    /// The first texture nobody is displaying, holding for display, or writing into.
+    fn free_slot(&self) -> Option<usize> {
+        (0..VIDEO_TEXTURE_COUNT).find(|index| {
+            self.displayed != Some(*index)
+                && self.pending.map(|(slot, _)| slot) != Some(*index)
+                && self.writing != Some(*index)
+        })
+    }
 }
 
 /// Synchronizes the frame-producer thread with the two SDL/GXM textures owned by the render
@@ -68,6 +92,7 @@ impl DirectVideoOutput {
                 targets: None,
                 displayed: None,
                 pending: None,
+                writing: None,
                 next_generation: 0,
             }),
             frame_displayed: Condvar::new(),
@@ -106,11 +131,12 @@ impl DirectVideoOutput {
         }
     }
 
-    pub fn set_targets(&self, targets: [VideoTextureTarget; 2]) {
+    pub fn set_targets(&self, targets: [VideoTextureTarget; VIDEO_TEXTURE_COUNT]) {
         if let Ok(mut state) = self.state.lock() {
             state.targets = Some(targets);
             state.displayed = None;
             state.pending = None;
+            state.writing = None;
         }
     }
 
@@ -119,22 +145,21 @@ impl DirectVideoOutput {
             state.targets = None;
             state.displayed = None;
             state.pending = None;
+            state.writing = None;
         }
         self.frame_displayed.notify_all();
     }
 
     pub fn mark_displayed(&self, index: usize, generation: u64) {
-        let mut cleared_pending = false;
         if let Ok(mut state) = self.state.lock() {
+            // Showing a new texture frees whichever one it replaces, so this always notifies -
+            // not only when it happens to clear `pending`.
             state.displayed = Some(index);
             if state.pending == Some((index, generation)) {
                 state.pending = None;
-                cleared_pending = true;
             }
         }
-        if cleared_pending {
-            self.frame_displayed.notify_one();
-        }
+        self.frame_displayed.notify_one();
     }
 
     /// Blocks (bounded by `MAX_PENDING_TEXTURE_WAIT`) until a texture is free to write into.
@@ -143,11 +168,11 @@ impl DirectVideoOutput {
         stalls: &AtomicU64,
     ) -> Option<DirectVideoTargetGuard<'_>> {
         let mut state = self.state.lock().ok()?;
-        if state.pending.is_some() {
+        if state.free_slot().is_none() {
             let (waited_state, timeout) = self
                 .frame_displayed
                 .wait_timeout_while(state, MAX_PENDING_TEXTURE_WAIT, |state| {
-                    state.targets.is_some() && state.pending.is_some()
+                    state.targets.is_some() && state.free_slot().is_none()
                 })
                 .ok()?;
             if timeout.timed_out() {
@@ -156,14 +181,19 @@ impl DirectVideoOutput {
             state = waited_state;
         }
         let targets = state.targets?;
-        let index = state
-            .pending
-            .map(|(index, _)| index)
-            .unwrap_or_else(|| state.displayed.map_or(0, |displayed| 1 - displayed));
+        // On timeout there is still no free slot, so fall back to overwriting the undisplayed
+        // pending frame - dropping a decoded frame beats dropping an access unit, which would cost
+        // reference frames and force a resync.
+        let index = match state.free_slot() {
+            Some(index) => index,
+            None => state.pending.map(|(index, _)| index)?,
+        };
+        state.writing = Some(index);
         Some(DirectVideoTargetGuard {
             state,
             target: targets[index],
             index,
+            published: false,
         })
     }
 }
@@ -172,6 +202,17 @@ pub struct DirectVideoTargetGuard<'a> {
     state: MutexGuard<'a, DirectVideoOutputState>,
     target: VideoTextureTarget,
     index: usize,
+    published: bool,
+}
+
+impl Drop for DirectVideoTargetGuard<'_> {
+    fn drop(&mut self) {
+        // The decode path abandons a guard without publishing whenever the access unit turns out
+        // to be stale. Releasing the slot here keeps that from permanently retiring a texture.
+        if !self.published {
+            self.state.writing = None;
+        }
+    }
 }
 
 impl DirectVideoTargetGuard<'_> {
@@ -183,6 +224,8 @@ impl DirectVideoTargetGuard<'_> {
         self.state.next_generation = self.state.next_generation.wrapping_add(1);
         let generation = self.state.next_generation;
         self.state.pending = Some((self.index, generation));
+        self.state.writing = None;
+        self.published = true;
         (self.index, generation)
     }
 }
@@ -206,6 +249,14 @@ pub struct VideoMetrics {
     /// `lock_decode_target` gave up waiting for the render thread to free a texture, so the
     /// previous undisplayed frame was overwritten.
     pub target_stalls: AtomicU64,
+    /// Cumulative time the decode thread spent inside `lock_decode_target` waiting for the render
+    /// thread to hand a texture back.
+    ///
+    /// `decode_us` deliberately excludes this, which makes the two easy to confuse: a `dec:` of
+    /// 1 ms alongside a saturated queue reads as "the decoder is idle" when it actually means
+    /// "the decoder is parked". Counted separately so the readout can tell those apart.
+    pub target_wait_us: AtomicU64,
+    pub target_wait_calls: AtomicU64,
 }
 
 #[derive(Clone, Copy)]

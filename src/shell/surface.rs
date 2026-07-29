@@ -3,7 +3,9 @@
 
 use crate::gfn::peer::PeerEngine;
 use crate::shell::egui_painter::SdlEguiPainter;
-use crate::streaming::video::{DirectVideoOutput, VideoPixelFormat, VideoTextureTarget};
+use crate::streaming::video::{
+    DirectVideoOutput, VIDEO_TEXTURE_COUNT, VideoPixelFormat, VideoTextureTarget,
+};
 use anyhow::{Context, Result};
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::render::{Canvas, Texture};
@@ -19,7 +21,7 @@ pub const HEIGHT: u32 = 544;
 /// egui, which is what keeps the Vita inside its VRAM budget.
 pub struct VitaSurface {
     canvas: Canvas<Window>,
-    video_textures: Option<[Texture; 2]>,
+    video_textures: Option<[Texture; VIDEO_TEXTURE_COUNT]>,
     displayed_video_texture: Option<usize>,
     direct_video_output: Option<Arc<DirectVideoOutput>>,
     video_width: u32,
@@ -33,6 +35,15 @@ pub struct VitaSurface {
 
 impl VitaSurface {
     pub fn new(video: &sdl2::VideoSubsystem) -> Result<Self> {
+        // Must be set before any texture is created: SDL captures the scale mode at creation time,
+        // and SDL's Vita backend maps it straight to a gxm texture filter
+        // (`SCE_GXM_TEXTURE_FILTER_LINEAR` vs `POINT`).
+        //
+        // Without it SDL defaults to nearest, so the 1280x720 stream was being downscaled to the
+        // Vita's 960x544 by dropping pixels - free on the GPU either way, but nearest shimmers on
+        // anything that moves. Linear costs nothing: the texture unit filters in hardware.
+        sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "1");
+
         let window = video
             .window("OpenNOW Vita", WIDTH, HEIGHT)
             .position_centered()
@@ -90,7 +101,7 @@ impl VitaSurface {
             return Ok(());
         }
         let index = frame.texture_index;
-        if index >= 2 {
+        if index >= VIDEO_TEXTURE_COUNT {
             anyhow::bail!("frame producer returned invalid direct texture index {index}");
         }
         if let Some(output) = &self.direct_video_output {
@@ -121,45 +132,51 @@ impl VitaSurface {
         let (width, height) = (output.width, output.height);
         let force_iyuv = self.force_iyuv;
         let mut format = VideoPixelFormat::Bgr565;
-        let mut create_pair = |pixel_format: PixelFormatEnum| -> Result<[Texture; 2]> {
+        let mut create_targets = |pixel_format: PixelFormatEnum| -> Result<[Texture; VIDEO_TEXTURE_COUNT]> {
             let mut create_one = || {
                 self.canvas
                     .create_texture_streaming(pixel_format, width, height)
                     .map_err(anyhow::Error::msg)
                     .with_context(|| format!("failed to create {pixel_format:?} video texture"))
             };
-            Ok([create_one()?, create_one()?])
+            Ok([create_one()?, create_one()?, create_one()?])
         };
         let mut textures = if force_iyuv {
             format = VideoPixelFormat::Iyuv;
-            create_pair(PixelFormatEnum::IYUV)?
+            create_targets(PixelFormatEnum::IYUV)?
         } else {
-            match create_pair(PixelFormatEnum::BGR565) {
+            match create_targets(PixelFormatEnum::BGR565) {
                 Ok(textures) => textures,
                 Err(error) => {
                     eprintln!("BGR565 video textures unavailable ({error:#}); using IYUV");
                     format = VideoPixelFormat::Iyuv;
-                    create_pair(PixelFormatEnum::IYUV)?
+                    create_targets(PixelFormatEnum::IYUV)?
                 }
             }
         };
-        let mut targets = [VideoTextureTarget {
-            ptr: 0,
-            pitch: 0,
-            capacity: 0,
-        }; 2];
-        for (index, texture) in textures.iter_mut().enumerate() {
-            texture
-                .with_lock(None, |pixels, pitch| {
-                    targets[index] = VideoTextureTarget {
-                        ptr: pixels.as_mut_ptr() as usize,
-                        pitch: pitch as u32,
-                        capacity: pixels.len().min(u32::MAX as usize) as u32,
-                    };
-                })
-                .map_err(anyhow::Error::msg)
-                .context("failed to lock direct SDL video texture")?;
-        }
+        let record_targets =
+            |textures: &mut [Texture; VIDEO_TEXTURE_COUNT]| -> Result<[VideoTextureTarget; VIDEO_TEXTURE_COUNT]> {
+                let mut targets = [VideoTextureTarget {
+                    ptr: 0,
+                    pitch: 0,
+                    capacity: 0,
+                }; VIDEO_TEXTURE_COUNT];
+                for (index, texture) in textures.iter_mut().enumerate() {
+                    texture
+                        .with_lock(None, |pixels, pitch| {
+                            targets[index] = VideoTextureTarget {
+                                ptr: pixels.as_mut_ptr() as usize,
+                                pitch: pitch as u32,
+                                capacity: pixels.len().min(u32::MAX as usize) as u32,
+                            };
+                        })
+                        .map_err(anyhow::Error::msg)
+                        .context("failed to lock direct SDL video texture")?;
+                }
+                Ok(targets)
+            };
+
+        let mut targets = record_targets(&mut textures)?;
         if !force_iyuv
             && format == VideoPixelFormat::Iyuv
             && targets.iter().any(|target| target.pitch != width)
@@ -169,19 +186,8 @@ impl VitaSurface {
                 targets[0].pitch
             );
             format = VideoPixelFormat::Bgr565;
-            textures = create_pair(PixelFormatEnum::BGR565)?;
-            for (index, texture) in textures.iter_mut().enumerate() {
-                texture
-                    .with_lock(None, |pixels, pitch| {
-                        targets[index] = VideoTextureTarget {
-                            ptr: pixels.as_mut_ptr() as usize,
-                            pitch: pitch as u32,
-                            capacity: pixels.len().min(u32::MAX as usize) as u32,
-                        };
-                    })
-                    .map_err(anyhow::Error::msg)
-                    .context("failed to lock direct SDL video texture")?;
-            }
+            textures = create_targets(PixelFormatEnum::BGR565)?;
+            targets = record_targets(&mut textures)?;
         }
         output.set_pixel_format(format);
         output.set_targets(targets);

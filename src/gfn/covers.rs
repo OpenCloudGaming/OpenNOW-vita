@@ -11,11 +11,17 @@ use tokio::sync::Semaphore;
 /// Maximum simultaneous cover downloads.
 const MAX_CONCURRENT_COVER_DOWNLOADS: usize = 8;
 
-/// How many decoded covers stay resident.
-pub const MAX_CACHED_COVERS: usize = 8;
+/// How many decoded covers stay resident. At the 256px decode cap a cover is roughly 200 KB, so
+/// this budget is a few MB - cheap next to re-downloading one over the Vita's wifi.
+pub const MAX_CACHED_COVERS: usize = 24;
 
-/// How many decoded row thumbnails stay resident.
-pub const MAX_CACHED_ICONS: usize = 24;
+/// How many decoded row thumbnails stay resident. Must comfortably exceed a full library's worth
+/// of rows: at 24 a list of 29 titles evicted thumbnails faster than scrolling could redraw them,
+/// so every scroll re-downloaded what had just been shown. 64px RGBA is 16 KB apiece.
+pub const MAX_CACHED_ICONS: usize = 256;
+
+/// Where downloaded cover bytes are kept between runs, alongside the token store.
+const COVER_DISK_CACHE_DIR: &str = "ux0:data/opennow-vita/covers";
 
 /// How long a failed cover download is remembered before another attempt is allowed.
 const COVER_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -239,7 +245,8 @@ impl CoverStore {
                 }
             };
 
-            let outcome = fetch_and_decode(&http_client, &url, size.max_dimension()).await;
+            let outcome =
+                fetch_and_decode(&http_client, &app_id, &url, size.max_dimension()).await;
             let texture_key = size.texture_key(&app_id);
             let mut inner = match cache.lock() {
                 Ok(guard) => guard,
@@ -323,7 +330,31 @@ pub enum CoverSnapshot {
     Failed,
 }
 
-async fn fetch_and_decode(client: &Client, url: &str, max_dim: u32) -> Result<TitleImage> {
+async fn fetch_and_decode(
+    client: &Client,
+    app_id: &str,
+    url: &str,
+    max_dim: u32,
+) -> Result<TitleImage> {
+    if let Some(path) = disk_cache_path(app_id) {
+        let cached = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || std::fs::read(&path).ok()
+        })
+        .await
+        .unwrap_or(None);
+
+        if let Some(bytes) = cached {
+            match tokio::task::spawn_blocking(move || decode_rgba(&bytes, max_dim)).await {
+                Ok(Ok(image)) => return Ok(image),
+                // A truncated or corrupt file should cost one re-download, not a permanent
+                // failure, so fall through to the network and let the write below replace it.
+                Ok(Err(error)) => eprintln!("Discarding unreadable cached cover {app_id}: {error}"),
+                Err(error) => eprintln!("Cached cover decode task panicked: {error}"),
+            }
+        }
+    }
+
     let bytes = client
         .get(url)
         .send()
@@ -334,9 +365,36 @@ async fn fetch_and_decode(client: &Client, url: &str, max_dim: u32) -> Result<Ti
         .bytes()
         .await
         .context("failed to read cover response body")?;
+
+    // The encoded original is stored rather than the decoded RGBA: it is an order of magnitude
+    // smaller on the memory card, and both decode sizes for a title share the one file, so a
+    // thumbnail and its full cover cost a single download instead of two.
+    if let Some(path) = disk_cache_path(app_id) {
+        let bytes = bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = std::fs::create_dir_all(COVER_DISK_CACHE_DIR)
+                .and_then(|()| std::fs::write(&path, &bytes))
+            {
+                eprintln!("Could not cache cover to {}: {error}", path.display());
+            }
+        });
+    }
+
     tokio::task::spawn_blocking(move || decode_rgba(&bytes, max_dim))
         .await
         .context("cover decode task panicked")?
+}
+
+/// On-disk path for a title's cover bytes, or `None` if `app_id` has no filename-safe form.
+fn disk_cache_path(app_id: &str) -> Option<std::path::PathBuf> {
+    let safe: String = app_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if safe.chars().all(|c| c == '_') {
+        return None;
+    }
+    Some(std::path::Path::new(COVER_DISK_CACHE_DIR).join(format!("{safe}.img")))
 }
 
 /// Decodes JPEG/PNG bytes to RGBA.

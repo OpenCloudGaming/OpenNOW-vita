@@ -15,7 +15,15 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-const MAX_PENDING_ACCESS_UNITS: usize = 2;
+/// Roughly a quarter-second of slack at the stream's frame rate, matching the sizing OpenNOW's
+/// Switch client settles on (`clamp((fps + 14) / 15, 2, 4)`; 4 at 60 fps).
+///
+/// This was 2, which is under one 33 ms hiccup of headroom. That looks like the latency-conscious
+/// choice, but dropping an access unit is not a cheap way to shed load: the decoder loses
+/// reference frames, the stream has to resync, and the PLI that follows makes the server drop
+/// quality. Trading a couple of frames of buffer for not converting ordinary scheduling jitter
+/// into a full resync is the better deal on hardware this tight.
+const MAX_PENDING_ACCESS_UNITS: usize = 4;
 
 const BLANK_FRAME_FALLBACK_STREAK: u32 = 30;
 const BLANK_FRAME_SAMPLE_BYTES: usize = 512;
@@ -71,8 +79,10 @@ impl VideoDecodeWorker {
         std::thread::Builder::new()
             .name("opennow-vita-video-decode".to_owned())
             .spawn(move || {
-                #[cfg(target_os = "vita")]
-                pin_decoder_thread();
+                crate::thread_affinity::pin_current_thread(
+                    crate::thread_affinity::VitaCore::Media,
+                    "video decode",
+                );
                 run_decode_loop(
                     worker_access_units,
                     worker_commands,
@@ -135,20 +145,6 @@ impl VideoDecodeWorker {
 impl Drop for VideoDecodeWorker {
     fn drop(&mut self) {
         let _ = self.commands.send(DecoderCommand::Stop);
-    }
-}
-
-#[cfg(target_os = "vita")]
-fn pin_decoder_thread() {
-    let thread_id = unsafe { vitasdk_sys::sceKernelGetThreadId() };
-    let result = unsafe {
-        vitasdk_sys::sceKernelChangeThreadCpuAffinityMask(
-            thread_id,
-            vitasdk_sys::SCE_KERNEL_CPU_MASK_USER_2 as i32,
-        )
-    };
-    if result < 0 {
-        eprintln!("Failed to pin video decoder thread to user CPU 2: {result:#x}");
     }
 }
 
@@ -224,7 +220,16 @@ fn decode_queued_access_unit(
     let Some(pixel_format) = direct_output.pixel_format() else {
         return;
     };
-    let Some(direct_target) = direct_output.lock_decode_target(&metrics.target_stalls) else {
+    // Timed around the whole call rather than inside it, so plain mutex contention against the
+    // render thread's `mark_displayed` counts too - that is the other half of the same stall.
+    let wait_started_at = std::time::Instant::now();
+    let direct_target = direct_output.lock_decode_target(&metrics.target_stalls);
+    metrics.target_wait_us.fetch_add(
+        wait_started_at.elapsed().as_micros() as u64,
+        Ordering::Relaxed,
+    );
+    metrics.target_wait_calls.fetch_add(1, Ordering::Relaxed);
+    let Some(direct_target) = direct_target else {
         return;
     };
     let decode_started_at = std::time::Instant::now();

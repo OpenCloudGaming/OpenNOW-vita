@@ -380,22 +380,37 @@ pub type VpcIdCache = Arc<OnceCell<String>>;
 const FALLBACK_VPC_ID: &str = "GFN-PC";
 
 /// Returns the cached VPC id, fetching it on first use.
-pub async fn resolve_vpc_id(client: &Client, token: &str, cache: &VpcIdCache) -> String {
+pub async fn resolve_vpc_id(client: &Client, token: &str, cache: &VpcIdCache) -> Result<String> {
     if let Some(cached) = cache.get() {
-        return cached.clone();
+        return Ok(cached.clone());
     }
     match fetch_vpc_id(client, token).await {
         Ok(vpc_id) => {
             let _ = cache.set(vpc_id.clone());
-            vpc_id
+            Ok(vpc_id)
+        }
+        // An expired token has to surface, not be papered over. Querying the catalog with the
+        // wrong VPC id succeeds and returns a *degenerate* library - seven titles instead of the
+        // account's several thousand - which looks like a broken list rather than a login problem.
+        // Propagating it lets the caller's refresh-and-retry path do its job.
+        Err(error) if is_authorization_error(&error) => {
+            return Err(error.context("serverInfo VPC id lookup was not authorized"));
         }
         Err(error) => {
             eprintln!(
                 "serverInfo VPC id lookup failed, falling back to {FALLBACK_VPC_ID}: {error:#}"
             );
-            FALLBACK_VPC_ID.to_owned()
+            Ok(FALLBACK_VPC_ID.to_owned())
         }
     }
+}
+
+/// Whether an error is GFN refusing the token, as opposed to the network being unhappy.
+fn is_authorization_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains("401 Unauthorized")
+        || text.contains("403 Forbidden")
+        || text.contains("Invalid or expired token")
 }
 
 /// Resolves the VPC id (cached) and fetches one catalog page - the pair every caller needs
@@ -407,6 +422,6 @@ pub async fn fetch_catalog_page_for_account(
     query: Option<&str>,
     cursor: &str,
 ) -> Result<CatalogPage> {
-    let vpc_id = resolve_vpc_id(client, token, cache).await;
+    let vpc_id = resolve_vpc_id(client, token, cache).await?;
     fetch_catalog_page(client, token, &vpc_id, query, cursor).await
 }

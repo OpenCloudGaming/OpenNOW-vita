@@ -2,14 +2,16 @@
 
 use crate::gfn::cloudmatch::SessionInfo;
 use crate::gfn::input_protocol::{
-    GAMEPAD_BITMAP_PRIMARY, GamepadInput, InputEncoder, parse_input_handshake_version,
+    GAMEPAD_BITMAP_PRIMARY, GamepadInput, InputEncoder, KeyStroke, MouseEvent,
+    parse_input_handshake_version,
 };
 use crate::gfn::signaling::IceCandidate;
+use crate::streaming::audio::AudioPacket;
 use crate::streaming::video::{
     DecodedFrame, DecoderConfig, DirectVideoOutput, VideoDecodeWorker,
 };
 use anyhow::{Context, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use rtc::peer_connection::RTCPeerConnectionBuilder;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
 use rtc::peer_connection::configuration::media_engine::MediaEngine;
@@ -32,7 +34,7 @@ use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -43,21 +45,8 @@ const DEFAULT_STREAM_HEIGHT: u32 = 720;
 const NATIVE_OUTPUT_WIDTH: u32 = 960;
 const NATIVE_OUTPUT_HEIGHT: u32 = 544;
 
-const MAX_PENDING_AUDIO_PACKETS: usize = 6;
-
 const PLI_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Pins the calling thread to the given user-CPU mask, logging (not failing) on error - a missed
-/// pin just risks scheduler jitter, not correctness.
-#[cfg(target_os = "vita")]
-fn pin_thread_to_cpu(mask: u32, thread_label: &str) {
-    let thread_id = unsafe { vitasdk_sys::sceKernelGetThreadId() };
-    let result =
-        unsafe { vitasdk_sys::sceKernelChangeThreadCpuAffinityMask(thread_id, mask as i32) };
-    if result < 0 {
-        eprintln!("Failed to pin {thread_label} thread to CPU mask {mask:#x}: {result:#x}");
-    }
-}
 
 /// The resolution NVIDIA actually streams at, per the session response.
 fn stream_dimensions(session: &SessionInfo) -> (u32, u32) {
@@ -91,6 +80,8 @@ pub enum PeerEvent {
 enum PeerCommand {
     RemoteIce(IceCandidate),
     Gamepad(GamepadInput),
+    Mouse(MouseEvent),
+    Key { key: KeyStroke, pressed: bool },
     Close,
 }
 
@@ -100,7 +91,12 @@ pub struct PeerEngine {
     is_connected: Arc<AtomicBool>,
     video_output: Arc<DirectVideoOutput>,
     latest_frame: Arc<Mutex<Option<(u64, DecodedFrame)>>>,
-    pending_audio: Arc<Mutex<Vec<Bytes>>>,
+    /// Cumulative bytes of inbound media (RTP/RTCP) since the peer started - the raw material for
+    /// estimating what this network actually delivered.
+    media_bytes: Arc<AtomicU64>,
+    /// Keyframes asked for because a frame arrived damaged. The honest signal for "this link is
+    /// struggling": throughput alone only says how busy the game was.
+    keyframe_requests: Arc<AtomicU64>,
 }
 
 impl PeerEngine {
@@ -114,7 +110,8 @@ impl PeerEngine {
             NATIVE_OUTPUT_HEIGHT,
         ));
         let latest_frame: Arc<Mutex<Option<(u64, DecodedFrame)>>> = Arc::new(Mutex::new(None));
-        let pending_audio: Arc<Mutex<Vec<Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+        let media_bytes = Arc::new(AtomicU64::new(0));
+        let keyframe_requests = Arc::new(AtomicU64::new(0));
 
         let setup = PeerSetup {
             offer_sdp: offer_sdp.to_owned(),
@@ -136,12 +133,15 @@ impl PeerEngine {
         let thread_connected = is_connected.clone();
         let thread_output = video_output.clone();
         let thread_frames = latest_frame.clone();
-        let thread_audio = pending_audio.clone();
+        let thread_media_bytes = media_bytes.clone();
+        let thread_keyframe_requests = keyframe_requests.clone();
         std::thread::Builder::new()
             .name("opennow-vita-peer".to_owned())
             .spawn(move || {
-                #[cfg(target_os = "vita")]
-                pin_thread_to_cpu(vitasdk_sys::SCE_KERNEL_CPU_MASK_USER_1, "peer");
+                crate::thread_affinity::pin_current_thread(
+                    crate::thread_affinity::VitaCore::Network,
+                    "peer",
+                );
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -160,7 +160,8 @@ impl PeerEngine {
                     thread_connected,
                     thread_output,
                     thread_frames,
-                    thread_audio,
+                    thread_media_bytes,
+                    thread_keyframe_requests,
                 ));
                 if let Err(error) = result {
                     let _ = thread_events
@@ -175,7 +176,8 @@ impl PeerEngine {
             is_connected,
             video_output,
             latest_frame,
-            pending_audio,
+            media_bytes,
+            keyframe_requests,
         })
     }
 
@@ -197,6 +199,35 @@ impl PeerEngine {
         let _ = self.command_tx.send(PeerCommand::Gamepad(input));
     }
 
+    /// Ships one pointer event to the host desktop. Unlike gamepad snapshots these are discrete
+    /// events, so they are queued rather than coalesced - dropping a button-up would leave the
+    /// host holding the mouse down.
+    pub fn send_mouse(&self, event: MouseEvent) {
+        let _ = self.command_tx.send(PeerCommand::Mouse(event));
+    }
+
+    /// Ships one key press or release to the game. Queued like mouse events rather than
+    /// coalesced: a dropped key-up would leave the host holding the key down.
+    pub fn send_key(&self, key: KeyStroke, pressed: bool) {
+        let _ = self.command_tx.send(PeerCommand::Key { key, pressed });
+    }
+
+    /// Presses and releases a key, which is what tapping one on the on-screen keyboard means.
+    pub fn tap_key(&self, key: KeyStroke) {
+        self.send_key(key, true);
+        self.send_key(key, false);
+    }
+
+    /// Cumulative inbound media bytes, sampled by the app to estimate the link's real capacity.
+    pub fn media_bytes(&self) -> u64 {
+        self.media_bytes.load(Ordering::Relaxed)
+    }
+
+    /// How many times a damaged frame forced a keyframe request this session.
+    pub fn keyframe_requests(&self) -> u64 {
+        self.keyframe_requests.load(Ordering::Relaxed)
+    }
+
     pub fn direct_video_output(&self) -> Arc<DirectVideoOutput> {
         self.video_output.clone()
     }
@@ -205,14 +236,6 @@ impl PeerEngine {
         *self.latest_frame.lock().ok()?
     }
 
-    /// Drains and returns whatever Opus packets have arrived since the last call - meant to be
-    /// fed straight into `streaming::audio::AudioRenderer::submit_packets` once per frame.
-    pub fn take_audio_packets(&self) -> Vec<Bytes> {
-        self.pending_audio
-            .lock()
-            .map(|mut queue| std::mem::take(&mut *queue))
-            .unwrap_or_default()
-    }
 }
 
 impl Drop for PeerEngine {
@@ -255,6 +278,8 @@ struct MetricsSnapshot {
     no_frame: u64,
     decode_errors: u64,
     target_stalls: u64,
+    target_wait_us: u64,
+    target_wait_calls: u64,
 }
 
 impl MetricsSnapshot {
@@ -267,6 +292,8 @@ impl MetricsSnapshot {
             no_frame: metrics.no_frame.load(Ordering::Relaxed),
             decode_errors: metrics.decode_errors.load(Ordering::Relaxed),
             target_stalls: metrics.target_stalls.load(Ordering::Relaxed),
+            target_wait_us: metrics.target_wait_us.load(Ordering::Relaxed),
+            target_wait_calls: metrics.target_wait_calls.load(Ordering::Relaxed),
         }
     }
 }
@@ -278,7 +305,8 @@ async fn run_peer(
     is_connected: Arc<AtomicBool>,
     video_output: Arc<DirectVideoOutput>,
     latest_frame: Arc<Mutex<Option<(u64, DecodedFrame)>>>,
-    pending_audio: Arc<Mutex<Vec<Bytes>>>,
+    media_bytes: Arc<AtomicU64>,
+    keyframe_requests: Arc<AtomicU64>,
 ) -> Result<()> {
     let decode_worker = match VideoDecodeWorker::spawn(
         DecoderConfig {
@@ -502,12 +530,14 @@ async fn run_peer(
                     )));
                 }
                 if audio_payload_types.contains(&packet.header.payload_type) {
-                    if let Ok(mut queue) = pending_audio.lock() {
-                        if queue.len() >= MAX_PENDING_AUDIO_PACKETS {
-                            queue.remove(0);
-                        }
-                        queue.push(packet.payload.clone());
-                    }
+                    // Straight to the decode thread, on arrival. The sequence number and payload
+                    // type travel with the payload: the audio pipeline needs them to reorder the
+                    // stream and to unwrap RED redundancy.
+                    crate::streaming::audio::submit_packet(AudioPacket {
+                        payload: packet.payload.clone(),
+                        sequence: packet.header.sequence_number,
+                        payload_type: packet.header.payload_type,
+                    });
                     continue;
                 }
                 let is_video = video_payload_types.is_empty()
@@ -548,6 +578,7 @@ async fn run_peer(
                     {
                         last_pli_sent = Some(now);
                         pli_sent_count += 1;
+                        keyframe_requests.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -597,7 +628,7 @@ async fn run_peer(
                 access_units_last = access_units_sent;
                 dropped_frames_last = dropped_frames_total;
 
-                let (sub, qfull, calls, dec_us, noframe, errs, rebuilds, stalls) = match &decoder_metrics {
+                let (sub, qfull, calls, dec_us, noframe, errs, rebuilds, stalls, wait_us, wait_calls) = match &decoder_metrics {
                     Some(m) => (
                         rate(m.submitted.load(Ordering::Relaxed), metrics_last.submitted),
                         rate(m.queue_full.load(Ordering::Relaxed), metrics_last.queue_full),
@@ -607,8 +638,17 @@ async fn run_peer(
                         rate(m.decode_errors.load(Ordering::Relaxed), metrics_last.decode_errors),
                         m.decoder_rebuilds.load(Ordering::Relaxed),
                         rate(m.target_stalls.load(Ordering::Relaxed), metrics_last.target_stalls),
+                        m.target_wait_us.load(Ordering::Relaxed),
+                        m.target_wait_calls.load(Ordering::Relaxed),
                     ),
-                    None => (0.0, 0.0, 0, 0, 0.0, 0.0, 0, 0.0),
+                    None => (0.0, 0.0, 0, 0, 0.0, 0.0, 0, 0.0, 0, 0),
+                };
+                let avg_wait_ms = if wait_calls > metrics_last.target_wait_calls {
+                    (wait_us - metrics_last.target_wait_us) as f32
+                        / (wait_calls - metrics_last.target_wait_calls) as f32
+                        / 1000.0
+                } else {
+                    0.0
                 };
                 let avg_decode_ms = if calls > metrics_last.decode_calls {
                     (dec_us - metrics_last.decode_us) as f32
@@ -622,7 +662,7 @@ async fn run_peer(
                 }
 
                 let _ = event_tx.send(PeerEvent::Status(format!(
-                    "fps:{fps:.0} src:{src_rate:.0} sub:{sub:.0} qf:{qfull:.0} dec:{avg_decode_ms:.0}ms nof:{noframe:.0} err:{errs:.0} reb:{rebuilds} stall:{stalls:.0} rtp:{rtp_rate:.0} drop:{drop_rate:.0} pli:{pli_sent_count} wfk:{} in:{}",
+                    "fps:{fps:.0} src:{src_rate:.0} sub:{sub:.0} qf:{qfull:.0} dec:{avg_decode_ms:.1}/wait:{avg_wait_ms:.1}ms nof:{noframe:.0} err:{errs:.0} reb:{rebuilds} stall:{stalls:.0} rtp:{rtp_rate:.0} drop:{drop_rate:.0} pli:{pli_sent_count} wfk:{} in:{}",
                     u8::from(video_rtp.waiting_for_keyframe()),
                     u8::from(input_ready)
                 )));
@@ -652,6 +692,8 @@ async fn run_peer(
                         {
                             last_pli_sent = Some(now);
                             pli_sent_count += 1;
+                            keyframe_requests.fetch_add(1, Ordering::Relaxed);
+                        keyframe_requests.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -668,7 +710,10 @@ async fn run_peer(
                     match classify(buf.first()) {
                         0 => in_stun += 1,
                         1 => in_dtls += 1,
-                        _ => in_media += 1,
+                        _ => {
+                            in_media += 1;
+                            media_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        }
                     }
                     pc.handle_read(TaggedBytesMut {
                         now: Instant::now(),
@@ -688,7 +733,10 @@ async fn run_peer(
             match classify(buf.first()) {
                 0 => in_stun += 1,
                 1 => in_dtls += 1,
-                _ => in_media += 1,
+                _ => {
+                    in_media += 1;
+                    media_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                }
             }
             pc.handle_read(TaggedBytesMut {
                 now: Instant::now(),
@@ -706,6 +754,8 @@ async fn run_peer(
         }
 
         let mut latest_gamepad = None;
+        let mut mouse_events = Vec::new();
+        let mut key_events: Vec<(KeyStroke, bool)> = Vec::new();
         for command in pending_commands.drain(..) {
             match command {
                 PeerCommand::RemoteIce(candidate) => {
@@ -723,6 +773,8 @@ async fn run_peer(
                     }
                 }
                 PeerCommand::Gamepad(input) => latest_gamepad = Some(input),
+                PeerCommand::Mouse(event) => mouse_events.push(event),
+                PeerCommand::Key { key, pressed } => key_events.push((key, pressed)),
                 PeerCommand::Close => {
                     let _ = pc.close();
                     return Ok(());
@@ -736,6 +788,40 @@ async fn run_peer(
             input.timestamp_us = session_clock.elapsed().as_micros() as u64;
             let packet = input_encoder.encode_gamepad_state(GAMEPAD_BITMAP_PRIMARY, input);
             if let Some(mut channel) = pc.data_channel(id) {
+                let _ = channel.send(BytesMut::from(&packet[..]));
+            }
+        }
+        // Mouse goes over the reliable channel, matching GFN's own clients: only gamepad state
+        // is eligible for the partially reliable one. A dropped button-up would leave the host
+        // holding the mouse down, which is exactly the packet you cannot afford to lose.
+        if !mouse_events.is_empty()
+            && input_ready
+            && let Some(id) = input_channel_id
+            && let Some(mut channel) = pc.data_channel(id)
+        {
+            for event in mouse_events.drain(..) {
+                let timestamp_us = session_clock.elapsed().as_micros() as u64;
+                let packet = match event {
+                    MouseEvent::MoveBy { dx, dy } => {
+                        input_encoder.encode_mouse_move(dx, dy, timestamp_us)
+                    }
+                    MouseEvent::Button { button, pressed } => {
+                        input_encoder.encode_mouse_button(button, pressed, timestamp_us)
+                    }
+                };
+                let _ = channel.send(BytesMut::from(&packet[..]));
+            }
+        }
+        // Keys go over the reliable channel for the same reason as mouse buttons: losing a
+        // key-up leaves the host holding the key down, which in a game is worse than a lost press.
+        if !key_events.is_empty()
+            && input_ready
+            && let Some(id) = input_channel_id
+            && let Some(mut channel) = pc.data_channel(id)
+        {
+            for (key, pressed) in key_events.drain(..) {
+                let timestamp_us = session_clock.elapsed().as_micros() as u64;
+                let packet = input_encoder.encode_key(key, pressed, timestamp_us);
                 let _ = channel.send(BytesMut::from(&packet[..]));
             }
         }

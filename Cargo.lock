@@ -1176,36 +1176,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "opennow-vita"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "crossbeam-channel",
- "egui",
- "fluent-bundle",
- "futures-util",
- "h264-reader",
- "image",
- "qrcode",
- "reqwest",
- "ring",
- "rtc",
- "rtc-media",
- "rtc-rtcp",
- "sdl2",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "unic-langid",
- "uuid",
- "vita-newlib-shims",
- "vitasdk-sys",
-]
-
-[[package]]
 name = "js-sys"
 version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1444,6 +1414,36 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "opennow-vita"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "crossbeam-channel",
+ "egui",
+ "fluent-bundle",
+ "futures-util",
+ "h264-reader",
+ "image",
+ "qrcode",
+ "reqwest",
+ "ring",
+ "rtc",
+ "rtc-media",
+ "rtc-rtcp",
+ "sdl2",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "unic-langid",
+ "uuid",
+ "vita-newlib-shims",
+ "vitasdk-sys",
+]
 
 [[package]]
 name = "owned_ttf_parser"

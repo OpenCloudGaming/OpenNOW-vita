@@ -41,9 +41,30 @@ pub fn build_nvst_sdp_from_answer(
     let ours = extract_ice_credentials(answer_sdp);
     let (width, height) = settings.dimensions();
     let max_bitrate_kbps = settings.max_bitrate_mbps * 1000;
-    let min_bitrate_kbps = 5_000.max(max_bitrate_kbps * 35 / 100);
+    // The floor decides *which axis* a weak link degrades on. GFN's bandwidth estimation and DRC
+    // are both already enabled below, so the stream does adapt - but a floor it cannot go under
+    // leaves dropping the encode resolution as the only way to shed load, which is the blurry
+    // picture. Floored low (was 35% / 5 Mbps, which a Vita's 2.4 GHz-only radio often cannot
+    // hold) so congestion control spends bitrate before it spends pixels.
+    let min_bitrate_kbps = 1_500.max(max_bitrate_kbps * 20 / 100);
+    // Opening at 70% of the ceiling means a link that cannot take it starts by losing packets.
+    // Starting nearer the ceiling lets estimation hold high quality instead of slowly ramping up.
     let initial_bitrate_kbps = min_bitrate_kbps.max(max_bitrate_kbps * 70 / 100);
     let max_reference_frames = crate::streaming::video::AVCDEC_NUM_REF_FRAMES;
+    // Resolution is pinned rather than left to the server's dynamic resolution control. The panel
+    // is exactly 960x544 and the stream is negotiated at exactly that, so a DRC drop means the
+    // server encodes smaller and something upscales it back - the soft, washed-out picture. With
+    // DRC/GRC/cpmRtc off and `minResolutionPercent:100`, a starved link spends quality on
+    // compression artefacts at native resolution instead. GFN's own Switch client, facing the same
+    // fixed-panel situation, makes the same choice.
+    //
+    // NACK was switched on but never sized, so retransmission had whatever the server defaults to
+    // - likely far too small to cover a 2.4 GHz link's loss. Recovering a packet costs a round
+    // trip; losing it costs macroblocks that smear until the next keyframe. The queue values here
+    // are the ones GFN's own Switch client negotiates.
+    //
+    // Pacing matters for the same reason: spreading a frame's packets over several groups instead
+    // of bursting them is what stops a weak radio from dropping the tail of every large frame.
     format!(
         "v=0\r\n\
         o=SdpTest test_id_13 14 IN IPv4 127.0.0.1\r\n\
@@ -57,13 +78,25 @@ pub fn build_nvst_sdp_from_answer(
         a=vqos.fec.rateDropWindow:10\r\n\
         a=vqos.fec.minRequiredFecPackets:2\r\n\
         a=vqos.drc.minRequiredBitrateCheckEnabled:1\r\n\
-        a=vqos.fec.repairMinPercent:5\r\n\
-        a=vqos.fec.repairPercent:5\r\n\
-        a=vqos.fec.repairMaxPercent:35\r\n\
+        a=vqos.fec.repairMinPercent:6\r\n\
+        a=vqos.fec.repairPercent:8\r\n\
+        a=vqos.fec.repairMaxPercent:30\r\n\
         a=vqos.dynamicStreamingMode:0\r\n\
-        a=vqos.drc.enable:1\r\n\
-        a=vqos.dfc.enable:1\r\n\
+        a=vqos.drc.enable:0\r\n\
+        a=vqos.dfc.enable:0\r\n\
         a=vqos.dfc.adjustResAndFps:0\r\n\
+        a=vqos.resControl.cpmRtc.enable:0\r\n\
+        a=vqos.resControl.cpmRtc.featureMask:0\r\n\
+        a=vqos.resControl.cpmRtc.minResolutionPercent:100\r\n\
+        a=vqos.resControl.cpmRtc.resolutionChangeHoldonMs:999999\r\n\
+        a=vqos.drc.qpMaxResThresholdAdj:4\r\n\
+        a=vqos.grc.qpMaxResThresholdAdj:4\r\n\
+        a=vqos.drc.iirFilterFactor:100\r\n\
+        a=vqos.grc.enable:0\r\n\
+        a=vqos.grc.maximumBitrateKbps:{max_bitrate_kbps}\r\n\
+        a=vqos.adjustStreamingFpsDuringOutOfFocus:1\r\n\
+        a=vqos.resControl.cpmRtc.ignoreOutOfFocusWindowState:1\r\n\
+        a=vqos.resControl.perfHistory.rtcIgnoreOutOfFocusWindowState:1\r\n\
         a=video.dx9EnableNv12:1\r\n\
         a=video.dx9EnableHdr:1\r\n\
         a=vqos.qpg.enable:1\r\n\
@@ -73,7 +106,19 @@ pub fn build_nvst_sdp_from_answer(
         a=vqos.bw.txRxLag.minFeedbackTxDeltaMs:200\r\n\
         a=vqos.drc.bitrateIirFilterFactor:18\r\n\
         a=video.packetSize:1140\r\n\
-        a=packetPacing.minNumPacketsPerGroup:15\r\n\
+        a=video.rtpNackQueueLength:1024\r\n\
+        a=video.rtpNackQueueMaxPackets:512\r\n\
+        a=video.rtpNackMaxPacketCount:25\r\n\
+        a=packetPacing.numGroups:6\r\n\
+        a=packetPacing.minNumPacketsPerGroup:10\r\n\
+        a=packetPacing.minNumPacketsFrame:10\r\n\
+        a=packetPacing.maxDelayUs:1250\r\n\
+        a=video.mapRtpTimestampsToFrames:1\r\n\
+        a=video.encoderCscMode:3\r\n\
+        a=video.dynamicRangeMode:0\r\n\
+        a=video.bitDepth:8\r\n\
+        a=video.scalingFeature1:0\r\n\
+        a=video.prefilterParams.prefilterModel:0\r\n\
         a=vqos.bllFec.enable:0\r\n\
         a=video.clientViewportWd:{width}\r\n\
         a=video.clientViewportHt:{height}\r\n\
@@ -84,6 +129,7 @@ pub fn build_nvst_sdp_from_answer(
         a=vqos.bw.maximumBitrateKbps:{max_bitrate_kbps}\r\n\
         a=vqos.bw.minimumBitrateKbps:{min_bitrate_kbps}\r\n\
         a=vqos.bw.peakBitrateKbps:{max_bitrate_kbps}\r\n\
+        a=vqos.bw.serverPeakBitrateKbps:{max_bitrate_kbps}\r\n\
         a=vqos.bw.enableBandwidthEstimation:1\r\n\
         a=vqos.bw.disableBitrateLimit:0\r\n\
         m=application 0 RTP/AVP\r\n\
@@ -199,9 +245,15 @@ pub fn h264_payload_types(sdp: &str) -> Vec<u8> {
     rtpmap_payload_types(sdp, "H264/")
 }
 
-/// Payload types the offer maps to Opus (`a=rtpmap:<pt> opus/48000/2`).
+/// Payload types the offer maps to Opus (`a=rtpmap:<pt> opus/48000/2`), including any RED
+/// (`a=rtpmap:<pt> red/48000/2`) types that wrap it.
+///
+/// RED has to be in here: NVST uses RFC 2198 redundancy as its audio FEC, and a stream negotiated
+/// on the RED payload type would otherwise be discarded wholesale as "not audio".
 pub fn opus_payload_types(sdp: &str) -> Vec<u8> {
-    rtpmap_payload_types(sdp, "OPUS/")
+    let mut types = rtpmap_payload_types(sdp, "OPUS/");
+    types.extend(rtpmap_payload_types(sdp, "RED/"));
+    types
 }
 
 fn rtpmap_payload_types(sdp: &str, codec_prefix: &str) -> Vec<u8> {

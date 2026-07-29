@@ -28,12 +28,21 @@ ftp: vpk
 ifndef VITA_IP
 	$(error Usage: make ftp VITA_IP=192.168.0.108)
 endif
-	curl -sS --connect-timeout 15 --max-time 900 -T $(VPK) \
-		"ftp://$(VITA_IP):$(FTP_PORT)/$(VITA_UPLOAD_DIR)$(VPK_NAME)" \
-		-w "uploaded %{size_upload} bytes in %{time_total}s (%{speed_upload} B/s)\n"
-	@echo "local:  $$(wc -c < $(VPK)) bytes"
-	@printf "remote: "; curl -sS -I --connect-timeout 15 --max-time 60 \
-		"ftp://$(VITA_IP):$(FTP_PORT)/$(VITA_UPLOAD_DIR)$(VPK_NAME)" \
+	@local_size=$$(wc -c < $(VPK) | tr -d ' '); \
+	remote_url="ftp://$(VITA_IP):$(FTP_PORT)/$(VITA_UPLOAD_DIR)$(VPK_NAME)"; \
+	remote_size=$$(curl -sS -I --connect-timeout 15 --max-time 60 "$$remote_url" 2>/dev/null \
+		| tr -d '\r' | awk -F': ' '/[Cc]ontent-[Ll]ength/ {print $$2}'); \
+	if [ "$(FORCE)" != "1" ] && [ -n "$$remote_size" ] && [ "$$remote_size" = "$$local_size" ]; then \
+		echo "Vita already has this exact build ($$local_size bytes) - skipping the upload."; \
+		echo "Re-send it anyway with: make ftp VITA_IP=$(VITA_IP) FORCE=1"; \
+		exit 0; \
+	fi; \
+	echo "Uploading $$(du -h $(VPK) | cut -f1) to $(VITA_IP)..."; \
+	curl -S --progress-bar --connect-timeout 15 --max-time 900 -T $(VPK) "$$remote_url" \
+		-w "transfer: %{size_upload} bytes in %{time_total}s (%{speed_upload} B/s)\n"; \
+	echo "local:  $$local_size bytes"; \
+	printf "remote: "; \
+	curl -sS -I --connect-timeout 15 --max-time 60 "$$remote_url" \
 		| tr -d '\r' | awk -F': ' '/[Cc]ontent-[Ll]ength/ {print $$2 " bytes"}'
 	@echo "Now install ux0:/data/$(VPK_NAME) from VitaShell - copying the file does not install it."
 
