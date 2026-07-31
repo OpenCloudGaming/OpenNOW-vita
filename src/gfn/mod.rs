@@ -1,7 +1,9 @@
+pub mod active_session;
 pub mod auth;
 pub mod catalog;
 pub mod cloudmatch;
 pub mod covers;
+pub mod error_codes;
 pub mod favorites;
 pub mod headers;
 pub mod input_protocol;

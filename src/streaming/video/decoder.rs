@@ -206,7 +206,7 @@ mod vita {
                         opt: SceAvcdecFrameOption {
                             rgba: SceAvcdecFrameOptionRGBA {
                                 alpha: 0xff,
-                                cscCoefficient: 0,
+                                cscCoefficient: 1, // 1 = ITU-R BT.709 for GFN HD video
                                 reserved: [0; 14],
                             },
                         },

@@ -40,6 +40,8 @@ pub enum AppCommand {
     SetLocale(crate::locale::Locale),
     /// Emitted by the catalog screen's sort picker.
     SetSort(crate::app::CatalogSort),
+    // my games / all games picker next to sort
+    SetFilter(crate::app::CatalogFilter),
     /// Emitted by the stream-quality section of the account popup.
     SetStreamFps(crate::gfn::stream_prefs::StreamFps),
     /// Emitted by the rear-trigger section of the account popup.
@@ -56,6 +58,8 @@ pub enum AppCommand {
     SendKey(crate::gfn::input_protocol::KeyStroke),
     /// Emitted by the stick-zone section of the settings modal.
     SetStickZones(crate::gfn::stream_prefs::StickZones),
+    /// from the rear-touch layout picker in settings
+    SetRearTouchMode(crate::gfn::stream_prefs::RearTouchMode),
     /// Emitted by the volume-boost section of the account popup.
     SetAudioBoost(crate::gfn::stream_prefs::AudioBoost),
     /// Emitted when a row in the catalog list is tapped/clicked.
@@ -68,6 +72,8 @@ pub enum AppCommand {
     ToggleControlsModal,
     /// Toggles front touch trackpad host mouse input on and off.
     ToggleMouseTrackpad,
+    /// bumps the bitrate mid session, kbps
+    SetMaxBitrate(u32),
 }
 
 impl From<InputCommand> for AppCommand {
@@ -512,11 +518,8 @@ impl FrontStickZones {
 /// reaching for L2 could give L3. The stick clicks moved to the front screen instead.
 #[derive(Default)]
 pub struct RearTouchTriggers {
-    /// Touch x positions by SDL finger id. The panel is multi-touch, so both triggers can be held
-    /// at once - a vector rather than a single slot.
-    fingers: Vec<(i64, f32)>,
-    /// How hard a touch presses, read from the player's setting. Cached rather than read per
-    /// frame because this is polled 60 times a second and the setting lives on the memory card.
+    // finger id -> (x, y) normalized 0..1
+    fingers: Vec<(i64, f32, f32)>,
     intensity: u8,
 }
 
@@ -527,17 +530,22 @@ impl RearTouchTriggers {
                 touch_id,
                 finger_id,
                 x,
+                y,
                 ..
             }
             | Event::FingerMotion {
                 touch_id,
                 finger_id,
                 x,
+                y,
                 ..
             } if touch_id == REAR_TOUCH_DEVICE_ID => {
-                match self.fingers.iter_mut().find(|(id, _)| *id == finger_id) {
-                    Some(slot) => slot.1 = x,
-                    None => self.fingers.push((finger_id, x)),
+                match self.fingers.iter_mut().find(|(id, _, _)| *id == finger_id) {
+                    Some(slot) => {
+                        slot.1 = x;
+                        slot.2 = y;
+                    }
+                    None => self.fingers.push((finger_id, x, y)),
                 }
             }
             Event::FingerUp {
@@ -545,16 +553,24 @@ impl RearTouchTriggers {
                 finger_id,
                 ..
             } if touch_id == REAR_TOUCH_DEVICE_ID => {
-                self.fingers.retain(|(id, _)| *id != finger_id);
+                self.fingers.retain(|(id, _, _)| *id != finger_id);
             }
             _ => {}
         }
     }
 
-    fn held(&self, left_half: bool) -> bool {
-        self.fingers
-            .iter()
-            .any(|(_, x)| if left_half { *x < 0.5 } else { *x >= 0.5 })
+    fn quadrant_held(&self, left_side: bool, top_side: bool) -> bool {
+        self.fingers.iter().any(|(_, x, y)| {
+            let matches_x = if left_side { *x < 0.5 } else { *x >= 0.5 };
+            let matches_y = if top_side { *y < 0.5 } else { *y >= 0.5 };
+            matches_x && matches_y
+        })
+    }
+
+    fn half_held(&self, left_side: bool) -> bool {
+        self.fingers.iter().any(|(_, x, _)| {
+            if left_side { *x < 0.5 } else { *x >= 0.5 }
+        })
     }
 
     /// Picks up a changed intensity setting; call when a session starts.
@@ -571,11 +587,31 @@ impl RearTouchTriggers {
     }
 
     fn left_trigger(&self) -> u8 {
-        if self.held(true) { self.pressure() } else { 0 }
+        let is_quadrant = crate::gfn::stream_prefs::rear_touch_mode() == crate::gfn::stream_prefs::RearTouchMode::Quadrant;
+        let held = if is_quadrant { self.quadrant_held(true, true) } else { self.half_held(true) };
+        if held { self.pressure() } else { 0 }
     }
 
     fn right_trigger(&self) -> u8 {
-        if self.held(false) { self.pressure() } else { 0 }
+        let is_quadrant = crate::gfn::stream_prefs::rear_touch_mode() == crate::gfn::stream_prefs::RearTouchMode::Quadrant;
+        let held = if is_quadrant { self.quadrant_held(false, true) } else { self.half_held(false) };
+        if held { self.pressure() } else { 0 }
+    }
+
+    pub fn left_stick_click(&self) -> bool {
+        if crate::gfn::stream_prefs::rear_touch_mode() == crate::gfn::stream_prefs::RearTouchMode::Quadrant {
+            self.quadrant_held(true, false)
+        } else {
+            false
+        }
+    }
+
+    pub fn right_stick_click(&self) -> bool {
+        if crate::gfn::stream_prefs::rear_touch_mode() == crate::gfn::stream_prefs::RearTouchMode::Quadrant {
+            self.quadrant_held(false, false)
+        } else {
+            false
+        }
     }
 }
 
@@ -622,12 +658,11 @@ pub fn gamepad_snapshot(
     set(Button::X, X);
     set(Button::Y, Y);
 
-    // SDL never raises the stick clicks on a handheld Vita - there are none - so the front
-    // screen's bottom corners stand in.
-    if stick_zones.left_stick_click() {
+    // L3/R3 can come from either front corners or rear quadrants, whichever fires
+    if stick_zones.left_stick_click() || rear_touch.left_stick_click() {
         buttons |= LEFT_THUMB;
     }
-    if stick_zones.right_stick_click() {
+    if stick_zones.right_stick_click() || rear_touch.right_stick_click() {
         buttons |= RIGHT_THUMB;
     }
 

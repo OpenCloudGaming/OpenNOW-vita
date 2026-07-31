@@ -15,15 +15,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Roughly a quarter-second of slack at the stream's frame rate, matching the sizing OpenNOW's
-/// Switch client settles on (`clamp((fps + 14) / 15, 2, 4)`; 4 at 60 fps).
-///
-/// This was 2, which is under one 33 ms hiccup of headroom. That looks like the latency-conscious
-/// choice, but dropping an access unit is not a cheap way to shed load: the decoder loses
-/// reference frames, the stream has to resync, and the PLI that follows makes the server drop
-/// quality. Trading a couple of frames of buffer for not converting ordinary scheduling jitter
-/// into a full resync is the better deal on hardware this tight.
-const MAX_PENDING_ACCESS_UNITS: usize = 4;
+// capped at 2 for lower input lag, was 4 but that felt laggy
+const MAX_PENDING_ACCESS_UNITS: usize = 2;
 
 const BLANK_FRAME_FALLBACK_STREAK: u32 = 30;
 const BLANK_FRAME_SAMPLE_BYTES: usize = 512;

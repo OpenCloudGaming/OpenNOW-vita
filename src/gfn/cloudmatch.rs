@@ -3,6 +3,8 @@
 //! Reference: `opennow-stable/src/main/gfn/cloudmatch.ts` and `protocol.rs` in the OpenNOW native
 //! streamer.
 
+use super::active_session;
+use super::error_codes::{GfnError, GfnErrorCode};
 use super::headers::{self, error_for_status_with_body};
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
@@ -108,9 +110,12 @@ pub async fn create_session(
     client: &Client,
     request: CreateSessionRequest<'_>,
 ) -> Result<SessionInfo> {
+    // device id is the per-install one from sign-in now, used to be a UUIDv5 of a fixed
+    // string which was the same on every vita so nvidia refused to DELETE stale sessions.
+    // same fix as OpenNOW-Switch's GenerateDeviceId. client id stays per-launch tho
     let identity = SessionIdentity {
         client_id: uuid::Uuid::new_v4().to_string(),
-        device_id: stable_device_id(),
+        device_id: super::auth::device_id(),
     };
     let base_url = DEFAULT_CLOUDMATCH_BASE_URL.trim_end_matches('/');
     let (width, height) = request.settings.dimensions();
@@ -128,6 +133,9 @@ pub async fn create_session(
 
     // Clear the decks first. Anything still open would reject this launch anyway, and finding that
     // out from a 403 costs the player a failed launch and two cleanup rounds.
+    //
+    // our own note goes first, its the only thing that survives a crash and knows the zone
+    stop_remembered_session(client, request.token, &identity).await;
     stop_active_sessions_before_launch(client, request.token, &identity, base_url).await;
 
     let send_request = || async {
@@ -169,33 +177,42 @@ pub async fn create_session(
                         {
                             return Ok((payload, true));
                         }
-                        bail!(
+                        return Err(payload.request_status.to_error(format!(
                             "CloudMatch create session error {} ({}): {body_text}",
                             payload.request_status.status_code,
                             payload.request_status.describe()
-                        );
+                        ))
+                        .with_http_status(status.as_u16())
+                        .into());
                     }
 
                     if status == reqwest::StatusCode::FORBIDDEN
                         || body_text.to_ascii_uppercase().contains("SESSION_LIMIT")
                     {
-                        if let Ok(limit_payload) = serde_json::from_str::<CloudMatchResponse>(&body_text) {
-                            if stop_conflicting_sessions(
-                                client,
-                                request.token,
-                                Some(&limit_payload),
-                                &identity,
-                                base_url,
-                            )
-                            .await
-                            {
-                                return Ok((limit_payload, true));
-                            }
-                            bail!(
+                        // still try cleanup even if body doesnt decode, falls back to
+                        // asking cloudmatch whats open
+                        let limit_payload =
+                            serde_json::from_str::<CloudMatchResponse>(&body_text).ok();
+                        if stop_conflicting_sessions(
+                            client,
+                            request.token,
+                            limit_payload.as_ref(),
+                            &identity,
+                            base_url,
+                        )
+                        .await
+                            && let Some(limit_payload) = limit_payload
+                        {
+                            return Ok((limit_payload, true));
+                        }
+                        if let Some(limit_payload) = limit_payload {
+                            return Err(limit_payload.request_status.to_error(format!(
                                 "CloudMatch create session error {} ({}): {body_text}",
                                 limit_payload.request_status.status_code,
                                 limit_payload.request_status.describe()
-                            );
+                            ))
+                            .with_http_status(status.as_u16())
+                            .into());
                         }
                     }
 
@@ -245,12 +262,13 @@ pub async fn create_session(
             break payload;
         }
         if cleanups >= 2 {
-            // We freed a slot, waited for CloudMatch to confirm it, and it still says the limit is
-            // hit - so the session it counts is not one this device can delete. Say that, instead
-            // of surfacing a bare code 50 that reads like a bug in the launch.
-            // Short and matchable: the player-facing wording lives in `ui::present_error`, which
-            // turns this into a title plus the actual recovery steps.
-            bail!("SESSION_LIMIT still reported after cleanup");
+            // still hitting the limit after cleanup means its a session this device cant
+            // delete, report it as the per-device limit and let the error screen explain
+            return Err(GfnError::new(
+                GfnErrorCode::SESSION_LIMIT_PER_DEVICE_REACHED,
+                "CloudMatch still reported the session limit after cleanup",
+            )
+            .into());
         }
         cleanups += 1;
         // No sleep here: `stop_conflicting_sessions` already waited for CloudMatch to confirm the
@@ -286,6 +304,8 @@ pub struct QueueStatus {
     /// the wait happened at all, so the launch stepper can tell "queued, then done" apart from
     /// "never queued".
     pub was_queued: bool,
+    // rig is patching the game, can take a while so we tell the player instead of looking stuck
+    pub app_patching: bool,
 }
 
 pub type QueueProgressTracker = Arc<std::sync::Mutex<QueueStatus>>;
@@ -327,17 +347,67 @@ pub async fn poll_session(
         };
 
         if response.status().is_server_error() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            // check for patching before it counts against the 5xx budget, its not really an error
+            let patching = serde_json::from_str::<CloudMatchResponse>(&body_text)
+                .map(|payload| payload.request_status.is_app_patching())
+                .unwrap_or(false);
+            if patching {
+                consecutive_server_errors = 0;
+                if let Some(tr) = &tracker
+                    && let Ok(mut st) = tr.lock()
+                {
+                    st.attempt = attempt + 1;
+                    st.server_errors = 0;
+                    st.app_patching = true;
+                }
+                sleep(POLL_INTERVAL).await;
+                continue;
+            }
+
+            // a code marked non-retryable (banned region, membership etc) skips the retry
+            // budget entirely, no point burning 2.5 min re-asking about something final
+            let failure = serde_json::from_str::<CloudMatchResponse>(&body_text)
+                .ok()
+                .map(|payload| {
+                    payload.request_status.to_error(format!(
+                        "CloudMatch poll attempt {attempt} rejected: {}: {body_text}",
+                        describe_status(status, &body_text)
+                    ))
+                })
+                .map(|error| error.with_http_status(status.as_u16()));
+            if let Some(failure) = &failure
+                && !failure.code.is_retryable()
+            {
+                return Err(failure.clone().into());
+            }
+
             consecutive_server_errors += 1;
             if let Some(tr) = &tracker
                 && let Ok(mut st) = tr.lock()
             {
                 st.attempt = attempt + 1;
                 st.server_errors = consecutive_server_errors;
+                st.app_patching = false;
             }
             if consecutive_server_errors > MAX_CONSECUTIVE_SERVER_ERRORS {
-                error_for_status_with_body(response)
-                    .await
-                    .with_context(|| format!("CloudMatch poll attempt {attempt} rejected"))?;
+                return Err(failure.map_or_else(
+                    || {
+                        // no payload, gotta go off the http status alone
+                        GfnError::new(
+                            GfnErrorCode::from_http_status(status.as_u16())
+                                .unwrap_or(GfnErrorCode::SERVER_INTERNAL_ERROR),
+                            format!(
+                                "CloudMatch poll attempt {attempt} rejected: {}: {body_text}",
+                                describe_status(status, &body_text)
+                            ),
+                        )
+                        .with_http_status(status.as_u16())
+                    },
+                    |failure| failure,
+                )
+                .into());
             }
             let backoff = POLL_INTERVAL
                 .saturating_mul(1 << (consecutive_server_errors - 1).min(3) as u32)
@@ -359,11 +429,12 @@ pub async fn poll_session(
             .context("failed to decode CloudMatch poll response")?;
 
         if payload.request_status.status_code != 1 {
-            bail!(
+            return Err(payload.request_status.to_error(format!(
                 "CloudMatch poll error: {} ({}): {body_text}",
                 payload.request_status.status_code,
                 payload.request_status.describe()
-            );
+            ))
+            .into());
         }
 
         let session = payload
@@ -409,6 +480,19 @@ pub async fn poll_session(
     }
 
     bail!("CloudMatch session did not become ready within the poll timeout")
+}
+
+// e.g "HTTP 503 (41 APP_PATCHING_STATUS)", put first bc the error screen truncates the long
+// json body and this is the part ppl actually screenshot
+fn describe_status(status: reqwest::StatusCode, body_text: &str) -> String {
+    match serde_json::from_str::<CloudMatchResponse>(body_text) {
+        Ok(payload) => format!(
+            "HTTP {status} ({} {})",
+            payload.request_status.status_code,
+            payload.request_status.describe()
+        ),
+        Err(_) => format!("HTTP {status}"),
+    }
 }
 
 /// Best-effort GET of a session payload; `None` on any transport/decode/status failure so the
@@ -494,26 +578,27 @@ pub async fn stop_session_by_id(
     StopOutcome::Failed
 }
 
-/// Stops a CloudMatch session.
-///
-/// Deleted at the session's own zone URL and under the identity that created it, not the generic
-/// CloudMatch entry point: a session lives on the zone that provisioned it, and NVIDIA scopes the
-/// delete to the client that owns it. Mirrors OpenNOW's `StopSession`, which resolves the
-/// session's streaming base URL before issuing the DELETE.
+// deletes at the session's own zone url, not the generic entrypoint, sessions only
+// live on the zone that provisioned them. mirrors OpenNOW's StopSession
 pub async fn stop_session(client: &Client, token: &str, session: &SessionInfo) {
     let base_url = if session.streaming_base_url.is_empty() {
         DEFAULT_CLOUDMATCH_BASE_URL
     } else {
         &session.streaming_base_url
     };
-    stop_session_by_id(
+    if stop_session_by_id(
         client,
         token,
         &session.session_id,
         &session.identity,
         base_url,
     )
-    .await;
+    .await
+        != StopOutcome::Failed
+    {
+        // treat as gone either way, real failures keep the note around for next attempt
+        active_session::forget(&session.session_id);
+    }
 }
 
 /// Sessions CloudMatch still considers active for this account. Setup/queuing (1), ready (2)
@@ -611,6 +696,41 @@ async fn stop_conflicting_sessions(
     // mid-setup takes appreciably longer than that, and retrying the launch before the slot is
     // actually released just spends an attempt on the same limit error.
     wait_for_sessions_to_clear(client, token, identity).await
+}
+
+// cleans up a session we recorded but never confirmed closed (crash/force-quit path).
+// deletes at the recorded zone since that's the only place that knows about it.
+// mirrors OpenNOW-Switch's CleanupStaleCloudSession
+async fn stop_remembered_session(client: &Client, token: &str, identity: &SessionIdentity) {
+    let Some(stale) = active_session::load() else {
+        return;
+    };
+    let base_url = if stale.streaming_base_url.is_empty() {
+        DEFAULT_CLOUDMATCH_BASE_URL
+    } else {
+        &stale.streaming_base_url
+    };
+
+    eprintln!(
+        "Ending the session left over from a previous run: {}",
+        stale.session_id
+    );
+    match stop_session_by_id(client, token, &stale.session_id, identity, base_url).await {
+        StopOutcome::Stopped => {
+            active_session::forget(&stale.session_id);
+            wait_for_sessions_to_clear(client, token, identity).await;
+        }
+        StopOutcome::Forbidden => {
+            eprintln!(
+                "Session {} belongs to an older device identity and has to expire on its own; \
+                 dropping the note so it stops blocking launches",
+                stale.session_id
+            );
+            active_session::forget(&stale.session_id);
+        }
+        // keep the note on failure, dont wanna lose track of it over a network blip
+        StopOutcome::Failed => {}
+    }
 }
 
 /// Ends every session CloudMatch still reports before a new launch is attempted.
@@ -771,10 +891,6 @@ fn build_signaling_url(raw: &str, server_ip: &str) -> (String, Option<String>) {
     (format!("wss://{server_ip}:443/nvst/"), None)
 }
 
-/// A stable device identifier.
-fn stable_device_id() -> String {
-    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"opennow-vita-stable-device-id").to_string()
-}
 
 fn build_session_request_body(
     app_id: &str,
@@ -941,6 +1057,9 @@ fn parse_session_info(
             codec: Some("H264".to_owned()),
         });
 
+    // record before handing back, so a crash downstream still has something to clean up next time
+    active_session::remember(&session_id, streaming_base_url);
+
     Ok(SessionInfo {
         session_id,
         app_id: session
@@ -1070,6 +1189,16 @@ struct CloudMatchRequestStatus {
 }
 
 impl CloudMatchRequestStatus {
+    // gfn code this reply maps to
+    fn error_code(&self) -> GfnErrorCode {
+        GfnErrorCode::from_cloudmatch(self.status_code, self.unified_error_code)
+    }
+
+    // typed failure, code + the text the logs used to get before
+    fn to_error(&self, detail: String) -> GfnError {
+        GfnError::new(self.error_code(), detail).with_description(self.status_description.clone())
+    }
+
     /// `<description> (#<unifiedErrorCode>)`, or `unknown` when the server sent neither.
     fn describe(&self) -> String {
         match (&self.status_description, self.unified_error_code) {
@@ -1080,14 +1209,28 @@ impl CloudMatchRequestStatus {
         }
     }
 
-    /// `SESSION_LIMIT_EXCEEDED` and its `SESSION_LIMIT_PER_DEVICE_EXCEEDED` variant both mean a
-    /// zombie session is squatting on this device id. Matched on the description because the
-    /// numeric code differs between the two (11 vs 50).
+    // checks the code table now (covers 11, 50, 83) instead of grepping the description
+    // for SESSION_LIMIT like before. description is still a fallback for unknown codes
     fn is_session_limit(&self) -> bool {
+        if self.error_code().is_session_conflict() {
+            return true;
+        }
         self.status_description
             .as_deref()
-            .map(|text| text.to_ascii_uppercase().contains("SESSION_LIMIT"))
-            .unwrap_or(false)
+            .and_then(GfnErrorCode::from_description)
+            .is_some_and(GfnErrorCode::is_session_conflict)
+    }
+
+    // rig is patching, not actually failing. comes back as non-200 so without this check
+    // it eats the 5xx retry budget and the launch gets abandoned mid patch.
+    // mirrors OpenNOW-Switch's IsAppPatchingResponse
+    fn is_app_patching(&self) -> bool {
+        self.status_code == 41
+            && self
+                .status_description
+                .as_deref()
+                .map(|text| text.to_ascii_uppercase().contains("APP_PATCHING_STATUS"))
+                .unwrap_or(false)
     }
 }
 
@@ -1246,6 +1389,35 @@ struct CloudMatchStreamingFeatures {
 mod tests {
     use super::*;
 
+    fn request_status(body: &str) -> CloudMatchRequestStatus {
+        serde_json::from_str::<CloudMatchResponse>(body)
+            .expect("body should decode")
+            .request_status
+    }
+
+    #[test]
+    fn app_patching_is_recognised_from_the_status_pair() {
+        let patching = r#"{"requestStatus":{"statusCode":41,
+            "statusDescription":"APP_PATCHING_STATUS 1234"}}"#;
+        assert!(request_status(patching).is_app_patching());
+    }
+
+    #[test]
+    fn other_failures_are_not_mistaken_for_patching() {
+        // right code wrong description
+        let other = r#"{"requestStatus":{"statusCode":41,"statusDescription":"SOMETHING_ELSE"}}"#;
+        assert!(!request_status(other).is_app_patching());
+
+        // right description wrong code
+        let wrong_code =
+            r#"{"requestStatus":{"statusCode":50,"statusDescription":"APP_PATCHING_STATUS"}}"#;
+        assert!(!request_status(wrong_code).is_app_patching());
+
+        // real server error, shouldnt be mistaken for patching
+        let busy = r#"{"requestStatus":{"statusCode":3,"statusDescription":"INTERNAL_ERROR"}}"#;
+        assert!(!request_status(busy).is_app_patching());
+    }
+
     fn active_ids(body: &str) -> Vec<String> {
         let payload: GetSessionsResponse =
             serde_json::from_str(body).expect("active sessions body should decode");
@@ -1308,13 +1480,6 @@ mod tests {
         assert_eq!(FlexibleStatus::Num(7).code(), 7);
     }
 
-    #[test]
-    fn stable_device_id_is_deterministic() {
-        let a = stable_device_id();
-        let b = stable_device_id();
-        assert_eq!(a, b);
-        assert!(a.len() > 10);
-    }
 
     #[test]
     fn parse_resolution_splits() {

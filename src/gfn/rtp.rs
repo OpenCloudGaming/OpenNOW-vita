@@ -28,6 +28,43 @@ pub struct VideoSampleStats {
     pub dropped: u32,
     pub source_frame_duration_us: Option<u64>,
     pub encoded_resolution: Option<(u32, u32)>,
+    pub jitter_ms: f32,
+}
+
+// jitter estimator, rfc 3550 formula
+pub struct JitterEstimator {
+    jitter_us: f64,
+    last_arrival_us: Option<u64>,
+    last_rtp_timestamp: Option<u32>,
+}
+
+impl Default for JitterEstimator {
+    fn default() -> Self {
+        Self {
+            jitter_us: 0.0,
+            last_arrival_us: None,
+            last_rtp_timestamp: None,
+        }
+    }
+}
+
+impl JitterEstimator {
+    pub fn update(&mut self, arrival_us: u64, rtp_timestamp: u32) -> f32 {
+        if let (Some(last_arrival), Some(last_rtp)) = (self.last_arrival_us, self.last_rtp_timestamp) {
+            let arrival_diff_us = arrival_us.saturating_sub(last_arrival) as f64;
+            let rtp_diff_us = (rtp_timestamp.wrapping_sub(last_rtp) as f64 * 1_000_000.0) / u64::from(VIDEO_RTP_CLOCK_RATE) as f64;
+            let transit_diff_us = (arrival_diff_us - rtp_diff_us).abs();
+            // RFC 3550 EWMA smoother: J = J + (|D| - J) / 16
+            self.jitter_us += (transit_diff_us - self.jitter_us) / 16.0;
+        }
+        self.last_arrival_us = Some(arrival_us);
+        self.last_rtp_timestamp = Some(rtp_timestamp);
+        (self.jitter_us / 1000.0) as f32
+    }
+
+    pub fn current_jitter_ms(&self) -> f32 {
+        (self.jitter_us / 1000.0) as f32
+    }
 }
 
 pub struct VideoRtp {
@@ -37,13 +74,11 @@ pub struct VideoRtp {
     last_frame_timestamp: Option<u32>,
     source_frame_duration_us: Option<u64>,
     damage_score: u8,
-    /// What AVCDEC was actually initialized to decode - an SPS reporting anything bigger means
-    /// the server changed encode resolution mid-session, which the hardware decoder can't follow
-    /// without being recreated first.
     decode_width: u32,
     decode_height: u32,
     stream_too_large: bool,
     waiting_for_keyframe: bool,
+    jitter_estimator: JitterEstimator,
 }
 
 struct PendingVideoFrame {
@@ -142,6 +177,7 @@ impl VideoRtp {
             decode_height,
             stream_too_large: false,
             waiting_for_keyframe: false,
+            jitter_estimator: JitterEstimator::default(),
         }
     }
 
@@ -149,13 +185,19 @@ impl VideoRtp {
         self.waiting_for_keyframe
     }
 
+    pub fn current_jitter_ms(&self) -> f32 {
+        self.jitter_estimator.current_jitter_ms()
+    }
+
     pub fn receive(
         &mut self,
         worker: &VideoDecodeWorker,
         packet: Packet,
         keyframe_requested: &mut bool,
+        arrival_us: u64,
     ) -> VideoSampleStats {
         let mut stats = VideoSampleStats::default();
+        stats.jitter_ms = self.jitter_estimator.update(arrival_us, packet.header.timestamp);
         let mut frame_was_damaged = false;
         if packet.payload.is_empty() {
             if self.next_sequence == Some(packet.header.sequence_number) {

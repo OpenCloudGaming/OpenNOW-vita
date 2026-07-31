@@ -75,6 +75,8 @@ pub enum PeerEvent {
     Connected,
     Disconnected(String),
     Error(String),
+    // session time warning from control_channel
+    TimeWarning { code: u32, seconds_left: u32 },
 }
 
 enum PeerCommand {
@@ -82,6 +84,7 @@ enum PeerCommand {
     Gamepad(GamepadInput),
     Mouse(MouseEvent),
     Key { key: KeyStroke, pressed: bool },
+    SetMaxBitrate(u32),
     Close,
 }
 
@@ -228,6 +231,11 @@ impl PeerEngine {
         self.keyframe_requests.load(Ordering::Relaxed)
     }
 
+    // reapplies local desc with the new bitrate baked in
+    pub fn set_max_bitrate(&self, kbps: u32) {
+        let _ = self.command_tx.send(PeerCommand::SetMaxBitrate(kbps));
+    }
+
     pub fn direct_video_output(&self) -> Arc<DirectVideoOutput> {
         self.video_output.clone()
     }
@@ -328,6 +336,7 @@ async fn run_peer(
     };
 
     let sanitized_offer = crate::gfn::sdp::sanitize_offer(&setup.offer_sdp, &setup.server_ip);
+    let ri_caps = crate::gfn::sdp::parse_ri_input_capabilities(&setup.offer_sdp);
     let _ = std::fs::write("ux0:data/opennow-vita/offer-raw.sdp", &setup.offer_sdp);
     let _ = std::fs::write("ux0:data/opennow-vita/offer-sanitized.sdp", &sanitized_offer);
     let video_payload_types = crate::gfn::sdp::h264_payload_types(&sanitized_offer);
@@ -369,6 +378,27 @@ async fn run_peer(
             None
         }
     };
+    let partial_input_channel_id = match pc.create_data_channel(
+        "input_channel_partially_reliable",
+        Some(rtc::data_channel::RTCDataChannelInit {
+            ordered: false,
+            max_packet_life_time: Some(ri_caps.partial_reliable_threshold_ms),
+            ..Default::default()
+        }),
+    ) {
+        Ok(channel) => Some(channel.id()),
+        Err(error) => {
+            let _ = event_tx.send(PeerEvent::Status(format!(
+                "partial input channel creation failed: {error}"
+            )));
+            None
+        }
+    };
+    let mut partial_input_ready = false;
+    let mut partial_sequence: u16 = 0;
+
+    let mut control_channel_id: Option<rtc::data_channel::RTCDataChannelId> = None;
+
     let mut input_encoder = InputEncoder::default();
     let mut input_ready = false;
     let session_clock = Instant::now();
@@ -401,15 +431,22 @@ async fn run_peer(
     let answer = pc.create_answer(None).context("failed to create answer")?;
     pc.set_local_description(answer.clone())
         .context("failed to set local description")?;
+    let stream_settings = crate::gfn::cloudmatch::StreamSettings::for_vita();
+    let munged_answer_sdp = crate::gfn::sdp::munge_answer_sdp(
+        &answer.sdp,
+        stream_settings.max_bitrate_mbps * 1000,
+    );
+    let mut saved_answer_sdp = munged_answer_sdp.clone();
     let answer_sdp = answer.sdp.clone();
-    let _ = std::fs::write("ux0:data/opennow-vita/answer.sdp", &answer_sdp);
+    let _ = std::fs::write("ux0:data/opennow-vita/answer.sdp", &saved_answer_sdp);
     let nvst_sdp = crate::gfn::sdp::build_nvst_sdp_from_answer(
         &answer_sdp,
-        &crate::gfn::cloudmatch::StreamSettings::for_vita(),
+        &stream_settings,
+        &ri_caps,
     );
     let our_ufrag = crate::gfn::sdp::extract_ice_credentials(&answer_sdp).ufrag;
     let _ = event_tx.send(PeerEvent::LocalAnswer {
-        answer_sdp,
+        answer_sdp: saved_answer_sdp.clone(),
         nvst_sdp,
     });
     let _ = event_tx.send(PeerEvent::LocalIce(IceCandidate {
@@ -482,7 +519,8 @@ async fn run_peer(
                         return Ok(());
                     }
                     other => {
-                        let _ = event_tx.send(PeerEvent::Status(format!("Conexión: {other}")));
+                        // stays english, this is just debug status from the peer thread, no locale here
+                        let _ = event_tx.send(PeerEvent::Status(format!("Connection: {other}")));
                     }
                 },
                 RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(state) => {
@@ -503,6 +541,15 @@ async fn run_peer(
                         input_ready = true;
                         let _ = event_tx
                             .send(PeerEvent::Status("Canal de input abierto".to_owned()));
+                    } else if Some(channel_id) == partial_input_channel_id {
+                        partial_input_ready = true;
+                        let _ = event_tx
+                            .send(PeerEvent::Status("Canal parcial abierto".to_owned()));
+                    } else if let Some(channel) = pc.data_channel(channel_id) {
+                        if channel.label() == "control_channel" {
+                            control_channel_id = Some(channel_id);
+                            let _ = event_tx.send(PeerEvent::Status("Control channel abierto".to_owned()));
+                        }
                     }
                 }
                 _ => {}
@@ -510,7 +557,19 @@ async fn run_peer(
         }
 
         while let Some(message) = pc.poll_read() {
-            if let RTCMessage::DataChannelMessage(_channel_id, dc_message) = &message {
+            if let RTCMessage::DataChannelMessage(channel_id, dc_message) = &message {
+                if Some(*channel_id) == control_channel_id {
+                    if let Ok(text) = std::str::from_utf8(&dc_message.data) {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+                            if val.get("type").and_then(|v| v.as_str()) == Some("timerNotification") {
+                                let code = val.get("code").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let seconds_left = val.get("secondsLeft").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                let _ = event_tx.send(PeerEvent::TimeWarning { code, seconds_left });
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if let Some(version) = parse_input_handshake_version(&dc_message.data) {
                     input_ready = true;
                     input_encoder.set_protocol_version(version.min(u8::MAX as u16) as u8);
@@ -547,8 +606,9 @@ async fn run_peer(
                 }
                 video_ssrc = Some(packet.header.ssrc);
                 let mut keyframe_requested = false;
+                let arrival_us = session_clock.elapsed().as_micros() as u64;
                 let sample_stats = if let Some(worker) = &decode_worker {
-                    video_rtp.receive(worker, packet, &mut keyframe_requested)
+                    video_rtp.receive(worker, packet, &mut keyframe_requested, arrival_us)
                 } else {
                     continue;
                 };
@@ -661,10 +721,12 @@ async fn run_peer(
                     metrics_last = MetricsSnapshot::capture(m);
                 }
 
+                let jitter_ms = video_rtp.current_jitter_ms();
                 let _ = event_tx.send(PeerEvent::Status(format!(
-                    "fps:{fps:.0} src:{src_rate:.0} sub:{sub:.0} qf:{qfull:.0} dec:{avg_decode_ms:.1}/wait:{avg_wait_ms:.1}ms nof:{noframe:.0} err:{errs:.0} reb:{rebuilds} stall:{stalls:.0} rtp:{rtp_rate:.0} drop:{drop_rate:.0} pli:{pli_sent_count} wfk:{} in:{}",
+                    "fps:{fps:.0} src:{src_rate:.0} sub:{sub:.0} qf:{qfull:.0} dec:{avg_decode_ms:.1}ms wait:{avg_wait_ms:.1}ms jit:{jitter_ms:.1}ms nof:{noframe:.0} err:{errs:.0} reb:{rebuilds} stall:{stalls:.0} rtp:{rtp_rate:.0} drop:{drop_rate:.0} pli:{pli_sent_count} wfk:{} in:{} pr:{}",
                     u8::from(video_rtp.waiting_for_keyframe()),
-                    u8::from(input_ready)
+                    u8::from(input_ready),
+                    u8::from(partial_input_ready)
                 )));
 
                 if frames == 0 {
@@ -775,6 +837,9 @@ async fn run_peer(
                 PeerCommand::Gamepad(input) => latest_gamepad = Some(input),
                 PeerCommand::Mouse(event) => mouse_events.push(event),
                 PeerCommand::Key { key, pressed } => key_events.push((key, pressed)),
+                PeerCommand::SetMaxBitrate(kbps) => {
+                    saved_answer_sdp = crate::gfn::sdp::replace_video_bitrate_in_sdp(&saved_answer_sdp, kbps);
+                }
                 PeerCommand::Close => {
                     let _ = pc.close();
                     return Ok(());

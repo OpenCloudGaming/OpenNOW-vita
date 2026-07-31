@@ -1,4 +1,4 @@
-use super::{App, AppState, CatalogSort};
+use super::{App, AppState, CatalogFilter, CatalogSort};
 use crate::gfn::auth::GfnUser;
 use crate::gfn::catalog::GameSummary;
 use crate::gfn::covers::{CoverSize, CoverSnapshot, CoverStore};
@@ -458,6 +458,7 @@ struct CatalogView<'a> {
     status_note: Option<&'a str>,
     locale: crate::locale::Locale,
     sort: CatalogSort,
+    filter: CatalogFilter,
     /// `pageInfo.totalCount` from the server - generally far more than we page in, so the header
     /// shows "N of M" to explain why the list stops where it does.
     total_count: Option<usize>,
@@ -503,6 +504,7 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                     status_note: app.status_note.as_deref(),
                     locale: app.locale,
                     sort: app.catalog_sort,
+                    filter: app.catalog_filter,
                     total_count: app.catalog_total_count(),
                     favorites: &app.favorites,
                     loading_more: app.is_loading_more_catalog(),
@@ -544,6 +546,7 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                 status_note: None,
                 locale: app.locale,
                 sort: app.catalog_sort,
+                filter: app.catalog_filter,
                 total_count: app.catalog_total_count(),
                 loading_more: app.is_loading_more_catalog(),
                 favorites: &app.favorites,
@@ -584,6 +587,7 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                 status_note: None,
                 locale: app.locale,
                 sort: app.catalog_sort,
+                filter: app.catalog_filter,
                 total_count: app.catalog_total_count(),
                 loading_more: app.is_loading_more_catalog(),
                 favorites: &app.favorites,
@@ -628,6 +632,7 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                 status_note: None,
                 locale: app.locale,
                 sort: app.catalog_sort,
+                filter: app.catalog_filter,
                 total_count: app.catalog_total_count(),
                 loading_more: app.is_loading_more_catalog(),
                 favorites: &app.favorites,
@@ -657,7 +662,7 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                 commands.push(cmd);
             }
         }
-        AppState::Error { message, .. } => error_screen(ctx, &i18n, message),
+        AppState::Error { message, code, .. } => error_screen(ctx, &i18n, message, *code),
     }
 
     if app.show_controls_modal && matches!(app.state, AppState::Streaming { .. })
@@ -936,6 +941,10 @@ fn catalog_screen(ctx: &egui::Context, i18n: &I18n, view: &CatalogView<'_>) -> V
                     if let Some(cmd) = sort_picker(ui, i18n, view.sort, view.games) {
                         commands.push(cmd);
                     }
+                    ui.add_space(6.0);
+                    if let Some(cmd) = filter_picker(ui, i18n, view.filter) {
+                        commands.push(cmd);
+                    }
                 });
             });
         });
@@ -1197,6 +1206,64 @@ fn language_picker(
                     if let Some(chosen) = settings_row(
                         ui,
                         i18n,
+                        "settings-rear-touch-mode-heading",
+                        crate::gfn::stream_prefs::RearTouchMode::ALL.iter().copied(),
+                        crate::gfn::stream_prefs::rear_touch_mode(),
+                        |candidate| i18n.text(candidate.label_key()),
+                    ) {
+                        command = Some(AppCommand::SetRearTouchMode(chosen));
+                    }
+
+                    // little diagram, 2 halves or 4 quadrants depending on mode
+                    let current_mode = crate::gfn::stream_prefs::rear_touch_mode();
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 70.0), egui::Sense::hover());
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, 6.0, BG_DEEP);
+                    painter.rect_stroke(rect, 6u8, egui::Stroke::new(1.0_f32, BORDER), egui::StrokeKind::Inside);
+
+                    let anim_time = ui.ctx().input(|i| i.time);
+                    ui.ctx().request_repaint(); // for the pulse anim
+
+                    match current_mode {
+                        crate::gfn::stream_prefs::RearTouchMode::Quadrant => {
+                            let quadrants = [
+                                ("L2", rect.min.x, rect.min.y, 0.0),
+                                ("R2", rect.center().x, rect.min.y, 0.25),
+                                ("L3", rect.min.x, rect.center().y, 0.50),
+                                ("R3", rect.center().x, rect.center().y, 0.75),
+                            ];
+                            for (label, min_x, min_y, phase) in quadrants {
+                                let pulse = 0.5 + 0.5 * ((anim_time * 3.0 + phase * std::f64::consts::TAU).sin() as f32);
+                                let cell = egui::Rect::from_min_size(
+                                    egui::pos2(min_x, min_y),
+                                    egui::vec2(rect.width() / 2.0, rect.height() / 2.0),
+                                ).shrink(3.0);
+                                painter.rect_filled(cell, 4.0, ACCENT.gamma_multiply(0.12 + pulse * 0.25));
+                                painter.rect_stroke(cell, 4u8, egui::Stroke::new(1.5_f32, ACCENT.gamma_multiply(0.4 + pulse * 0.6)), egui::StrokeKind::Inside);
+                                painter.text(cell.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), egui::Color32::WHITE);
+                            }
+                        }
+                        crate::gfn::stream_prefs::RearTouchMode::Halves => {
+                            let halves = [
+                                ("L2", rect.min.x, 0.0),
+                                ("R2", rect.center().x, 0.5),
+                            ];
+                            for (label, min_x, phase) in halves {
+                                let pulse = 0.5 + 0.5 * ((anim_time * 3.0 + phase * std::f64::consts::TAU).sin() as f32);
+                                let cell = egui::Rect::from_min_size(
+                                    egui::pos2(min_x, rect.min.y),
+                                    egui::vec2(rect.width() / 2.0, rect.height()),
+                                ).shrink(3.0);
+                                painter.rect_filled(cell, 4.0, ACCENT.gamma_multiply(0.12 + pulse * 0.25));
+                                painter.rect_stroke(cell, 4u8, egui::Stroke::new(1.5_f32, ACCENT.gamma_multiply(0.4 + pulse * 0.6)), egui::StrokeKind::Inside);
+                                painter.text(cell.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(14.0), egui::Color32::WHITE);
+                            }
+                        }
+                    }
+
+                    if let Some(chosen) = settings_row(
+                        ui,
+                        i18n,
                         "settings-stick-zones-heading",
                         crate::gfn::stream_prefs::StickZones::ALL.iter().copied(),
                         crate::gfn::stream_prefs::stick_zones(),
@@ -1289,6 +1356,33 @@ fn sort_picker(
                 };
                 if ui.selectable_label(candidate == current, label).clicked() {
                     command = Some(AppCommand::SetSort(candidate));
+                }
+            }
+        },
+    );
+    command
+}
+
+// same as sort_picker but for my games / all games
+fn filter_picker(ui: &mut egui::Ui, i18n: &I18n, current: CatalogFilter) -> Option<AppCommand> {
+    let mut command = None;
+    let label = text1(i18n, "catalog-filter-button", "filter", i18n.text(current.label_key()));
+    let response = ui.add_sized([150.0, 30.0], egui::Button::new(label).fill(BG_RAISED));
+    let popup_id = ui.make_persistent_id("catalog_filter_popup");
+    if response.clicked() {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &response,
+        egui::PopupCloseBehavior::CloseOnClick,
+        |ui| {
+            ui.set_min_width(170.0);
+            for candidate in CatalogFilter::ALL {
+                let label = i18n.text(candidate.label_key());
+                if ui.selectable_label(candidate == current, label).clicked() {
+                    command = Some(AppCommand::SetFilter(candidate));
                 }
             }
         },
@@ -2220,6 +2314,20 @@ fn creating_session_launch<'a>(
     queue_status: &crate::gfn::cloudmatch::QueueStatus,
     was_queued: bool,
 ) -> LaunchView<'a> {
+    // Checked before the server-error case: a patch is reported as a 5xx but is not a failure, and
+    // it can hold the launch for many minutes - long enough that silence reads as a hang.
+    if queue_status.app_patching {
+        return LaunchView {
+            stage: LaunchStage::Setup,
+            game,
+            headline: i18n.text("session-app-patching"),
+            detail: Some(i18n.text("session-app-patching-detail")),
+            spinning: true,
+            session_id: None,
+            queue_skipped: !was_queued,
+        };
+    }
+
     // A run of 5xx replies looks identical to a stalled launch from the outside, so it gets said
     // out loud rather than hidden behind the queue position.
     if queue_status.server_errors > 0 {
@@ -2546,6 +2654,17 @@ fn stream_controls_modal(ctx: &egui::Context, i18n: &I18n) -> Option<AppCommand>
                     command = Some(AppCommand::SetTriggerIntensity(chosen));
                 }
 
+                if let Some(chosen) = settings_row(
+                    ui,
+                    i18n,
+                    "settings-rear-touch-mode-heading",
+                    crate::gfn::stream_prefs::RearTouchMode::ALL.iter().copied(),
+                    crate::gfn::stream_prefs::rear_touch_mode(),
+                    |candidate| i18n.text(candidate.label_key()),
+                ) {
+                    command = Some(AppCommand::SetRearTouchMode(chosen));
+                }
+
                 ui.add_space(6.0);
 
                 if let Some(chosen) = settings_row(
@@ -2583,12 +2702,10 @@ fn stream_controls_modal(ctx: &egui::Context, i18n: &I18n) -> Option<AppCommand>
 /// that nobody reads and that pushes the hint off the screen.
 const MAX_ERROR_BODY: usize = 220;
 
-/// What to show the player for a failure, as `(title key, body)`.
-///
-/// A raw error string explains the machinery; a player needs to know what to *do*. Mirrors
-/// OpenNOW-Switch's `session_error::Present`, which maps the same failures to a short title and an
-/// actionable body rather than printing the exception.
-fn present_error(i18n: &I18n, message: &str) -> (String, String) {
+// old text-based classifier, only hit when we never got a real gfn code (sign-in, catalog
+// graphql, signaling socket). has spanish words too bc the text mightve already been
+// translated. dont add more to this list, thats what the code table is for now
+fn legacy_error_keys(message: &str) -> Option<(&'static str, &'static str)> {
     let haystack = message.to_ascii_lowercase();
 
     // Checked before the session case: an expired login often mentions "session" too, and the
@@ -2599,17 +2716,45 @@ fn present_error(i18n: &I18n, message: &str) -> (String, String) {
         || haystack.contains("expirado")
         || haystack.contains("caduc")
     {
-        return (
-            i18n.text("error-auth-title"),
-            i18n.text("error-auth-body"),
-        );
+        return Some(("error-auth-title", "error-auth-body"));
     }
 
     if haystack.contains("session_limit") || haystack.contains("active session") {
+        return Some(("error-session-busy-title", "error-session-busy-body"));
+    }
+
+    None
+}
+
+// title/body to show the player. code decides it when we have one, substring checks below
+// are just the fallback for stuff that never carried a code (sign-in, catalog, signaling)
+fn present_error(
+    i18n: &I18n,
+    message: &str,
+    code: Option<crate::gfn::error_codes::GfnErrorCode>,
+) -> (String, String) {
+    if let Some(code) = code {
+        if let Some((title, body)) = code.message_keys() {
+            return (i18n.text(title), i18n.text(body));
+        }
+        // A code NVIDIA has not given wording to. Naming it still beats the raw JSON this used to
+        // print, and it is the string a player can search for or quote in a bug report.
         return (
-            i18n.text("error-session-busy-title"),
-            i18n.text("error-session-busy-body"),
+            i18n.text("error-gfn-unknown-title"),
+            text1(
+                i18n,
+                "error-gfn-unknown-body",
+                "detail",
+                match code.name() {
+                    Some(name) => format!("{name} ({})", code.0),
+                    None => code.0.to_string(),
+                },
+            ),
         );
+    }
+
+    if let Some((title, body)) = legacy_error_keys(message) {
+        return (i18n.text(title), i18n.text(body));
     }
 
     let mut body = message.trim().to_owned();
@@ -2620,8 +2765,13 @@ fn present_error(i18n: &I18n, message: &str) -> (String, String) {
     (i18n.text("error-title"), body)
 }
 
-fn error_screen(ctx: &egui::Context, i18n: &I18n, message: &str) {
-    let (title, body) = present_error(i18n, message);
+fn error_screen(
+    ctx: &egui::Context,
+    i18n: &I18n,
+    message: &str,
+    code: Option<crate::gfn::error_codes::GfnErrorCode>,
+) {
+    let (title, body) = present_error(i18n, message, code);
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(70.0);
@@ -2700,27 +2850,19 @@ fn draw_qr(ui: &mut egui::Ui, verification_uri: &str, target_size: f32) {
 
 #[cfg(test)]
 mod error_presentation_tests {
-    /// The classifier, lifted out of `present_error` so it can be checked without an `I18n`.
-    /// Kept in the same order as the real one - the order is the point.
+    use super::legacy_error_keys;
+    use crate::gfn::error_codes::GfnErrorCode;
+
     fn classify(message: &str) -> &'static str {
-        let haystack = message.to_ascii_lowercase();
-        if haystack.contains("401")
-            || haystack.contains("sign in again")
-            || haystack.contains("expired")
-            || haystack.contains("expirado")
-            || haystack.contains("caduc")
-        {
-            "auth"
-        } else if haystack.contains("session_limit") || haystack.contains("active session") {
-            "session"
-        } else {
-            "generic"
+        match legacy_error_keys(message) {
+            Some(("error-auth-title", _)) => "auth",
+            Some(_) => "session",
+            None => "generic",
         }
     }
 
     #[test]
     fn a_session_limit_is_not_shown_as_a_generic_failure() {
-        assert_eq!(classify("SESSION_LIMIT still reported after cleanup"), "session");
         assert_eq!(
             classify("GeForce NOW still reports an active session"),
             "session"
@@ -2741,6 +2883,20 @@ mod error_presentation_tests {
     #[test]
     fn anything_else_falls_back() {
         assert_eq!(classify("connection reset by peer"), "generic");
+    }
+
+    // this one wouldve landed on the auth branch if we still matched by text
+    #[test]
+    fn a_code_decides_regardless_of_the_wording() {
+        let (title, _) = GfnErrorCode::SESSION_LIMIT_PER_DEVICE_REACHED
+            .message_keys()
+            .expect("the per-device limit has wording");
+        assert_eq!(title, "error-gfn-session-limit-per-device-reached-title");
+        assert_eq!(
+            classify("CloudMatch rejected the launch: token expired"),
+            "auth",
+            "without a code this is all the classifier has to go on"
+        );
     }
 
     /// Long errors used to wrap into a wall of text that pushed the hint off screen.

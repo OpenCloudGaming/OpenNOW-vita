@@ -266,6 +266,21 @@ pub struct CatalogPage {
     pub total_count: Option<usize>,
 }
 
+// same filter opennow uses (libraryGames.ts:35-45), skips games we dont own
+fn owned_games_filter() -> serde_json::Value {
+    json!({
+        "variants": {
+            "gfn": {
+                "library": {
+                    "status": {
+                        "notEquals": "NOT_OWNED"
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Fetches one page.
 pub async fn fetch_catalog_page(
     client: &Client,
@@ -273,18 +288,20 @@ pub async fn fetch_catalog_page(
     vpc_id: &str,
     query: Option<&str>,
     cursor: &str,
+    owned_only: bool,
 ) -> Result<CatalogPage> {
     let (document, label) = match query {
         Some(_) => (catalog_search_query(), "catalog search"),
         None => (catalog_query(), "catalog"),
     };
+    let filters = if owned_only { owned_games_filter() } else { json!({}) };
     let mut variables = json!({
         "vpcId": vpc_id,
         "locale": LOCALE,
         "sortString": CATALOG_SORT,
         "fetchCount": CATALOG_PAGE_SIZE,
         "cursor": cursor,
-        "filters": {},
+        "filters": filters,
     });
     if let Some(query) = query {
         variables["searchString"] = json!(query);
@@ -406,7 +423,18 @@ pub async fn resolve_vpc_id(client: &Client, token: &str, cache: &VpcIdCache) ->
 }
 
 /// Whether an error is GFN refusing the token, as opposed to the network being unhappy.
+///
+/// checks the code first, text checks stay as fallback since this hits the graphql endpoint
+/// not cloudmatch, so we dont always get a real requestStatus back
 fn is_authorization_error(error: &anyhow::Error) -> bool {
+    if error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<super::error_codes::GfnError>())
+        .is_some_and(|gfn| gfn.code.needs_reauth())
+    {
+        return true;
+    }
+
     let text = format!("{error:#}");
     text.contains("401 Unauthorized")
         || text.contains("403 Forbidden")
@@ -421,7 +449,8 @@ pub async fn fetch_catalog_page_for_account(
     cache: &VpcIdCache,
     query: Option<&str>,
     cursor: &str,
+    owned_only: bool,
 ) -> Result<CatalogPage> {
     let vpc_id = resolve_vpc_id(client, token, cache).await?;
-    fetch_catalog_page(client, token, &vpc_id, query, cursor).await
+    fetch_catalog_page(client, token, &vpc_id, query, cursor, owned_only).await
 }

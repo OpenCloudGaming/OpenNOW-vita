@@ -756,8 +756,11 @@ fn spawn_decode_worker(device: AudioDevice) -> Result<SyncSender<AudioPacket>> {
                                 Some(primary) => match decoder.decode(primary, &mut decode_buf) {
                                     Ok(samples) => samples,
                                     Err(error) => {
-                                        eprintln!("Failed to decode Opus audio packet: {error}");
+                                        eprintln!("Failed to decode Opus audio packet: {error}; resetting decoder");
                                         STATS.decode_errors.fetch_add(1, Ordering::Relaxed);
+                                        if let Ok(new_decoder) = NativeOpusDecoder::new() {
+                                            decoder = new_decoder;
+                                        }
                                         decoder.conceal(&mut decode_buf).unwrap_or(0)
                                     }
                                 },

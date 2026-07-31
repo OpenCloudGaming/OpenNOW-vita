@@ -585,7 +585,10 @@ fn decode_jwt_payload(token: &str) -> Result<serde_json::Value> {
 /// A random id persisted alongside the tokens, standing in for the hostname+username hash
 /// OpenNOW's desktop client derives its `device_id` from - the Vita has neither concept in a way
 /// that is stable and meaningful here.
-fn device_id() -> String {
+///
+/// shared with CloudMatch, not just sign-in — if we send a different x-device-id there we
+/// wont be able to delete our own sessions
+pub fn device_id() -> String {
     if let Some(existing) = load_device_id() {
         return existing;
     }

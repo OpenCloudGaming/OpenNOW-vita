@@ -21,6 +21,8 @@ const WRAPPER_LEGACY_INPUT: u8 = 0x21;
 /// Marks a single unframed event - unlike `0x21` it carries no length prefix.
 const WRAPPER_SINGLE_INPUT: u8 = 0x22;
 const WRAPPER_VERSION_MARKER: u8 = 0x23;
+// wrapper byte for partial-reliable gamepad state
+const WRAPPER_PARTIAL_GAMEPAD: u8 = 0x26;
 const GAMEPAD_PAYLOAD_SIZE: u16 = 26;
 const GAMEPAD_INNER_SIZE: u16 = 20;
 const GAMEPAD_RESERVED_MARKER: u16 = 85;
@@ -219,6 +221,10 @@ impl InputEncoder {
         self.protocol_version = protocol_version;
     }
 
+    pub fn protocol_version(&self) -> u8 {
+        self.protocol_version
+    }
+
     /// Keepalive the server expects every ~2 seconds once the channel is up.
     pub fn encode_heartbeat(&self) -> Vec<u8> {
         INPUT_HEARTBEAT.to_le_bytes().to_vec()
@@ -244,6 +250,42 @@ impl InputEncoder {
         payload.extend_from_slice(&0u16.to_le_bytes());
         payload.extend_from_slice(&input.timestamp_us.to_le_bytes());
         self.wrap_legacy_input(input.timestamp_us, &payload)
+    }
+
+    // partial reliable gamepad frame, 54 bytes total, format copied byte for byte from
+    // OpenNOW-Switch: [0x23][u64 BE ts][0x26][u8 ctrl_id][u16 BE seq][0x21][u16 BE len=26][26b payload]
+    pub fn encode_gamepad_state_partially_reliable(
+        &self,
+        bitmap: u16,
+        input: GamepadInput,
+        sequence: u16,
+    ) -> Vec<u8> {
+        let mut inner_payload = Vec::with_capacity(26);
+        inner_payload.extend_from_slice(&(input.controller_id as u16).to_le_bytes());
+        inner_payload.extend_from_slice(&bitmap.to_le_bytes());
+        inner_payload.extend_from_slice(&GAMEPAD_INNER_SIZE.to_le_bytes());
+        inner_payload.extend_from_slice(&input.buttons.to_le_bytes());
+        inner_payload.extend_from_slice(
+            &(input.left_trigger as u16 | ((input.right_trigger as u16) << 8)).to_le_bytes(),
+        );
+        inner_payload.extend_from_slice(&input.left_stick_x.to_le_bytes());
+        inner_payload.extend_from_slice(&input.left_stick_y.to_le_bytes());
+        inner_payload.extend_from_slice(&input.right_stick_x.to_le_bytes());
+        inner_payload.extend_from_slice(&input.right_stick_y.to_le_bytes());
+        inner_payload.extend_from_slice(&0u16.to_le_bytes());
+        inner_payload.extend_from_slice(&GAMEPAD_RESERVED_MARKER.to_le_bytes());
+        inner_payload.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut bytes = Vec::with_capacity(54);
+        bytes.push(WRAPPER_VERSION_MARKER); // 0x23
+        bytes.extend_from_slice(&input.timestamp_us.to_be_bytes()); // 8 bytes BE
+        bytes.push(WRAPPER_PARTIAL_GAMEPAD); // 0x26
+        bytes.push(input.controller_id); // 1 byte controller_id
+        bytes.extend_from_slice(&sequence.to_be_bytes()); // 2 bytes BE sequence
+        bytes.push(WRAPPER_LEGACY_INPUT); // 0x21
+        bytes.extend_from_slice(&(inner_payload.len() as u16).to_be_bytes()); // 2 bytes BE len (26)
+        bytes.extend_from_slice(&inner_payload); // 26 bytes payload
+        bytes
     }
 
     /// Relative pointer movement, `dx`/`dy` in host pixels. Note the endianness split: the
@@ -468,5 +510,30 @@ mod tests {
                 "printable ASCII {character:?} (0x{byte:02X}) has no key mapping"
             );
         }
+    }
+
+    #[test]
+    fn partially_reliable_gamepad_encoding_matches_expected_structure() {
+        let encoder = v3();
+        let input = GamepadInput {
+            controller_id: 0,
+            buttons: 0x0001,
+            left_trigger: 100,
+            right_trigger: 200,
+            left_stick_x: 1000,
+            left_stick_y: -1000,
+            right_stick_x: 2000,
+            right_stick_y: -2000,
+            timestamp_us: 0x0102030405060708,
+        };
+        let payload = encoder.encode_gamepad_state_partially_reliable(GAMEPAD_BITMAP_PRIMARY, input, 42);
+        assert_eq!(payload.len(), 54);
+        assert_eq!(payload[0], WRAPPER_VERSION_MARKER); // 0x23
+        assert_eq!(&payload[1..9], &0x0102030405060708u64.to_be_bytes());
+        assert_eq!(payload[9], WRAPPER_PARTIAL_GAMEPAD); // 0x26
+        assert_eq!(payload[10], 0); // controller_id
+        assert_eq!(&payload[11..13], &42u16.to_be_bytes()); // sequence
+        assert_eq!(payload[13], WRAPPER_LEGACY_INPUT); // 0x21
+        assert_eq!(&payload[14..16], &26u16.to_be_bytes()); // inner len 26
     }
 }

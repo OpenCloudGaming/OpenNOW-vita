@@ -5,6 +5,54 @@ All notable changes to OpenNOW Vita are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-08-02
+
+Error handling pass on top of 0.3.0: launch failures now speak GeForce NOW's
+own error codes instead of raw JSON, and two causes of a stuck or locked-out
+launch are fixed.
+
+### Changed
+
+- Failed launches now say what went wrong. GeForce NOW's error codes are modelled
+  properly — 121 of them, 69 with wording in English and Spanish, ported from
+  OpenNOW's `gfnErrorCodeEnum.ts` — so a failure shows "Membership Upgrade
+  Required" or "Region At Capacity" instead of a truncated dump of NVIDIA's JSON.
+  An unrecognised code is named rather than pasted.
+- The code also drives behaviour, replacing three separate substring classifiers
+  that had grown up around the error text — one picking the error screen's
+  wording, one deciding whether to refresh the token, one deciding whether a
+  catalog failure was an authorization problem. They matched on text that had
+  *already been translated*, so a Spanish player took different branches than an
+  English one.
+- A poll failure NVIDIA reports as final now stops immediately instead of
+  spending the whole 5xx retry allowance — about 2.5 minutes — re-asking about a
+  banned region or a membership problem.
+- The catalog now defaults to the account's owned games instead of the whole
+  GFN catalog (same `library.status` filter as OpenNOW's `LIBRARY_APPS_FILTER`),
+  with a "My Games / All Games" picker next to the sort dropdown to switch back.
+
+### Fixed
+
+- Launches abandoned with `HTTP 503` while NVIDIA was installing a game update.
+  CloudMatch reports patching as a 5xx with `statusCode` 41, which counted
+  against the server-error allowance and gave up after ~2.5 minutes — far short
+  of how long a patch takes. It is now recognised as progress, with its own
+  "Updating the game" screen. Mirrors OpenNOW-Switch's `IsAppPatchingResponse`.
+- Launch failures now lead with the CloudMatch status code and description
+  instead of opening with raw JSON that the error screen truncates.
+- "A session is already open" locking an account out for the several minutes
+  NVIDIA takes to reap a session, after a crash or a force-quit. Three causes:
+  - The device id sent to CloudMatch was a UUIDv5 of a fixed string, so it was
+    *identical on every Vita running the app* — and NVIDIA refuses a `DELETE`
+    from a device that does not own the session. It is now the same per-install
+    id sign-in already persisted, matching OpenNOW-Switch's `GenerateDeviceId`.
+  - The open session is now written to the memory card with the zone that
+    provisioned it, and deleted on the next launch. The normal stop does not run
+    when the process dies, and asking CloudMatch which sessions are open does not
+    say which zone to delete them at.
+  - Both cleanup paths deleted against the generic CloudMatch entry point rather
+    than the session's own zone, so they could not remove anything.
+
 ## [0.3.0] - 2026-07-31
 
 Closes the two gaps 0.2.1 shipped with — no rear-touch mapping for the analog
@@ -88,5 +136,6 @@ First public release.
 
 - Analog triggers and L3/R3 had no rear-touchpad mapping. *(Addressed in 0.3.0.)*
 
+[0.3.1]: https://github.com/OpenCloudGaming/OpenNOW-vita/releases/tag/v0.3.1
 [0.3.0]: https://github.com/OpenCloudGaming/OpenNOW-vita/releases/tag/v0.3.0
 [0.2.1]: https://github.com/OpenCloudGaming/OpenNOW-vita/releases/tag/v0.2.1

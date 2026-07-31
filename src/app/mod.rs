@@ -85,6 +85,58 @@ impl CatalogSort {
             Self::TitleDesc => "catalog-sort-title-desc",
         }
     }
+
+    pub fn as_text(self) -> &'static str {
+        match self {
+            Self::LastPlayed => "last_played",
+            Self::Relevance => "relevance",
+            Self::TitleAsc => "title_asc",
+            Self::TitleDesc => "title_desc",
+        }
+    }
+
+    pub fn from_text(text: &str) -> Self {
+        match text.trim() {
+            "relevance" => Self::Relevance,
+            "title_asc" => Self::TitleAsc,
+            "title_desc" => Self::TitleDesc,
+            _ => Self::LastPlayed,
+        }
+    }
+}
+
+// my games vs whole gfn catalog, default is my games obviously
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatalogFilter {
+    #[default]
+    MyGames,
+    AllGames,
+}
+
+impl CatalogFilter {
+    pub const ALL: [CatalogFilter; 2] = [Self::MyGames, Self::AllGames];
+
+    // label for the dropdown
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Self::MyGames => "catalog-filter-my-games",
+            Self::AllGames => "catalog-filter-all-games",
+        }
+    }
+
+    pub fn as_text(self) -> &'static str {
+        match self {
+            Self::MyGames => "my_games",
+            Self::AllGames => "all_games",
+        }
+    }
+
+    pub fn from_text(text: &str) -> Self {
+        match text.trim() {
+            "all_games" => Self::AllGames,
+            _ => Self::MyGames,
+        }
+    }
 }
 
 /// How many catalog pages (`CATALOG_PAGE_SIZE` titles each) are walked before we stop.
@@ -242,6 +294,14 @@ fn tr(locale: Locale, id: &'static str, key: &'static str, value: impl ToString)
     crate::i18n::I18n::new(locale).text_with(id, args)
 }
 
+// digs thru the error chain for a gfn code, the outer error is usually just anyhow context by now
+fn gfn_error_code(error: &anyhow::Error) -> Option<crate::gfn::error_codes::GfnErrorCode> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::gfn::error_codes::GfnError>())
+        .map(|gfn| gfn.code)
+}
+
 /// Top-level screen the shell is currently rendering.
 pub enum AppState {
     /// Press Confirm to start the device-code flow.
@@ -329,6 +389,8 @@ pub enum AppState {
     Error {
         message: String,
         retry: ErrorRetry,
+        // kept separate from message so we can look up real wording instead of grepping text
+        code: Option<crate::gfn::error_codes::GfnErrorCode>,
     },
 }
 
@@ -380,6 +442,8 @@ pub struct App {
     pub(crate) locale: Locale,
     /// Library sort order, changed via the sort dropdown next to the library header.
     pub(crate) catalog_sort: CatalogSort,
+    // my games vs full catalog, next to the sort dropdown
+    pub(crate) catalog_filter: CatalogFilter,
     /// Cached account VPC id, shared with every spawned catalog task so the id is fetched once
     /// per session instead of before every catalog/search request.
     vpc_id_cache: catalog::VpcIdCache,
@@ -455,9 +519,14 @@ impl App {
         let http_client = auth::client();
         let tokens = auth::load_tokens();
         let vpc_id_cache = catalog::VpcIdCache::default();
+        let catalog_filter =
+            CatalogFilter::from_text(&crate::gfn::stream_prefs::saved_catalog_filter());
+        let owned_only = catalog_filter == CatalogFilter::MyGames;
         let state = match &tokens {
             Some(tokens) => match auth::user_from_tokens(tokens) {
-                Ok(user) => Self::start_catalog_fetch(&http_client, tokens, &vpc_id_cache, user),
+                Ok(user) => {
+                    Self::start_catalog_fetch(&http_client, tokens, &vpc_id_cache, user, owned_only)
+                }
                 Err(error) => {
                     eprintln!("Saved GFN login could not be decoded, clearing it: {error:#}");
                     auth::clear_tokens();
@@ -487,7 +556,8 @@ impl App {
             show_controls_modal: false,
             mouse_trackpad_enabled: true,
             locale: Locale::default(),
-            catalog_sort: CatalogSort::default(),
+            catalog_sort: CatalogSort::from_text(&crate::gfn::stream_prefs::saved_catalog_sort()),
+            catalog_filter,
             vpc_id_cache,
             paging: CatalogPaging::default(),
             browse_snapshot: None,
@@ -530,6 +600,22 @@ impl App {
             }
             AppCommand::SetTriggerIntensity(intensity) => {
                 crate::gfn::stream_prefs::set_trigger_intensity(intensity);
+                current_state
+            }
+            AppCommand::SetRearTouchMode(mode) => {
+                crate::gfn::stream_prefs::set_rear_touch_mode(mode);
+                if mode == crate::gfn::stream_prefs::RearTouchMode::Quadrant {
+                    // turn off front L3/R3 so they dont fight with rear panel
+                    crate::gfn::stream_prefs::set_stick_zones(crate::gfn::stream_prefs::StickZones::Off);
+                }
+                current_state
+            }
+            AppCommand::SetStickZones(zones) => {
+                crate::gfn::stream_prefs::set_stick_zones(zones);
+                if zones != crate::gfn::stream_prefs::StickZones::Off {
+                    // same deal but reverse, drop rear back to 2 zones
+                    crate::gfn::stream_prefs::set_rear_touch_mode(crate::gfn::stream_prefs::RearTouchMode::Halves);
+                }
                 current_state
             }
             AppCommand::DismissControlsHint => {
@@ -584,6 +670,12 @@ impl App {
                 self.mouse_trackpad_enabled = !self.mouse_trackpad_enabled;
                 current_state
             }
+            AppCommand::SetMaxBitrate(kbps) => {
+                if let AppState::Streaming { peer, .. } = &current_state {
+                    peer.set_max_bitrate(kbps);
+                }
+                current_state
+            }
             AppCommand::ToggleKeyboard => {
                 if crate::ime::is_open() {
                     crate::ime::close();
@@ -596,10 +688,6 @@ impl App {
                 if let AppState::Streaming { peer, .. } = &current_state {
                     peer.tap_key(key);
                 }
-                current_state
-            }
-            AppCommand::SetStickZones(zones) => {
-                crate::gfn::stream_prefs::set_stick_zones(zones);
                 current_state
             }
             AppCommand::SetAudioBoost(boost) => {
@@ -629,6 +717,7 @@ impl App {
             }
             AppCommand::SetSort(sort) => {
                 self.catalog_sort = sort;
+                crate::gfn::stream_prefs::set_saved_catalog_sort(sort.as_text());
                 match current_state {
                     AppState::Catalog {
                         user,
@@ -650,6 +739,24 @@ impl App {
                             search_requested,
                             covers,
                         }
+                    }
+                    other => other,
+                }
+            }
+            AppCommand::SetFilter(filter) => {
+                self.catalog_filter = filter;
+                crate::gfn::stream_prefs::set_saved_catalog_filter(filter.as_text());
+                match current_state {
+                    AppState::Catalog { user, .. } => {
+                        self.browse_snapshot = None;
+                        self.paging.abort_job();
+                        Self::start_catalog_fetch(
+                            &self.http_client,
+                            self.tokens.as_ref().expect("catalog requires a saved login"),
+                            &self.vpc_id_cache,
+                            user,
+                            filter == CatalogFilter::MyGames,
+                        )
                     }
                     other => other,
                 }
@@ -1139,6 +1246,7 @@ impl App {
             }
             (
                 AppState::Error {
+                    code: None,
                     retry: ErrorRetry::RestartLogin,
                     ..
                 },
@@ -1146,6 +1254,7 @@ impl App {
             ) => self.start_login_state(),
             (
                 AppState::Error {
+                    code: None,
                     retry: ErrorRetry::ReloadCatalog(user),
                     ..
                 },
@@ -1157,10 +1266,12 @@ impl App {
                     self.tokens.as_ref().expect("retry requires a saved login"),
                     &self.vpc_id_cache,
                     user,
+                    self.catalog_filter == CatalogFilter::MyGames,
                 )
             }
             (
                 AppState::Error {
+                    code: None,
                     retry:
                         ErrorRetry::BackToCatalog {
                             user,
@@ -1188,6 +1299,7 @@ impl App {
             // recoverable as a failed launch.
             (
                 AppState::Error {
+                    code: None,
                     retry:
                         ErrorRetry::BackToCatalog {
                             user,
@@ -1212,6 +1324,7 @@ impl App {
             },
             (
                 AppState::Error {
+                    code: None,
                     retry: ErrorRetry::ReloadCatalog(user),
                     ..
                 },
@@ -1223,10 +1336,12 @@ impl App {
                     self.tokens.as_ref().expect("retry requires a saved login"),
                     &self.vpc_id_cache,
                     user,
+                    self.catalog_filter == CatalogFilter::MyGames,
                 )
             }
             (
                 AppState::Error {
+                    code: None,
                     retry: ErrorRetry::RestartLogin,
                     ..
                 },
@@ -1249,6 +1364,7 @@ impl App {
         tokens: &AuthTokens,
         vpc_id_cache: &catalog::VpcIdCache,
         user: GfnUser,
+        owned_only: bool,
     ) -> AppState {
         let client = client.clone();
         let tokens = tokens.clone();
@@ -1277,7 +1393,8 @@ impl App {
             } else {
                 tokens.bearer().to_owned()
             };
-            catalog::fetch_catalog_page_for_account(&client, &bearer, &cache, None, "").await
+            catalog::fetch_catalog_page_for_account(&client, &bearer, &cache, None, "", owned_only)
+                .await
         });
         AppState::LoadingCatalog {
             user,
@@ -1402,10 +1519,19 @@ impl App {
         let client = self.http_client.clone();
         let cache = self.vpc_id_cache.clone();
         let dispatched = query.clone();
+        let owned_only = self.catalog_filter == CatalogFilter::MyGames;
         let handle: JoinHandle<Result<catalog::CatalogPage>> = tokio::spawn(async move {
             let trimmed = dispatched.trim();
             let server_query = (!trimmed.is_empty()).then_some(trimmed);
-            catalog::fetch_catalog_page_for_account(&client, &token, &cache, server_query, "").await
+            catalog::fetch_catalog_page_for_account(
+                &client,
+                &token,
+                &cache,
+                server_query,
+                "",
+                owned_only,
+            )
+            .await
         });
         self.search_job = Some((query, PollJob::Pending(handle)));
     }
@@ -1457,10 +1583,12 @@ impl App {
         let cache = self.vpc_id_cache.clone();
         let server_query = self.paging.server_query.clone();
         let generation = self.paging.generation;
+        let owned_only = self.catalog_filter == CatalogFilter::MyGames;
         let handle: JoinHandle<Result<catalog::CatalogPage>> = tokio::spawn(async move {
             let trimmed = server_query.trim();
             let query = (!trimmed.is_empty()).then_some(trimmed);
-            catalog::fetch_catalog_page_for_account(&client, &token, &cache, query, &cursor).await
+            catalog::fetch_catalog_page_for_account(&client, &token, &cache, query, &cursor, owned_only)
+                .await
         });
         self.paging.job = Some((generation, PollJob::Pending(handle)));
     }
@@ -1700,6 +1828,15 @@ impl App {
                             eprintln!("Streaming peer error: {err}");
                             self.status_note = Some(self.tr1("status-peer-error", "error", &err));
                         }
+                        crate::gfn::peer::PeerEvent::TimeWarning { code, seconds_left } => {
+                            let mins = (seconds_left + 59) / 60;
+                            let msg = match code {
+                                1 | 2 => format!("La sesión terminará en ~{mins} min"),
+                                4 => format!("La sesión finalizará en breve ({seconds_left}s)"),
+                                _ => format!("Aviso de tiempo de sesión: ~{mins} min restantes"),
+                            };
+                            self.status_note = Some(msg);
+                        }
                         crate::gfn::peer::PeerEvent::Disconnected(reason) => {
                             eprintln!("Streaming peer disconnected: {reason}");
                             fatal_reason
@@ -1713,6 +1850,7 @@ impl App {
                     handle.close();
                     self.stop_cloudmatch_session(&session);
                     self.state = AppState::Error {
+                        code: None,
                         message,
                         retry: ErrorRetry::BackToCatalog {
                             user,
@@ -1809,6 +1947,7 @@ impl App {
         if let Some(reason) = disconnected_reason {
             self.stop_cloudmatch_session(&session);
             return AppState::Error {
+                code: None,
                 message: self.tr1("error-signaling-disconnected", "reason", &reason),
                 retry: ErrorRetry::BackToCatalog {
                     user,
@@ -1848,6 +1987,7 @@ impl App {
                 poll_job: None,
             },
             PollJob::Done(Err(error)) => AppState::Error {
+                code: None,
                 message: self.tr1("error-login-start", "error", format!("{error:#}")),
                 retry: ErrorRetry::RestartLogin,
             },
@@ -1862,6 +2002,7 @@ impl App {
     ) -> AppState {
         if challenge.is_expired() {
             return AppState::Error {
+                code: None,
                 message: self.tr("error-login-code-expired"),
                 retry: ErrorRetry::RestartLogin,
             };
@@ -1918,14 +2059,17 @@ impl App {
             }
             PollJob::Done(Ok(DevicePollOutcome::Authorized(tokens))) => self.finish_login(tokens),
             PollJob::Done(Ok(DevicePollOutcome::Expired)) => AppState::Error {
+                code: None,
                 message: self.tr("error-login-code-expired"),
                 retry: ErrorRetry::RestartLogin,
             },
             PollJob::Done(Ok(DevicePollOutcome::Denied)) => AppState::Error {
+                code: None,
                 message: self.tr("error-login-denied"),
                 retry: ErrorRetry::RestartLogin,
             },
             PollJob::Done(Err(error)) => AppState::Error {
+                code: None,
                 message: self.tr1("error-login-check", "error", format!("{error:#}")),
                 retry: ErrorRetry::RestartLogin,
             },
@@ -1940,14 +2084,20 @@ impl App {
             Ok(user) => user,
             Err(error) => {
                 return AppState::Error {
+                    code: None,
                     message: self.tr1("error-profile-read", "error", format!("{error:#}")),
                     retry: ErrorRetry::RestartLogin,
                 };
             }
         };
         self.vpc_id_cache = catalog::VpcIdCache::default();
-        let state =
-            Self::start_catalog_fetch(&self.http_client, &tokens, &self.vpc_id_cache, user);
+        let state = Self::start_catalog_fetch(
+            &self.http_client,
+            &tokens,
+            &self.vpc_id_cache,
+            user,
+            self.catalog_filter == CatalogFilter::MyGames,
+        );
         self.tokens = Some(tokens);
         state
     }
@@ -2091,7 +2241,12 @@ impl App {
             }
             PollJob::Done(Err(error)) => {
                 let err_str = format!("{error:#}");
-                if err_str.contains("401 Unauthorized") || err_str.contains("Invalid or expired token") {
+                // check code first, text fallback is only for the graphql endpoint which
+                // doesnt give us a real requestStatus
+                if gfn_error_code(&error).is_some_and(|code| code.needs_reauth())
+                    || err_str.contains("401 Unauthorized")
+                    || err_str.contains("Invalid or expired token")
+                {
                     // An expired access token is the common case here and it is recoverable, so
                     // try to renew it before falling back to making the player sign in again.
                     match self.refresh_session(&user).await {
@@ -2106,6 +2261,7 @@ impl App {
                                 tokens,
                                 &self.vpc_id_cache,
                                 user,
+                                self.catalog_filter == CatalogFilter::MyGames,
                             );
                         }
                         SessionRefresh::ReauthenticationRequired => {
@@ -2113,6 +2269,7 @@ impl App {
                             self.tokens = None;
                             self.vpc_id_cache = catalog::VpcIdCache::default();
                             return AppState::Error {
+                                code: None,
                                 message: self.tr("error-session-expired"),
                                 retry: ErrorRetry::RestartLogin,
                             };
@@ -2120,6 +2277,7 @@ impl App {
                         // Keep the saved login: a flaky connection must not cost a re-scan.
                         SessionRefresh::Failed(message) => {
                             return AppState::Error {
+                                code: None,
                                 message: self.tr1("error-catalog-load", "error", &message),
                                 retry: ErrorRetry::ReloadCatalog(user),
                             };
@@ -2127,6 +2285,7 @@ impl App {
                     }
                 } else {
                     AppState::Error {
+                        code: None,
                         message: self.tr1("error-catalog-load", "error", &err_str),
                         retry: ErrorRetry::ReloadCatalog(user),
                     }
@@ -2203,6 +2362,8 @@ impl App {
                 }
             }
             PollJob::Done(Err(error)) => AppState::Error {
+                // grab the code before it gets flattened into a string
+                code: gfn_error_code(&error),
                 message: tr(locale, "error-session-create", "error", format!("{error:#}")),
                 retry: ErrorRetry::BackToCatalog {
                     user,
