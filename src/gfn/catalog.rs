@@ -289,9 +289,12 @@ pub async fn fetch_catalog_page(
     if let Some(query) = query {
         variables["searchString"] = json!(query);
     }
-    run_catalog_query(client, token, json!({ "query": document, "variables": variables }), label)
-        .await
-}
+    Ok(CatalogPage {
+        games: data.apps.items.into_iter().flat_map(to_game_summaries).collect(),
+        next_cursor,
+        total_count: page_info.total_count,
+    })
+
 
 async fn run_catalog_query(
     client: &Client,
@@ -331,7 +334,7 @@ async fn run_catalog_query(
         .filter(|cursor| page_info.has_next_page && !cursor.is_empty());
 
     Ok(CatalogPage {
-        games: data.apps.items.into_iter().map(to_game_summary).collect(),
+        games: data.apps.items.into_iter().flat_map(to_game_summaries).collect(),
         next_cursor,
         total_count: page_info.total_count,
     })
@@ -339,39 +342,52 @@ async fn run_catalog_query(
 
 /// Shared `CatalogAppItem` -> `GameSummary` mapping for both catalog queries above - they request
 /// the same item shape (`id`, `title`, `variants`, `images`).
-fn to_game_summary(item: CatalogAppItem) -> GameSummary {
-    let numeric_variant = item
-        .variants
-        .iter()
-        .find(|v| v.id.chars().all(|c| c.is_ascii_digit()));
-    let numeric_app_id = numeric_variant
-        .map(|v| v.id.clone())
-        .or_else(|| {
-            if item.id.chars().all(|c| c.is_ascii_digit()) {
-                Some(item.id.clone())
-            } else {
-                item.variants.first().map(|v| v.id.clone())
-            }
-        })
-        .unwrap_or_else(|| item.id.clone());
-    let store = numeric_variant
-        .or_else(|| item.variants.first())
-        .and_then(|v| v.app_store.clone());
-    let last_played = item
-        .variants
-        .iter()
-        .find_map(|v| v.last_played_date())
-        .map(str::to_owned);
-
-    GameSummary {
-        cover_url: item.images.as_ref().and_then(|images| images.poster_url()),
-        app_id: numeric_app_id,
-        search_key: item.title.to_lowercase(),
-        title: item.title,
-        store,
-        last_played,
+fn to_game_summaries(item: CatalogAppItem) -> Vec<GameSummary> {
+    if item.variants.is_empty() {
+        return vec![GameSummary {
+            cover_url: item.images.as_ref().and_then(|images| images.poster_url()),
+            app_id: item.id.clone(),
+            search_key: item.title.to_lowercase(),
+            title: item.title,
+            store: None,
+            last_played: None,
+        }];
     }
+    
+    item.variants.into_iter().map(|v| {
+        let app_id = if v.id.chars().all(|c| c.is_ascii_digit()) {
+            v.id.clone()
+        } else {
+            item.id.clone()
+        };
+        GameSummary {
+            cover_url: item.images.as_ref().and_then(|images| images.poster_url()),
+            app_id,
+            search_key: item.title.to_lowercase(),
+            title: item.title.clone(),
+            store: v.app_store,
+            last_played: v.last_played_date().map(str::to_owned),
+        }
+    }).collect()
 }
+    
+    item.variants.into_iter().map(|v| {
+        let app_id = if v.id.chars().all(|c| c.is_ascii_digit()) {
+            v.id.clone()
+        } else {
+            item.id.clone()
+        };
+        GameSummary {
+            cover_url: item.images.as_ref().and_then(|images| images.poster_url()),
+            app_id,
+            search_key: item.title.to_lowercase(),
+            title: item.title.clone(),
+            store: v.app_store,
+            last_played: v.last_played_date().map(str::to_owned),
+        }
+    }).collect()
+}
+
 
 /// Process-lifetime cache for the account's VPC id, shared with every spawned catalog task.
 pub type VpcIdCache = Arc<OnceCell<String>>;
