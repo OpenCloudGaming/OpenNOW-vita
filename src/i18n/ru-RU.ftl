@@ -1,0 +1,289 @@
+# Login / device-code flow
+login-subtitle = Неофициальный клиент GeForce NOW для PS Vita
+login-hint = Нажмите Подтвердить (X) чтобы войти используя ваш аккаунт NVIDIA.
+login-last-input = Последний обнаруженный способ ввода: { $input }
+login-requesting-code = Запрос кода доступа от NVIDIA...
+
+device-title = Войдите с другого устройства
+device-step-open = 1. Откройте этот адрес в браузере на вашем телефоне или компьютере:
+device-step-scan = 2. Или отсканируйте этот QR код и введите следующее:
+device-waiting = Ожидание завершения входа в аккаунт... (Назад (O) для отмены)
+
+# Catalog
+catalog-welcome = Добро пожаловать, { $name }
+catalog-loading = Загрузка вашего каталога GeForce NOW...
+catalog-search-hint = Поиск игр...
+catalog-search-button = Поиск
+catalog-library-title = ОБЛАЧНЫЕ ИГРЫ
+catalog-sort-button = Сортировка: { $sort }
+catalog-sort-last-played = Запущенные недавно
+catalog-sort-relevance = Рекомендации
+catalog-sort-title-asc = В алфавитном порядке
+catalog-sort-title-desc = В обратном алфавитном порядке
+catalog-filter-button = Показывать: { $filter }
+catalog-filter-my-games = Мои игры
+catalog-filter-all-games = Все игры
+catalog-no-games-api = Не найдено доступных игр (API вернул ответ none).
+catalog-no-match = Нет игр, соответсвующих вашему запросу.
+catalog-footer-hint = Вверх/Вниз чтобы выбрать · Подтвердить (X) чтобы играть · Назад (O) чтобы очистить поиск
+catalog-count = { $shown } из { $total }
+catalog-count-loading = { $shown } из { $total } · загружаем ещё...
+
+# Detail panel (right-hand side of the catalog)
+detail-play = ИГРАТЬ
+detail-app-id = ID приложения: { $id }
+detail-last-played = Последний запуск: { $date }
+detail-never-played = Ни разу не запущенно на этом аккаунте
+detail-press = Нажмите
+detail-to-start = чтобы начать
+detail-play-hint = Нажмите Подтвердить (X) или коснитесь ИГРАТЬ чтобы начать трансляцию этой игры.
+detail-empty = Выберите игру из списка чтобы увидеть подробности.
+
+# Session creation / queue
+session-stop-button = Остановить сессию
+session-queue-position = Позиция в очереди NVIDIA: #{ $position }
+session-eta-minutes = Предположительное время ожидания: ~{ $minutes } мин { $seconds } сек
+session-eta-seconds = Предположительное время ожидания: ~{ $seconds } секунд
+session-queue-live = Обновление статуса онлайн (проверка { $attempt })...
+session-connecting-attempt = Подключение к серверу NVIDIA (проверка { $attempt })...
+session-waiting-ready = Ожидание готовности сервера NVIDIA...
+session-server-busy = Сервера NVIDIA заняты.
+session-server-busy-retry = Повторная попытка... (попытка { $attempt })
+session-app-patching = Обновление игры
+session-app-patching-detail = NVIDIA устанавливает обновление для игры на вашей облачной системе. Это может занять несколько минут, трансляция начнётся самостоятельно по окончании.
+session-cancel-button = Отменить сессию
+session-exit-hint = Коснитесь "Отменить сессию" или нажмите (O) чтобы подтвердить выход
+session-now-loading = Загрузка
+session-step-queue = Очередь
+session-step-setup = Определение
+session-step-ready = Готово
+session-preparing-rig = Готовим вашу облачную систему
+session-ready-headline = Ваша система готова
+
+# Session ready (debug/transition screen)
+session-ready-hint = Нажмите Подтвердить (X) чтобы подключиться к сигналированию NVIDIA.
+
+# WebRTC signaling
+signaling-title = Сигналирование
+signaling-offer-received = SDP оффер получен ({ $bytes } байтов).
+signaling-waiting-offer = Ожидание SDP оффера от GFN сервера...
+
+# Exit confirmation
+exit-heading = Остановить сессию трансляции?
+exit-body = Вы уверены, что хотите выйти и остановить активную сессию GeForce NOW?
+exit-cancel = Вернуться к сессии
+exit-confirm = Да, выйти и остановить
+
+# Streaming
+streaming-game = Трансляция "{ $game }"
+streaming-generic = Трансляция игры...
+streaming-signaling-done = WebRTC сигналирование и обмен SDP завершён
+streaming-waiting-negotiation = Ожидание согласования WebRTC...
+
+# Errors
+error-title = Ошибка
+error-hint = Подтвердить или Назад чтобы вернуться.
+
+# Errors and status notes (built in app/mod.rs)
+error-login-start = Не получилось инициировать вход в аккаунт: { $error }
+error-login-code-expired = Код истёк до завершения входа в аккаунт. Попробуйте снова.
+error-login-denied = Вход в аккаунт был отменён.
+error-login-check = Проверка входа провалена: { $error }
+error-profile-read = Успешный вход, но профиль не может быть считан: { $error }
+error-session-expired = Ваша сессия истекла. Пожалуйста, войдите снова.
+error-catalog-load = Не получилось загрузить вашу библиотеку игр: { $error }
+error-session-create = Не получилось начать трансляцию: { $error }
+error-signaling-disconnected = Сигналирование отключено: { $reason }
+error-stream-lost = Потеряно соединение с трансляцией: { $reason }
+status-search-results = { $count } результат(ов) для "{ $query }"
+status-search-failed = Поиск провален: { $error }
+status-stream-live = Текущая трансляция активна
+status-peer-error = Узел: { $error }
+status-signaling-connected = Сигналирование подключено, ожидание SDP оффера...
+status-offer-received = SDP оффер получен ({ $bytes } байтов). Согласование WebRTC...
+status-remote-ice = Удалённый кандидат ICE получен от NVIDIA: { $candidate }
+status-session-start-failed = Не получилось открыть сессию: отсутствие входа или игры.
+status-signaling-connecting = Подключение к сигналированию NVIDIA...
+status-signaling-connect-failed = Не получилось подключить сигналирование: { $error }
+
+settings-fps-heading = Количество кадров трансляции
+settings-fps-60 = 60 fps - Плавнее движение
+settings-fps-30 = 30 fps - Чётче картинка
+settings-trigger-heading = Нажатие на заднюю L2/R2 панель
+settings-audio-boost-heading = Усиление громкости
+session-keyboard-show = Клавиатура
+session-keyboard-hide = Спрятать клавиатуру
+key-esc = Esc
+key-tab = Tab
+key-enter = Enter
+key-shift = Shift
+key-ctrl = Ctrl
+key-alt = Alt
+key-f1 = F1
+key-f2 = F2
+key-f3 = F3
+key-f4 = F4
+settings-heading = Настройки
+settings-title = Настройки
+account-close = Закрыть
+settings-language-heading = Язык
+controls-hint-heading = Управление Vita
+controls-hint-rear = Задняя панель заменяет кнопки, которых не имеет эта консоль:
+controls-hint-touch = Передняя сенсорная панель двигает курсор мыши, нажмите чтобы кликнуь.
+controls-hint-dismiss = Понятно
+settings-stick-zones-heading = L3/R3 на передней панели
+settings-stick-zones-off = Выкл
+settings-stick-zones-hidden = Вкл
+settings-stick-zones-visible = Вкл + показать
+settings-rear-touch-mode-heading = Задняя сенсорная панель
+settings-rear-touch-quadrant = 4 зоны (L2/R2 + L3/R3)
+settings-rear-touch-halves = 2 зоны (L2/R2)
+controls-hint-sticks = Нижние углы экрана отвечают за L3 и R3.
+error-session-busy-title = Сессия уже открыта
+error-session-busy-body = GeForce NOW всё ещё имеет сессию на этом аккаунте, но не одну из тех, что может закрыть это приложение. Самое быстрое решение: откройте play.geforcenow.com и начните игру там чтобы переключить контроль. Иной способ - выйдите из GeForce NOW на других ваших устройствах, или подождите примерно 8 минут чтобы сессия закрылась автоматически.
+error-auth-title = Войдите снова.
+error-auth-body = Ваша авторизация NVIDIA истекла. Войдите в этот аккаунт снова, чтобы продолжить.
+
+# GeForce NOW failure wording, one pair per code NVIDIA gives a distinct meaning to.
+# Ported from OpenNOW's gfnErrorMessages.ts; anything else falls back to error-gfn-unknown.
+
+error-gfn-session-setup-cancelled-title = Сессия Отменена
+error-gfn-session-setup-cancelled-body = Определение сессии было отменено.
+error-gfn-session-setup-cancelled-during-queuing-title = Очередь отменена
+error-gfn-session-setup-cancelled-during-queuing-body = Вы вышли из очереди.
+error-gfn-request-cancelled-title = Запрос Отменён
+error-gfn-request-cancelled-body = Запрос был отменён.
+error-gfn-system-sleep-during-session-setup-title = Сон Системы
+error-gfn-system-sleep-during-session-setup-body = Определение сессии было нарушено из-за перехода системы в режим сна.
+error-gfn-no-internet-during-session-setup-title = Нет интернета
+error-gfn-no-internet-during-session-setup-body = Нет подключения к интернету во время определения системы.
+error-gfn-invalid-operation-title = Неизвестная операция
+error-gfn-invalid-operation-body = Запрошенная операция не валидна на данный момент.
+error-gfn-network-error-title = Ошибка Сети
+error-gfn-network-error-body = Возникла ошибка сети. Пожалуйста, проверьте ваше подключение к интернету.
+error-gfn-auth-token-not-updated-title = Требуется аутентификация
+error-gfn-auth-token-not-updated-body = Ваша сессия истекла. Пожалуйста, войдите снова.
+error-gfn-response-parse-failure-title = Ошибка Ответа Сервера
+error-gfn-response-parse-failure-body = Не удалось получить ответ от сервера. Пожалуйста, попробуйте снова.
+error-gfn-invalid-server-response-title = Неправильный Ответ Сервера
+error-gfn-invalid-server-response-body = Сервер получил неправильный ответ.
+error-gfn-dom-exception-in-session-control-title = Ошибка Сессии
+error-gfn-dom-exception-in-session-control-body = Возникла ошибка во время определения сессии.=
+error-gfn-auth-token-update-timeout-title = Истекло Время Ожидания Аутентификации
+error-gfn-auth-token-update-timeout-body = Истекло время ожидания токена аутентификации. Пожалуйста, войдите снова.
+error-gfn-request-forbidden-title = Доступ Запрещён
+error-gfn-request-forbidden-body = Доступ к этому сервису запрещён.
+error-gfn-server-internal-timeout-title = Истекло Время Ожидания Сервера
+error-gfn-server-internal-timeout-body = Истекло время ожидания сервера. Пожалуйста, попробуйте снова.
+error-gfn-server-internal-error-title = Ошибка Сервера
+error-gfn-server-internal-error-body = Произошла внутренняя ошибка сервера. Пожалуйста, попробуйте снова спустя время.
+error-gfn-server-invalid-request-title = Неправильный Запрос
+error-gfn-server-invalid-request-body = Запрос был неправильным.
+error-gfn-session-list-limit-exceeded-title = Слишком Много Сессий
+error-gfn-session-list-limit-exceeded-body = У вас слишком много активных сессий. Пожалуйста, закройте некоторые из них и попробуйте снова.
+error-gfn-session-limit-exceeded-title = Превышен Лимит Активной Сессии
+error-gfn-session-limit-exceeded-body = Вы достигли лимита вашей сессии. Другая сессия, возможно, открыта на вашем аккаунте.
+error-gfn-session-entitled-time-exceeded-title = Превышен Лимит Времени
+error-gfn-session-entitled-time-exceeded-body = Лимит времени вашей сессии истёк.=
+error-gfn-auth-failure-title = Аутентификация провалена=
+error-gfn-auth-failure-body = Аутентификация провалена. Пожалуйста, войдите снова.
+error-gfn-invalid-authentication-expired-title = Сессия Просрочена
+error-gfn-invalid-authentication-expired-body = Ваша аутентификация просрочена. Пожалуйста, войдите снова.
+error-gfn-entitlement-failure-title = Ошибка Доступа
+error-gfn-entitlement-failure-body = У вас нет доступа к этой игре или сервису.
+error-gfn-invalid-app-id-not-available-title = Игра Недоступна
+error-gfn-invalid-app-id-not-available-body = Эта игра недоступна на данный момент. 
+error-gfn-invalid-app-id-not-found-title = Игра Не Найдена
+error-gfn-invalid-app-id-not-found-body = Эта игра не была найдена в библиотеке.
+error-gfn-eula-un-accepted-title = Требуется EULA
+error-gfn-eula-un-accepted-body = Вы должны принять лицензионное соглашение конечного пользователя чтобы продолжить.
+error-gfn-maintenance-status-title = Технические Работы
+error-gfn-maintenance-status-body = Сервис на данный момент в процессе технических работ. Пожалуйста, попробуйте снова спустя время.
+error-gfn-service-un-available-title = Сервис Недоступен
+error-gfn-service-un-available-body = Этот сервис временно недоступен. Пожалуйста, попробуйте позже спустя время.
+error-gfn-steam-guard-required-title = Требуется Steam Guard
+error-gfn-steam-guard-required-body = Требуется аутентификация через Steam Guard. Пожалуйста, завершите верификацию Steam Guard.
+error-gfn-steam-login-required-title = Требуется Вход в Steam
+error-gfn-steam-login-required-body = Вам нужно подключить ваш Steam аккаунт чтобы играть в эту игру.
+error-gfn-steam-guard-invalid-title = Неверный Код Steam Guard 
+error-gfn-steam-guard-invalid-body = Код Steam Guard неправильный. Пожалуйста, попробуйте снова.
+error-gfn-steam-profile-private-title = Приватный Профиль Steam
+error-gfn-steam-profile-private-body = Ваш профиль в Steam - приватный. Пожалуйста, сделайте его публичным или доступным только для друзей.
+error-gfn-email-not-verified-title = Email Не Подтверждён
+error-gfn-email-not-verified-body = Пожалуйста, подтвердите свой email адрес чтобы продолжить.
+error-gfn-app-patching-title = Игра Обновляется
+error-gfn-app-patching-body = В текущий момент игра обновляется. Пожалуйста, попробуйте снова спустя время.
+error-gfn-game-not-found-title = Игра Не Найдена
+error-gfn-game-not-found-body = Эта игра не была найдена.
+error-gfn-not-enough-credits-title = Недостаточно Средств
+error-gfn-not-enough-credits-body = У вас недостаточно средств для этой сессии.
+error-gfn-session-terminated-by-another-client-title = Сессия Отнята
+error-gfn-session-terminated-by-another-client-body = Ваша сессия была отнята другим устройством.
+error-gfn-session-expired-title = Сессия Истекла
+error-gfn-session-expired-body = Ваша сессия истекла.
+error-gfn-session-limit-per-device-reached-title = Достигнут Лимит Сессий Для Устройства
+error-gfn-session-limit-per-device-reached-body = Вы достигли лимита сессий для этого устройства
+error-gfn-forwarding-zone-out-of-capacity-title = Лимит по Региону
+error-gfn-forwarding-zone-out-of-capacity-body = Ваш регион на данный момент переполнен. Пожалуйста, попробуйте снова спустя время.
+error-gfn-region-not-supported-indefinitely-title = Регион Не Поддерживается
+error-gfn-region-not-supported-indefinitely-body = Сервис недоступен в вашем регионе.
+error-gfn-region-banned-title = Регион Заблокирован
+error-gfn-region-banned-body = Этот сервис недоступен в вашем регионе.
+error-gfn-region-on-hold-for-free-title = Бесплатный Пропуск На Удержании
+error-gfn-region-on-hold-for-free-body = Бесплатный пропуск временно недоступен в вашем регионе.
+error-gfn-region-on-hold-for-paid-title = Платный Пропуск На Удержании
+error-gfn-region-on-hold-for-paid-body = Платный пропуск временно недоступен в вашем регионе.
+error-gfn-app-maintenance-status-title = Техническое Обслуживание
+error-gfn-app-maintenance-status-body = Игра на данный момент проходит техническое обслуживание.
+error-gfn-insufficient-vm-capacity-title = Нет Свободных Мест
+error-gfn-insufficient-vm-capacity-body = Нет доступных систем на данный момент. Попробуйте снова спустя время, или войдите в очередь.
+error-gfn-server-session-queue-length-exceeded-title = Очередь Переполнена
+error-gfn-server-session-queue-length-exceeded-body = Очерень переполнена на данный момент. Пожалуйста, попробуйте снова спустя время.
+error-gfn-region-not-supported-for-streaming-title = GeForce NOW Недоступен в Вашем Регионе
+error-gfn-region-not-supported-for-streaming-body = GeForce NOW запретил трансляцию в ваш регион. Это не ошибка со сторонеы OpenNOW - NVIDIA заблокировала доступ из вашей локации. Вам, возможно, потребуется VPN, или проверить список поддерживаемых стран GeForce NOW.
+error-gfn-game-binaries-not-available-in-region-title = Игра Недоступна
+error-gfn-game-binaries-not-available-in-region-body = Эта игра недоступна в вашем регионе.
+error-gfn-session-in-queue-abandoned-title = Очередь Заброшена
+error-gfn-session-in-queue-abandoned-body = Ваша сессия в очереди была заброшена.
+error-gfn-member-terminated-title = Аккаунт Закрыт
+error-gfn-member-terminated-body = Ваш аккаунт был закрыт.
+error-gfn-session-removed-from-queue-maintenance-title = Отмена очереди/Обслуживание
+error-gfn-session-removed-from-queue-maintenance-body = Очередь была очищена из-за технического обслуживания.
+error-gfn-zone-maintenance-status-title = Обслуживание Зоны
+error-gfn-zone-maintenance-status-body = Зона данного сервера на техническом обслуживании.
+error-gfn-session-waiting-ads-time-expired-title = Истекло Время Ожидания Рекламы
+error-gfn-session-waiting-ads-time-expired-body = Сессия истекла во время ожидания рекламы. Пользователи бесплатного пропуска должны смотреть рекламу, чтобы играть. Пожалуйста, начните новую сессию.
+error-gfn-user-cancelled-watching-ads-title = Реклама Отменена
+error-gfn-user-cancelled-watching-ads-body = Сессия отменена потому что реклама была пропущена. Пользователи бесплатного пропуска должны смотреть рекламу, чтобы играть.
+error-gfn-streaming-not-allowed-in-limited-mode-title = Ограниченный Режим
+error-gfn-streaming-not-allowed-in-limited-mode-body = Трансляция запрещена в ограниченном режиме.
+error-gfn-max-session-number-limit-exceeded-title = Лимит Сессий
+error-gfn-max-session-number-limit-exceeded-body = Достигнуто максимальное число сессий.
+error-gfn-session-rejected-no-capacity-title = Нет Свободных Мест
+error-gfn-session-rejected-no-capacity-body = Нет свободных систем на данный момент. Пожалуйста, попробуйте снова спустя время.
+error-gfn-session-insufficient-playability-level-title = Требуется Улучшение Пропуска
+error-gfn-session-insufficient-playability-level-body = Ваш текущий пропуск GeForce NOW недостаточно высок чтобы транслировать эту игру. Улучшите пропуск и попробуйте снова.
+error-gfn-user-storage-not-available-title = Хранилище Недоступно
+error-gfn-user-storage-not-available-body = Хранилище пользователя недоступно.
+error-gfn-gfn-storage-not-available-title = Ошибка Хранилища
+error-gfn-gfn-storage-not-available-body = Хранилище сервиса недоступно.
+error-gfn-app-not-allowed-to-stream-title = Трансляция Запрещена
+error-gfn-app-not-allowed-to-stream-body = Это приложение не имеет разрешения транслировать на ваш текущий аккаунт GeForce NOW или регион.
+error-gfn-socket-error-title = Ошибка Сокета
+error-gfn-socket-error-body = Возникла ошибка сокета. Пожалуйста, проверьте свою сеть.
+error-gfn-address-resolve-failed-title = Ошибка DNS
+error-gfn-address-resolve-failed-body = Не удалось решить адрес сервера. Пожалуйста, проверьте вашу сеть.
+error-gfn-connect-failed-title = Подключение Провалено
+error-gfn-connect-failed-body = Не удалось подключиться к серверу. Пожалуйста, проверьте вашу сеть.
+error-gfn-ssl-error-title = Ошибка SSL
+error-gfn-ssl-error-body = Возникла ошибка безопасного соединения.
+error-gfn-connection-timeout-title = Истекло Время Ожидания Подключения
+error-gfn-connection-timeout-body = Истекло время ожидания подключения. Пожалуйста, проверьте вашу сеть.
+error-gfn-data-receive-timeout-title = Истекло Время Ожидания Приёма
+error-gfn-data-receive-timeout-body = Истекло время ожидания приёма данных. Пожалуйста, проверьте вашу сеть.
+error-gfn-peer-no-response-title = Нет Ответа
+error-gfn-peer-no-response-body = Сервер не отвечает. Пожалуйста, попробуйте снова.
+error-gfn-certificate-rejected-title = Ошибка Сертификата
+error-gfn-certificate-rejected-body = Сертификат сервера был отклонён.
+error-gfn-unknown-title = Сессия Не Может Начаться
+error-gfn-unknown-body = GeForce NOW отказывается запускаться: { $detail }
