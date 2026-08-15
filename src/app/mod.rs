@@ -2043,46 +2043,76 @@ impl App {
         let cache = vpc_id_cache.clone();
         let user_id = user.user_id.clone();
 
-        let client_for_tier = client.clone();
-        let tokens_for_tier = tokens.clone();
-        let cache_for_tier = vpc_id_cache.clone();
-        let user_id_for_tier = user.user_id.clone();
-        tokio::spawn(async move {
-            if tokens_for_tier.membership_tier.is_none() {
-                if let Ok(vpc_id) = crate::gfn::catalog::resolve_vpc_id(&client_for_tier, tokens_for_tier.bearer(), &cache_for_tier).await {
-                    if let Ok(tier) = crate::gfn::auth::fetch_membership_tier(&client_for_tier, tokens_for_tier.bearer(), &vpc_id, &user_id_for_tier).await {
-                        let mut updated_tokens = tokens_for_tier.clone();
-                        updated_tokens.membership_tier = Some(tier);
-                        let _ = crate::gfn::auth::save_tokens(&updated_tokens);
-                    }
-                }
-            }
-        });
         let handle: JoinHandle<Result<catalog::CatalogPage>> = tokio::spawn(async move {
             // Renew first when the saved token is near expiry. This runs at startup with whatever
             // was on the memory card, and the proactive refresh in `tick` only gets a turn *after*
             // this request is already in flight - so a stale token would fail the VPC lookup and
             // land the player on a catalog that is wrong rather than on a sign-in prompt.
-            let bearer = if tokens.needs_refresh() {
+            let tokens = if tokens.needs_refresh() {
                 match crate::gfn::auth::refresh_tokens(&client, &tokens, &user_id).await {
                     Ok(refreshed) => {
                         if let Err(error) = crate::gfn::auth::save_tokens(&refreshed) {
                             eprintln!("Could not persist refreshed GFN tokens: {error:#}");
                         }
-                        refreshed.bearer().to_owned()
+                        refreshed
                     }
                     // Let the request go out anyway: the error path already knows how to turn a
                     // rejection into a sign-in prompt, and the token may still be good.
                     Err(error) => {
                         eprintln!("Startup token refresh failed: {error}");
-                        tokens.bearer().to_owned()
+                        tokens
                     }
                 }
             } else {
-                tokens.bearer().to_owned()
+                tokens
             };
-            catalog::fetch_catalog_page_for_account(&client, &bearer, &cache, None, "", owned_only)
-                .await
+
+            if tokens.membership_tier.is_none() {
+                let client_for_tier = client.clone();
+                let bearer_for_tier = tokens.bearer().to_owned();
+                let cache_for_tier = cache.clone();
+                let user_id_for_tier = user_id.clone();
+                tokio::spawn(async move {
+                    let Ok(vpc_id) = crate::gfn::catalog::resolve_vpc_id(
+                        &client_for_tier,
+                        &bearer_for_tier,
+                        &cache_for_tier,
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    let Ok(tier) = crate::gfn::auth::fetch_membership_tier(
+                        &client_for_tier,
+                        &bearer_for_tier,
+                        &vpc_id,
+                        &user_id_for_tier,
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    let Some(mut current) = crate::gfn::auth::load_tokens() else {
+                        return;
+                    };
+                    if current.membership_tier.is_none() {
+                        current.membership_tier = Some(tier);
+                        if let Err(error) = crate::gfn::auth::save_tokens(&current) {
+                            eprintln!("Could not persist membership tier: {error:#}");
+                        }
+                    }
+                });
+            }
+
+            catalog::fetch_catalog_page_for_account(
+                &client,
+                tokens.bearer(),
+                &cache,
+                None,
+                "",
+                owned_only,
+            )
+            .await
         });
         AppState::LoadingCatalog {
             user,

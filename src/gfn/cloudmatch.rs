@@ -224,11 +224,8 @@ impl QueueAdRunner {
                 ads.len(),
                 ads.iter()
                     .map(|a| {
-                        format!(
-                            "{}({}s)",
-                            &a.ad_id[..a.ad_id.len().min(24)],
-                            a.length_ms.unwrap_or(0) / 1000
-                        )
+                        let id: String = a.ad_id.chars().take(24).collect();
+                        format!("{}({}s)", id, a.length_ms.unwrap_or(0) / 1000)
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -942,6 +939,7 @@ pub async fn get_active_sessions(
     bases: &[&str],
 ) -> Result<Vec<String>> {
     let mut all_sessions = Vec::new();
+    let mut any_zone_ok = false;
     let query_bases: Vec<&str> = if bases.is_empty() {
         vec![DEFAULT_CLOUDMATCH_BASE_URL.trim_end_matches('/')]
     } else {
@@ -952,14 +950,23 @@ pub async fn get_active_sessions(
         let base_url = base.trim_end_matches('/');
         let url = format!("{base_url}/v2/session");
 
-        let response = headers::apply_cloudmatch_headers(
+        let response = match headers::apply_cloudmatch_headers(
             client.get(&url),
             token,
             &identity.client_id,
             &identity.device_id,
         )
         .send()
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                // One zone flaking must not hide live sessions on the others — that is the
+                // orphan-session case this cleanup exists to prevent.
+                log_warn!("Could not list CloudMatch sessions on {base_url}: {error}");
+                continue;
+            }
+        };
         let body_text = response.text().await.unwrap_or_default();
         let payload: GetSessionsResponse = match serde_json::from_str(&body_text) {
             Ok(payload) => payload,
@@ -968,6 +975,7 @@ pub async fn get_active_sessions(
                 continue;
             }
         };
+        any_zone_ok = true;
 
         for s in payload.sessions {
             if s.status.occupies_device_slot()
@@ -979,6 +987,10 @@ pub async fn get_active_sessions(
                 }
             }
         }
+    }
+
+    if !any_zone_ok {
+        anyhow::bail!("could not list CloudMatch sessions on any zone");
     }
 
     all_sessions.sort();

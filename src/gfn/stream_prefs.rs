@@ -65,11 +65,14 @@ pub fn active_game() -> Option<String> {
 
 fn active_profile() -> Option<GameProfile> {
     let app_id = active_game()?;
-    load_or_init_settings().game_profiles.get(&app_id).cloned()
+    with_cached_settings(|s| s.game_profiles.get(&app_id).cloned())
 }
 
 pub fn active_game_has_profile() -> bool {
-    active_profile().is_some()
+    let Some(app_id) = active_game() else {
+        return false;
+    };
+    with_cached_settings(|s| s.game_profiles.contains_key(&app_id))
 }
 
 pub fn set_active_game_profile(enabled: bool) {
@@ -153,23 +156,16 @@ fn with_cached_settings<R>(f: impl FnOnce(&AppSettings) -> R) -> R {
     f(guard.as_ref().expect("settings cache populated"))
 }
 
-fn load_or_init_settings() -> AppSettings {
-    let mut guard = CACHED_SETTINGS.lock().unwrap();
-    if let Some(ref settings) = *guard {
-        return settings.clone();
-    }
-
+/// Disk load / legacy migration. Must not touch `CACHED_SETTINGS` — callers that already hold
+/// that lock (notably `update_settings`) would otherwise self-deadlock on `std::sync::Mutex`.
+fn read_or_migrate_settings() -> AppSettings {
     if let Ok(content) = std::fs::read_to_string(SETTINGS_JSON_PATH) {
         match serde_json::from_str::<AppSettings>(&content) {
-            Ok(settings) => {
-                *guard = Some(settings.clone());
-                return settings;
-            }
+            Ok(settings) => return settings,
             Err(_) => {
                 eprintln!("settings.json corrupt; recreating with stable defaults");
                 let settings = AppSettings::default();
                 save_settings_disk(&settings);
-                *guard = Some(settings.clone());
                 return settings;
             }
         }
@@ -205,6 +201,22 @@ fn load_or_init_settings() -> AppSettings {
     }
 
     save_settings_disk(&settings);
+    settings
+}
+
+fn load_or_init_settings() -> AppSettings {
+    {
+        let guard = CACHED_SETTINGS.lock().unwrap();
+        if let Some(ref settings) = *guard {
+            return settings.clone();
+        }
+    }
+
+    let settings = read_or_migrate_settings();
+    let mut guard = CACHED_SETTINGS.lock().unwrap();
+    if let Some(ref cached) = *guard {
+        return cached.clone();
+    }
     *guard = Some(settings.clone());
     settings
 }
@@ -227,11 +239,14 @@ fn save_settings_disk(settings: &AppSettings) {
 }
 
 fn update_settings<F: FnOnce(&mut AppSettings)>(f: F) {
-    let mut guard = CACHED_SETTINGS.lock().unwrap();
-    let mut settings = guard.clone().unwrap_or_else(load_or_init_settings);
+    let mut settings = {
+        let guard = CACHED_SETTINGS.lock().unwrap();
+        guard.clone()
+    }
+    .unwrap_or_else(read_or_migrate_settings);
     f(&mut settings);
     save_settings_disk(&settings);
-    *guard = Some(settings);
+    *CACHED_SETTINGS.lock().unwrap() = Some(settings);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
