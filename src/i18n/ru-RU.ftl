@@ -36,7 +36,7 @@ detail-last-played = Последний запуск: { $date }
 detail-never-played = Ни разу не запущено на этом аккаунте
 detail-press = Нажмите
 detail-to-start = чтобы начать
-detail-play-hint = Нажмите Подтвердить (X) или коснитесь ИГРАТЬ чтобы начать трансляцию этой игры.
+detail-play-hint = Нажмите "Подтвердить" (X) или коснитесь ИГРАТЬ чтобы начать трансляцию этой игры.
 detail-empty = Выберите игру из списка чтобы увидеть подробности.
 
 # Session creation / queue
@@ -61,7 +61,7 @@ session-preparing-rig = Готовим вашу облачную систему
 session-ready-headline = Ваша система готова
 
 # Session ready (debug/transition screen)
-session-ready-hint = Нажмите Подтвердить (X) чтобы подключиться к сигналированию NVIDIA.
+session-ready-hint = Нажмите "Подтвердить" (X) чтобы подключиться к сигналированию NVIDIA.
 
 # WebRTC signaling
 signaling-title = Сигналирование
