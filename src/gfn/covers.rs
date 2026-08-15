@@ -45,10 +45,10 @@ impl TitleImage {
     }
 
     /// Lazily uploads the RGBA to the egui context.
-    pub fn texture(&self, ctx: &egui::Context, key: &str) -> &egui::TextureHandle {
+    pub fn texture(&self, ctx: &egui::Context, key: impl FnOnce() -> String) -> &egui::TextureHandle {
         self.texture.get_or_init(|| {
             ctx.load_texture(
-                key.to_owned(),
+                key(),
                 egui::ColorImage::from_rgba_unmultiplied(
                     [self.width as usize, self.height as usize],
                     &self.rgba,
@@ -69,51 +69,72 @@ enum CoverState {
     Failed { at: Instant },
 }
 
-/// The map plus its LRU ordering, kept together so both are mutated under the one `Mutex`.
+struct CoverEntry {
+    state: CoverState,
+    generation: u64,
+}
+
 #[derive(Default)]
 struct CoverCache {
-    entries: HashMap<String, CoverState>,
-    /// App ids ordered oldest-touched first.
-    lru: Vec<String>,
+    entries: HashMap<String, CoverEntry>,
+    next_generation: u64,
+    ready_count: usize,
 }
 
 impl CoverCache {
-    /// Moves `app_id` to the most-recently-used end.
+    fn get(&self, app_id: &str) -> Option<&CoverState> {
+        self.entries.get(app_id).map(|entry| &entry.state)
+    }
+
+    fn insert(&mut self, app_id: String, state: CoverState) {
+        let is_ready = matches!(state, CoverState::Ready(_));
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        if let Some(previous) = self.entries.insert(
+            app_id,
+            CoverEntry {
+                state,
+                generation,
+            },
+        ) {
+            if matches!(previous.state, CoverState::Ready(_)) {
+                self.ready_count -= 1;
+            }
+        }
+        if is_ready {
+            self.ready_count += 1;
+        }
+    }
+
     fn touch(&mut self, app_id: &str) {
-        if let Some(index) = self.lru.iter().position(|id| id == app_id) {
-            let id = self.lru.remove(index);
-            self.lru.push(id);
-        } else {
-            self.lru.push(app_id.to_owned());
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        if let Some(entry) = self.entries.get_mut(app_id) {
+            entry.generation = generation;
         }
     }
 
     fn forget(&mut self, app_id: &str) {
-        self.entries.remove(app_id);
-        self.lru.retain(|id| id != app_id);
+        if let Some(entry) = self.entries.remove(app_id)
+            && matches!(entry.state, CoverState::Ready(_))
+        {
+            self.ready_count -= 1;
+        }
     }
 
     /// Drops `Ready` covers until at most `max_ready` remain, oldest-touched first, never
     /// touching `keep`.
     fn evict_to(&mut self, keep: Option<&str>, max_ready: usize) {
-        let ready_count = |cache: &Self| {
-            cache
+        while self.ready_count > max_ready {
+            let victim = self
                 .entries
-                .values()
-                .filter(|state| matches!(state, CoverState::Ready(_)))
-                .count()
-        };
-
-        while ready_count(self) > max_ready {
-            let victim = self.lru.iter().find(|id| {
-                if keep == Some(id.as_str()) {
-                    return false;
-                }
-                matches!(self.entries.get(*id), Some(CoverState::Ready(_)))
-            });
-            let Some(victim) = victim.cloned() else {
-                break;
-            };
+                .iter()
+                .filter(|(id, entry)| {
+                    keep != Some(id.as_str()) && matches!(entry.state, CoverState::Ready(_))
+                })
+                .min_by_key(|(_, entry)| entry.generation)
+                .map(|(id, _)| id.clone());
+            let Some(victim) = victim else { break };
             self.forget(&victim);
         }
     }
@@ -217,13 +238,12 @@ impl CoverStore {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            match inner.entries.get(&app_id) {
+            match inner.get(&app_id) {
                 Some(CoverState::Loading | CoverState::Ready(_)) => return,
                 Some(CoverState::Failed { at }) if at.elapsed() < COVER_RETRY_AFTER => return,
                 Some(CoverState::Failed { .. }) | None => {}
             }
-            inner.entries.insert(app_id.clone(), CoverState::Loading);
-            inner.touch(&app_id);
+            inner.insert(app_id.clone(), CoverState::Loading);
         }
 
         let permits = self.download_permits.clone();
@@ -238,16 +258,13 @@ impl CoverStore {
                         Ok(guard) => guard,
                         Err(poisoned) => poisoned.into_inner(),
                     };
-                    inner
-                        .entries
-                        .insert(app_id, CoverState::Failed { at: Instant::now() });
+                    inner.insert(app_id, CoverState::Failed { at: Instant::now() });
                     return;
                 }
             };
 
             let outcome =
                 fetch_and_decode(&http_client, &app_id, &url, size.max_dimension()).await;
-            let texture_key = size.texture_key(&app_id);
             let mut inner = match cache.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -255,18 +272,13 @@ impl CoverStore {
             match outcome {
                 Ok(image) => {
                     let texture = Arc::new(image);
-                    let _ = texture.texture(&ctx, &texture_key);
-                    inner
-                        .entries
-                        .insert(app_id.clone(), CoverState::Ready(texture));
-                    inner.touch(&app_id);
+                    let _ = texture.texture(&ctx, || size.texture_key(&app_id));
+                    inner.insert(app_id.clone(), CoverState::Ready(texture));
                     inner.evict_to(Some(&app_id), size.cache_capacity());
                 }
                 Err(error) => {
                     eprintln!("Cover fetch for {app_id} failed: {error:#}");
-                    inner
-                        .entries
-                        .insert(app_id, CoverState::Failed { at: Instant::now() });
+                    inner.insert(app_id, CoverState::Failed { at: Instant::now() });
                 }
             }
         });
@@ -308,13 +320,23 @@ impl CoverStore {
 
     fn get_sized(&self, app_id: &str, size: CoverSize) -> Option<CoverSnapshot> {
         let mut inner = self.cache_for(size).lock().ok()?;
-        let snapshot = match inner.entries.get(app_id)? {
+        let snapshot = match inner.get(app_id)? {
             CoverState::Loading => CoverSnapshot::Loading,
             CoverState::Ready(image) => CoverSnapshot::Ready(image.clone()),
             CoverState::Failed { .. } => CoverSnapshot::Failed,
         };
         inner.touch(app_id);
         Some(snapshot)
+    }
+
+    pub fn is_requested(&self, app_id: &str, size: CoverSize) -> bool {
+        let Ok(inner) = self.cache_for(size).lock() else {
+            return false;
+        };
+        matches!(
+            inner.get(app_id),
+            Some(CoverState::Loading | CoverState::Ready(_))
+        )
     }
 
     /// egui texture key for a cached image, so callers pass the right one to

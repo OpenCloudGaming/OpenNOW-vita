@@ -14,11 +14,8 @@ const STORE_DIR: &str = "ux0:data/opennow-vita";
 /// Never ask for less than this: below it the picture is unusable anyway, so a bad measurement
 /// should not be able to strand the client on a permanently terrible stream.
 pub const MIN_CEILING_MBPS: u32 = 5;
-/// The Vita decodes 960x544; past this, extra bitrate buys nothing visible and only risks the
-/// 2.4 GHz radio.
-pub const MAX_CEILING_MBPS: u32 = 25;
-/// Used until a session has been measured.
-pub const DEFAULT_CEILING_MBPS: u32 = 15;
+pub const MAX_CEILING_MBPS: u32 = 12;
+pub const DEFAULT_CEILING_MBPS: u32 = 8;
 
 /// Ignore the opening moments: the stream ramps up, so an early sample understates the link.
 const WARMUP: Duration = Duration::from_secs(5);
@@ -148,9 +145,15 @@ fn stored_ceiling() -> Option<u32> {
 
 /// The ceiling to request, from the last measured session or the default.
 pub fn ceiling_mbps() -> u32 {
-    stored_ceiling()
-        .map(|mbps| mbps.clamp(MIN_CEILING_MBPS, MAX_CEILING_MBPS))
-        .unwrap_or(DEFAULT_CEILING_MBPS)
+    let Some(raw) = stored_ceiling() else {
+        return DEFAULT_CEILING_MBPS;
+    };
+    let clamped = raw.clamp(MIN_CEILING_MBPS, MAX_CEILING_MBPS);
+    if clamped != raw {
+        let _ = std::fs::create_dir_all(STORE_DIR);
+        let _ = std::fs::write(STORE_PATH, clamped.to_string());
+    }
+    clamped
 }
 
 #[cfg(test)]

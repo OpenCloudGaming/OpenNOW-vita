@@ -50,8 +50,6 @@ impl PerformanceMode {
             gpu_xbar: PERFORMANCE_GPU_XBAR_MHZ,
         });
 
-        // Tells the power manager the radio is in continuous use, which is exactly true for a
-        // streaming client and affects its idle/suspend policy.
         let result = unsafe { vitasdk_sys::scePowerSetUsingWireless(1) };
         if result < 0 {
             eprintln!("scePowerSetUsingWireless failed: {result:#x}");
@@ -78,11 +76,60 @@ impl Drop for PerformanceMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatteryStatus {
+    pub percent: u8,
+    pub charging: bool,
+    pub low: bool,
+}
+
+impl BatteryStatus {
+    pub const WARN_PERCENT: u8 = 20;
+    pub const CRITICAL_PERCENT: u8 = 8;
+
+    pub fn should_warn(self) -> bool {
+        !self.charging && (self.low || self.percent <= Self::WARN_PERCENT)
+    }
+
+    pub fn is_critical(self) -> bool {
+        !self.charging && self.percent <= Self::CRITICAL_PERCENT
+    }
+}
+
+#[cfg(target_os = "vita")]
+pub fn battery_status() -> Option<BatteryStatus> {
+    let percent = unsafe { vitasdk_sys::scePowerGetBatteryLifePercent() };
+    if percent < 0 {
+        return None;
+    }
+    Some(BatteryStatus {
+        percent: percent.clamp(0, 100) as u8,
+        charging: unsafe { vitasdk_sys::scePowerIsBatteryCharging() } > 0
+            || unsafe { vitasdk_sys::scePowerIsPowerOnline() } > 0,
+        low: unsafe { vitasdk_sys::scePowerIsLowBattery() } > 0,
+    })
+}
+
+#[cfg(not(target_os = "vita"))]
+pub fn battery_status() -> Option<BatteryStatus> {
+    None
+}
+
+#[cfg(target_os = "vita")]
+pub fn suspend_required() -> bool {
+    unsafe { vitasdk_sys::scePowerIsSuspendRequired() > 0 }
+}
+
+#[cfg(not(target_os = "vita"))]
+pub fn suspend_required() -> bool {
+    false
+}
+
 /// Restoring reads the previous values back rather than hardcoding a default, so launching from a
 /// shell that already changed clocks puts them back where they actually were.
 #[cfg(target_os = "vita")]
 fn set_clocks(clocks: Clocks) {
-    let mut apply = |name: &str, mhz: i32, setter: unsafe extern "C" fn(i32) -> i32| {
+    let apply = |name: &str, mhz: i32, setter: unsafe extern "C" fn(i32) -> i32| {
         let result = unsafe { setter(mhz) };
         if result < 0 {
             eprintln!("{name}({mhz}) failed: {result:#x}");

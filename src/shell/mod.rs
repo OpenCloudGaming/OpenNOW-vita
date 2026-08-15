@@ -14,33 +14,29 @@ use crate::input::{
 use crate::streaming::audio::AudioRenderer;
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
-use surface::{HEIGHT, VitaSurface, WIDTH};
-use tokio::time::sleep;
+use surface::{FramePaintStats, HEIGHT, VitaSurface, WIDTH};
 
 /// Scales `pixels_per_point` up so the UI reads legibly on the Vita's small screen.
 const UI_SCALE: f32 = 1.3;
-const DIRECTION_REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(350);
-const DIRECTION_REPEAT_INTERVAL: Duration = Duration::from_millis(90);
+const DIRECTION_REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(200);
+const DIRECTION_REPEAT_INTERVAL: Duration = Duration::from_millis(70);
 
 pub(crate) const TARGET_FRAME_TIME: Duration = Duration::from_millis(16);
-const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(4);
 
+const FRAME_STATS_INTERVAL: Duration = Duration::from_secs(2);
+const SLOW_FRAME_THRESHOLD: Duration = Duration::from_millis(20);
+const LONG_GAP_THRESHOLD: Duration = Duration::from_millis(25);
 
-/// Where the render loop's time goes, for the on-screen readout.
-///
-/// The loop only sleeps when it comes in under `TARGET_FRAME_TIME`; when it overruns it runs flat
-/// out, which pegs a core. Knowing *which* phase overran is the difference between fixing it and
-/// guessing at it.
 pub(crate) mod render_stats {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
     pub(crate) static FRAME_US: AtomicU32 = AtomicU32::new(0);
     pub(crate) static UI_US: AtomicU32 = AtomicU32::new(0);
     pub(crate) static PAINT_US: AtomicU32 = AtomicU32::new(0);
-    /// Frames that missed the deadline, so the loop never got to sleep.
+    pub(crate) static PRESENT_US: AtomicU32 = AtomicU32::new(0);
+    pub(crate) static DRAW_CALLS: AtomicU32 = AtomicU32::new(0);
     pub(crate) static OVER_BUDGET: AtomicU64 = AtomicU64::new(0);
 
-    /// Exponential smoothing, so the readout is legible instead of flickering every frame.
     pub(crate) fn record(slot: &AtomicU32, sample_us: u32) {
         let previous = slot.load(Ordering::Relaxed);
         let smoothed = if previous == 0 {
@@ -53,12 +49,154 @@ pub(crate) mod render_stats {
 
     pub(crate) fn line() -> String {
         format!(
-            "cpu frame:{:.1}ms ui:{:.1}ms paint:{:.1}ms over:{}",
+            "cpu frame:{:.1}ms ui:{:.1}ms paint:{:.1}ms present:{:.1}ms draws:{} over:{}",
             FRAME_US.load(Ordering::Relaxed) as f32 / 1000.0,
             UI_US.load(Ordering::Relaxed) as f32 / 1000.0,
             PAINT_US.load(Ordering::Relaxed) as f32 / 1000.0,
+            PRESENT_US.load(Ordering::Relaxed) as f32 / 1000.0,
+            DRAW_CALLS.load(Ordering::Relaxed),
             OVER_BUDGET.load(Ordering::Relaxed),
         )
+    }
+}
+
+#[derive(Default)]
+struct FrameStats {
+    window_started_at: Option<Instant>,
+    frames: u32,
+    tick: Duration,
+    build_ui: Duration,
+    tessellate: Duration,
+    texture_apply: Duration,
+    geometry: Duration,
+    present: Duration,
+    draw_calls: u64,
+    textures_uploaded: u64,
+    vertices_drawn: u64,
+    iterations: u32,
+    last_painted_at: Option<Instant>,
+    max_gap: Duration,
+    long_gaps: u32,
+    pending_log: Vec<String>,
+}
+
+impl FrameStats {
+    fn note_iteration(&mut self) {
+        self.iterations += 1;
+        self.window_started_at.get_or_insert_with(Instant::now);
+    }
+
+    fn record(
+        &mut self,
+        tick: Duration,
+        build_ui: Duration,
+        tessellate: Duration,
+        paint: FramePaintStats,
+    ) {
+        let now = Instant::now();
+        let texture_apply = Duration::from_secs_f64(paint.texture_apply_secs);
+        let geometry = Duration::from_secs_f64(paint.geometry_secs);
+        let present = Duration::from_secs_f64(paint.present_secs);
+        self.frames += 1;
+        self.tick += tick;
+        self.build_ui += build_ui;
+        self.tessellate += tessellate;
+        self.texture_apply += texture_apply;
+        self.geometry += geometry;
+        self.present += present;
+        self.draw_calls += paint.draw_calls as u64;
+        self.textures_uploaded += paint.textures_uploaded as u64;
+        self.vertices_drawn += paint.vertices_drawn as u64;
+        let paint_total = texture_apply + geometry + present;
+        let total = tick + build_ui + tessellate + paint_total;
+        if let Some(previous) = self.last_painted_at {
+            let gap = now.duration_since(previous);
+            self.max_gap = self.max_gap.max(gap);
+            if gap > LONG_GAP_THRESHOLD {
+                self.long_gaps += 1;
+                self.pending_log.push(format!(
+                    "long gap: {:.1}ms since last painted frame (work={:.1}ms elsewhere={:.1}ms)",
+                    gap.as_secs_f64() * 1000.0,
+                    total.as_secs_f64() * 1000.0,
+                    gap.saturating_sub(total).as_secs_f64() * 1000.0,
+                ));
+            }
+        }
+        self.last_painted_at = Some(now);
+        if total > SLOW_FRAME_THRESHOLD {
+            self.pending_log.push(format!(
+                "slow frame: tick={:.1}ms build_ui={:.1}ms tessellate={:.1}ms paint={:.1}ms \
+                 (texture_apply={:.1}ms×{} geometry={:.1}ms×{}draws/{}verts present={:.1}ms) total={:.1}ms",
+                tick.as_secs_f64() * 1000.0,
+                build_ui.as_secs_f64() * 1000.0,
+                tessellate.as_secs_f64() * 1000.0,
+                paint_total.as_secs_f64() * 1000.0,
+                texture_apply.as_secs_f64() * 1000.0,
+                paint.textures_uploaded,
+                geometry.as_secs_f64() * 1000.0,
+                paint.draw_calls,
+                paint.vertices_drawn,
+                present.as_secs_f64() * 1000.0,
+                total.as_secs_f64() * 1000.0,
+            ));
+        }
+
+        let ui_us = (build_ui + tessellate).as_micros() as u32;
+        let paint_us = (texture_apply + geometry).as_micros() as u32;
+        let present_us = present.as_micros() as u32;
+        let frame_us = total.as_micros() as u32;
+        render_stats::record(&render_stats::UI_US, ui_us);
+        render_stats::record(&render_stats::PAINT_US, paint_us);
+        render_stats::record(&render_stats::PRESENT_US, present_us);
+        render_stats::record(&render_stats::FRAME_US, frame_us);
+        render_stats::DRAW_CALLS.store(paint.draw_calls, std::sync::atomic::Ordering::Relaxed);
+        if tick + build_ui + tessellate + texture_apply + geometry >= TARGET_FRAME_TIME {
+            render_stats::OVER_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn maybe_flush(&mut self) {
+        let Some(window_started_at) = self.window_started_at else {
+            return;
+        };
+        let elapsed = window_started_at.elapsed();
+        if elapsed < FRAME_STATS_INTERVAL {
+            return;
+        }
+        let seconds = elapsed.as_secs_f64();
+        let frames = self.frames.max(1) as f64;
+        self.pending_log.push(format!(
+            "frame stats ({:.1}s): {} painted ({:.1} fps) · {} iterations · \
+             worst frame gap {:.0}ms, {} over {}ms",
+            seconds,
+            self.frames,
+            self.frames as f64 / seconds,
+            self.iterations,
+            self.max_gap.as_secs_f64() * 1000.0,
+            self.long_gaps,
+            LONG_GAP_THRESHOLD.as_millis(),
+        ));
+        if self.frames > 0 {
+            self.pending_log.push(format!(
+                "  avg per painted frame: tick={:.2}ms build_ui={:.2}ms tessellate={:.2}ms \
+                 texture_apply={:.2}ms ({:.1} uploads) geometry={:.2}ms ({:.1} draws, {:.0} verts) present={:.2}ms",
+                self.tick.as_secs_f64() * 1000.0 / frames,
+                self.build_ui.as_secs_f64() * 1000.0 / frames,
+                self.tessellate.as_secs_f64() * 1000.0 / frames,
+                self.texture_apply.as_secs_f64() * 1000.0 / frames,
+                self.textures_uploaded as f64 / frames,
+                self.geometry.as_secs_f64() * 1000.0 / frames,
+                self.draw_calls as f64 / frames,
+                self.vertices_drawn as f64 / frames,
+                self.present.as_secs_f64() * 1000.0 / frames,
+            ));
+        }
+        crate::logger::write_frame_stats(&self.pending_log.join("\n"));
+        let last_painted_at = self.last_painted_at;
+        *self = FrameStats {
+            last_painted_at,
+            ..FrameStats::default()
+        };
     }
 }
 
@@ -74,6 +212,7 @@ pub async fn run(mut app: App) -> Result<()> {
     let _audio_renderer =
         AudioRenderer::new(&audio).context("failed to set up audio renderer")?;
     let egui_ctx = egui::Context::default();
+    crate::app::fonts::configure(&egui_ctx);
     crate::app::ui::apply_theme(&egui_ctx);
     let start_time = Instant::now();
     let mut pointer_pos = egui::Pos2::ZERO;
@@ -87,34 +226,32 @@ pub async fn run(mut app: App) -> Result<()> {
     let mut rear_touch = RearTouchTriggers::default();
     let mut stick_zones = crate::input::FrontStickZones::default();
     let mut was_streaming = false;
-    // Reactive repainting outside a session: the catalog is static between interactions, so
-    // re-running and re-tessellating egui 60 times a second burns a whole core to redraw an
-    // identical screen. Streaming always repaints - the video changes every frame.
-    let mut last_painted_at = Instant::now();
-    let mut needs_repaint = true;
+    let mut frame_stats = FrameStats::default();
+    crate::logger::reset_frame_stats_log();
+    crate::logger::write_frame_stats("=== OpenNOW-vita frame stats — new session ===");
 
     loop {
         let loop_started_at = Instant::now();
+        frame_stats.note_iteration();
+        frame_stats.maybe_flush();
         let mut egui_events = Vec::new();
         let mut direct_commands = Vec::new();
         let mut stream_mouse_events = Vec::new();
-        // While a session is live the touchscreen belongs to the game rather than to the client
-        // UI - except for the "Stop session" button, whose rect the UI publishes each frame.
-        // Without that carve-out the button is on screen but unreachable, leaving no way out of a
-        // running game.
-        // Any client-owned modal has to take the touchscreen back, or its buttons are drawn over
-        // the game but every tap goes to the game's mouse instead - which is exactly how the
-        // controls hint ended up with a "Got it" that did nothing.
-        let touch_drives_stream = matches!(app.state, AppState::Streaming { .. })
-            && !app.confirm_exit
-            && !app.show_controls_hint
-            && !app.show_controls_modal;
-        let stream_ui_rects: Vec<egui::Rect> = crate::app::ui::stream_ui_rects(&egui_ctx)
+        let touch_drives_stream =
+            matches!(app.state, AppState::Streaming { .. }) && !app.ui_owns_touch();
+        let screen_points = (WIDTH as f32 / UI_SCALE, HEIGHT as f32 / UI_SCALE);
+        let mut stream_ui_rects: Vec<egui::Rect> = crate::app::ui::stream_ui_rects(&egui_ctx)
             .into_iter()
             // Fingertips are wider than a button's hit box.
             .map(|rect| rect.expand(8.0))
             .collect();
-        let screen_points = (WIDTH as f32 / UI_SCALE, HEIGHT as f32 / UI_SCALE);
+        if app.keyboard_open {
+            let screen = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(screen_points.0, screen_points.1),
+            );
+            stream_ui_rects.push(crate::app::ui::keyboard_panel_rect(screen));
+        }
         // Touch deltas are normalized 0..1, so they scale by the streamed frame's own size to
         // land as host pixels: a drag across the whole panel moves the cursor across the whole
         // remote screen.
@@ -147,7 +284,8 @@ pub async fn run(mut app: App) -> Result<()> {
             if let sdl2::event::Event::FingerDown { touch_id, x, y, .. } = event
                 && touch_id == crate::input::FRONT_TOUCH_DEVICE_ID
             {
-                touch_owned_by_stick_zone = !touch_owned_by_ui
+                touch_owned_by_stick_zone = touch_drives_stream
+                    && !touch_owned_by_ui
                     && crate::gfn::stream_prefs::stick_zones().is_active()
                     && crate::input::is_in_stick_zone(x, y);
                 crate::input::stick_zone_stats::record_touch_owned(touch_owned_by_stick_zone);
@@ -207,11 +345,12 @@ pub async fn run(mut app: App) -> Result<()> {
             None => held_direction = None,
         }
 
-        let had_direct_commands = !direct_commands.is_empty();
         for command in direct_commands {
             app.handle_command(command).await?;
         }
+        let tick_started_at = Instant::now();
         app.tick().await?;
+        let tick_elapsed = tick_started_at.elapsed();
 
         let show_video = {
             let streaming_peer = match &app.state {
@@ -222,12 +361,13 @@ pub async fn run(mut app: App) -> Result<()> {
             // memory card and this runs 60 times a second.
             if streaming_peer.is_some() != was_streaming {
                 was_streaming = streaming_peer.is_some();
+                if was_streaming {
+                    rear_touch.reload_intensity();
+                    stick_zones.reload_enabled();
+                }
             }
-            if was_streaming {
-                rear_touch.reload_intensity();
-                stick_zones.reload_enabled();
-            }
-            surface.sync_video_frame(streaming_peer)?;
+            let latest_video = streaming_peer.and_then(|peer| peer.video_frame());
+            surface.sync_video_frame(streaming_peer, latest_video.as_ref())?;
             if let (Some(peer), Some(active_controller)) = (streaming_peer, controller.as_ref()) {
                 peer.send_gamepad(gamepad_snapshot(active_controller, &rear_touch, &stick_zones));
                 crate::input::stick_zone_stats::record_clicks(
@@ -242,7 +382,7 @@ pub async fn run(mut app: App) -> Result<()> {
             }
             // Audio no longer passes through here at all: the peer thread hands packets to the
             // decode worker as they arrive, so playback is not paced by the video frame rate.
-            streaming_peer.is_some_and(|peer| peer.video_frame().is_some())
+            latest_video.is_some()
         };
 
         let search_requested = matches!(
@@ -264,7 +404,6 @@ pub async fn run(mut app: App) -> Result<()> {
             text_input_active = false;
         }
 
-        let had_egui_events = !egui_events.is_empty();
         let raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -285,35 +424,12 @@ pub async fn run(mut app: App) -> Result<()> {
             ..Default::default()
         };
 
-        // App state changes behind egui's back (a finished job, a new status line), so a floor
-        // keeps the screen honest without polling at frame rate. 100 ms is imperceptible on a menu
-        // and still ~6x less work than repainting every frame.
-        const IDLE_REPAINT_FLOOR: Duration = Duration::from_millis(100);
-        let repaint_now = show_video
-            || needs_repaint
-            || had_egui_events
-            || had_direct_commands
-            || last_painted_at.elapsed() >= IDLE_REPAINT_FLOOR;
-        if !repaint_now {
-            let frame_deadline = loop_started_at + TARGET_FRAME_TIME;
-            while Instant::now() < frame_deadline {
-                let remaining = frame_deadline.saturating_duration_since(Instant::now());
-                sleep(remaining.min(INPUT_POLL_INTERVAL)).await;
-            }
-            continue;
-        }
-
-        let ui_started_at = Instant::now();
+        let build_ui_started_at = Instant::now();
         let mut ui_commands = Vec::new();
         let full_output = egui_ctx.run(raw_input, |ctx| {
             ui_commands = build_ui(ctx, &app);
         });
-        // egui asks for another frame while anything is animating - a spinner, a fade, a hover.
-        needs_repaint = full_output
-            .viewport_output
-            .get(&egui::ViewportId::ROOT)
-            .is_some_and(|viewport| viewport.repaint_delay.is_zero());
-        last_painted_at = Instant::now();
+        let build_ui_elapsed = build_ui_started_at.elapsed();
 
         for command in ui_commands {
             if command == crate::input::AppCommand::RightClick {
@@ -330,51 +446,22 @@ pub async fn run(mut app: App) -> Result<()> {
             app.handle_command(command).await?;
         }
 
+        let tessellate_started_at = Instant::now();
         let clipped_primitives =
             egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-        render_stats::record(
-            &render_stats::UI_US,
-            ui_started_at.elapsed().as_micros() as u32,
-        );
+        let tessellate_elapsed = tessellate_started_at.elapsed();
 
-        let paint_started_at = Instant::now();
         surface.draw_scene(show_video)?;
-        surface.paint_egui(
+        let paint_stats = surface.paint_egui(
             full_output.pixels_per_point,
             &clipped_primitives,
             &full_output.textures_delta,
         )?;
-        render_stats::record(
-            &render_stats::PAINT_US,
-            paint_started_at.elapsed().as_micros() as u32,
-        );
-        render_stats::record(
-            &render_stats::FRAME_US,
-            loop_started_at.elapsed().as_micros() as u32,
-        );
-
+        frame_stats.record(tick_elapsed, build_ui_elapsed, tessellate_elapsed, paint_stats);
         let frame_deadline = loop_started_at + TARGET_FRAME_TIME;
-        if Instant::now() >= frame_deadline {
-            render_stats::OVER_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        if Instant::now() < frame_deadline {
-            while Instant::now() < frame_deadline {
-                let remaining = frame_deadline.saturating_duration_since(Instant::now());
-                sleep(remaining.min(INPUT_POLL_INTERVAL)).await;
-                if Instant::now() >= frame_deadline {
-                    break;
-                }
-                event_pump.pump_events();
-                if let (AppState::Streaming { peer, .. }, Some(active_controller)) =
-                    (&app.state, controller.as_ref())
-                {
-                    peer.send_gamepad(gamepad_snapshot(active_controller, &rear_touch, &stick_zones));
-                crate::input::stick_zone_stats::record_clicks(
-                    stick_zones.left_stick_click(),
-                    stick_zones.right_stick_click(),
-                );
-                }
-            }
+        let remaining = frame_deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            tokio::time::sleep(remaining).await;
         } else {
             tokio::task::yield_now().await;
         }

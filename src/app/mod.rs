@@ -1,3 +1,5 @@
+pub mod fonts;
+pub mod settings_menu;
 pub mod ui;
 
 use crate::gfn::auth::{self, AuthTokens, DeviceCodeChallenge, DevicePollOutcome, GfnUser};
@@ -11,7 +13,7 @@ use crate::locale::Locale;
 use anyhow::Result;
 use reqwest::Client;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 /// The outcome of trying to renew the saved GFN login.
@@ -105,7 +107,6 @@ impl CatalogSort {
     }
 }
 
-// my games vs whole gfn catalog, default is my games obviously
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CatalogFilter {
     #[default]
@@ -116,7 +117,6 @@ pub enum CatalogFilter {
 impl CatalogFilter {
     pub const ALL: [CatalogFilter; 2] = [Self::MyGames, Self::AllGames];
 
-    // label for the dropdown
     pub fn label_key(self) -> &'static str {
         match self {
             Self::MyGames => "catalog-filter-my-games",
@@ -291,7 +291,9 @@ fn sorted_indices(games: &[GameSummary], query: &str, sort: CatalogSort) -> Vec<
 fn tr(locale: Locale, id: &'static str, key: &'static str, value: impl ToString) -> String {
     let mut args = fluent_bundle::FluentArgs::new();
     args.set(key, crate::i18n::arg_string(value.to_string()));
-    crate::i18n::I18n::new(locale).text_with(id, args)
+    crate::i18n::I18n::new(locale)
+        .text_with(id, args)
+        .to_string()
 }
 
 // digs thru the error chain for a gfn code, the outer error is usually just anyhow context by now
@@ -385,6 +387,7 @@ pub enum AppState {
         session: SessionInfo,
         handle: SignalingHandle,
         peer: crate::gfn::peer::PeerEngine,
+        session_start: std::time::Instant,
     },
     Error {
         message: String,
@@ -436,6 +439,10 @@ pub struct App {
     pub(crate) toolbar_expanded: bool,
     /// Whether the in-stream controls quick modal (L2/R2 & L3/R3 settings) is showing.
     pub(crate) show_controls_modal: bool,
+    pub(crate) keyboard_open: bool,
+    pub(crate) key_shift: bool,
+    pub(crate) key_ctrl: bool,
+    pub(crate) key_alt: bool,
     /// Whether front-touch trackpad input drives host mouse movement.
     pub(crate) mouse_trackpad_enabled: bool,
     /// UI display language, changed via the gear icon next to the avatar in the catalog screen.
@@ -467,6 +474,27 @@ pub struct App {
     /// the search started: clearing "holl" would shrink the list back down to a single fresh page
     /// and slowly regrow it, discarding scroll position along the way.
     browse_snapshot: Option<BrowseSnapshot>,
+    pub(crate) regions: Vec<crate::gfn::regions::StreamRegion>,
+    regions_job: Option<PollJob<Vec<crate::gfn::regions::StreamRegion>>>,
+    pub(crate) regions_measuring: bool,
+    pub(crate) regions_error: Option<String>,
+    pub(crate) settings_open: bool,
+    pub(crate) settings_tab: settings_menu::SettingsTab,
+    pub(crate) settings_focus: usize,
+    pub(crate) settings_expanded: Option<usize>,
+    pub(crate) settings_option_focus: usize,
+    pub(crate) server_picker_open: bool,
+    pub(crate) server_picker_focus: usize,
+    pub(crate) queue_stats: crate::gfn::queue_stats::QueueMap,
+    queue_job: Option<PollJob<crate::gfn::queue_stats::QueueMap>>,
+    regions_measured_for_picker: bool,
+    pub(crate) battery: Option<crate::power::BatteryStatus>,
+    battery_checked_at: Option<Instant>,
+    bitrate_ceiling_mbps: u32,
+    bitrate_keyframes_seen: u64,
+    bitrate_checked_at: Option<Instant>,
+    last_tick_wall_clock: Option<std::time::SystemTime>,
+    pub(crate) membership_tier: Option<String>,
 }
 
 struct BrowseSnapshot {
@@ -477,11 +505,15 @@ struct BrowseSnapshot {
 }
 
 impl App {
+    pub(crate) fn ui_owns_touch(&self) -> bool {
+        self.confirm_exit || self.show_controls_hint || self.show_controls_modal
+    }
+
     /// Returns the current Bearer token if the user is logged in.
     /// Localized text in the user's chosen UI language. The error and status strings these build
     /// were hardcoded Spanish, so an English UI still reported failures in Spanish.
     fn tr(&self, id: &'static str) -> String {
-        crate::i18n::I18n::new(self.locale).text(id)
+        crate::i18n::I18n::new(self.locale).text(id).to_string()
     }
 
     fn tr1(&self, id: &'static str, key: &'static str, value: impl ToString) -> String {
@@ -497,7 +529,9 @@ impl App {
         let mut args = fluent_bundle::FluentArgs::new();
         args.set(first.0, crate::i18n::arg_string(first.1.to_string()));
         args.set(second.0, crate::i18n::arg_string(second.1.to_string()));
-        crate::i18n::I18n::new(self.locale).text_with(id, args)
+        crate::i18n::I18n::new(self.locale)
+            .text_with(id, args)
+            .to_string()
     }
 
     pub fn bearer_token(&self) -> Option<&str> {
@@ -518,6 +552,7 @@ impl App {
         let favorite_games = crate::gfn::favorites::load();
         let http_client = auth::client();
         let tokens = auth::load_tokens();
+        let membership_tier = tokens.as_ref().and_then(|t| t.membership_tier.clone());
         let vpc_id_cache = catalog::VpcIdCache::default();
         let catalog_filter =
             CatalogFilter::from_text(&crate::gfn::stream_prefs::saved_catalog_filter());
@@ -554,6 +589,10 @@ impl App {
             confirm_exit: false,
             toolbar_expanded: false,
             show_controls_modal: false,
+            keyboard_open: false,
+            key_shift: false,
+            key_ctrl: false,
+            key_alt: false,
             mouse_trackpad_enabled: true,
             locale: Locale::default(),
             catalog_sort: CatalogSort::from_text(&crate::gfn::stream_prefs::saved_catalog_sort()),
@@ -564,7 +603,36 @@ impl App {
             launching_session: Arc::new(std::sync::Mutex::new(None)),
             launch_was_queued: false,
             link_meter: None,
+            regions: Vec::new(),
+            regions_job: None,
+            regions_measuring: false,
+            regions_error: None,
+            settings_open: false,
+            settings_tab: settings_menu::SettingsTab::Stream,
+            settings_focus: 0,
+            settings_expanded: None,
+            settings_option_focus: 0,
+            server_picker_open: false,
+            server_picker_focus: 0,
+            queue_stats: Default::default(),
+            queue_job: None,
+            regions_measured_for_picker: false,
+            battery: None,
+            battery_checked_at: None,
+            bitrate_ceiling_mbps: 0,
+            bitrate_keyframes_seen: 0,
+            bitrate_checked_at: None,
+            last_tick_wall_clock: None,
+            membership_tier,
         })
+    }
+
+    pub(crate) fn is_loading_queue_stats(&self) -> bool {
+        self.queue_job.is_some()
+    }
+
+    pub(crate) fn is_loading_regions(&self) -> bool {
+        self.regions_job.is_some()
     }
 
     pub async fn handle_command(&mut self, command: AppCommand) -> Result<()> {
@@ -615,6 +683,121 @@ impl App {
                 if zones != crate::gfn::stream_prefs::StickZones::Off {
                     // same deal but reverse, drop rear back to 2 zones
                     crate::gfn::stream_prefs::set_rear_touch_mode(crate::gfn::stream_prefs::RearTouchMode::Halves);
+                }
+                current_state
+            }
+            AppCommand::SetRegion(base_url) => {
+                crate::gfn::stream_prefs::set_region(&base_url);
+                let pinned = crate::gfn::stream_prefs::region();
+                crate::log_info!(
+                    "Region set to {}",
+                    if pinned.is_empty() { "automatic" } else { &pinned }
+                );
+                self.status_note = Some(if pinned.is_empty() {
+                    self.tr("settings-region-note-auto")
+                } else {
+                    let name = self
+                        .regions
+                        .iter()
+                        .find(|region| region.url == pinned)
+                        .map(|region| region.name.clone())
+                        .unwrap_or(pinned);
+                    self.tr1("settings-region-note-pinned", "region", name)
+                });
+                current_state
+            }
+            AppCommand::LoadRegions => {
+                if self.regions_job.is_none() && self.regions.is_empty() {
+                    self.start_region_fetch();
+                }
+                current_state
+            }
+            AppCommand::TestRegionLatency => {
+                if self.regions_job.is_none() && !self.regions.is_empty() {
+                    let regions = self.regions.clone();
+                    self.regions_measuring = true;
+                    self.regions_job = Some(PollJob::Pending(tokio::spawn(async move {
+                        Ok(crate::gfn::regions::measure_all(regions).await)
+                    })));
+                }
+                current_state
+            }
+            AppCommand::CloseServerPicker => {
+                self.server_picker_open = false;
+                current_state
+            }
+            AppCommand::FocusServerPicker(row) => {
+                self.server_picker_focus = row;
+                current_state
+            }
+            AppCommand::LaunchOnServer(zone_base_url) => {
+                self.server_picker_open = false;
+                self.start_launch(current_state, zone_base_url, bearer_token, http_client)
+            }
+            AppCommand::LoadQueueStats => {
+                if self.queue_job.is_none() {
+                    self.start_queue_fetch();
+                }
+                current_state
+            }
+            AppCommand::ToggleGameProfile => {
+                let enabled = crate::gfn::stream_prefs::active_game_has_profile();
+                crate::gfn::stream_prefs::set_active_game_profile(!enabled);
+                current_state
+            }
+            AppCommand::ToggleTriggerSwap => {
+                let enabled = crate::gfn::stream_prefs::trigger_swap_enabled();
+                crate::gfn::stream_prefs::set_trigger_swap_enabled(!enabled);
+                current_state
+            }
+            AppCommand::SetGameLanguage(language) => {
+                crate::gfn::stream_prefs::set_game_language(language);
+                current_state
+            }
+            AppCommand::OpenSettings => {
+                self.settings_open = true;
+                self.settings_tab = settings_menu::SettingsTab::Stream;
+                self.settings_focus = 0;
+                self.settings_expanded = None;
+                if self.regions_job.is_none() && self.regions.is_empty() {
+                    self.start_region_fetch();
+                }
+                current_state
+            }
+            AppCommand::CloseSettings => {
+                self.settings_open = false;
+                self.settings_expanded = None;
+                current_state
+            }
+            AppCommand::SetSettingsTab(tab) => {
+                self.settings_tab = tab;
+                self.settings_focus = 0;
+                self.settings_expanded = None;
+                current_state
+            }
+            AppCommand::ExpandSettingsRow(row) => {
+                if let Some(row) = row {
+                    self.settings_focus = row;
+                }
+                self.settings_expanded = row;
+                self.settings_option_focus = row
+                    .map(|row| {
+                        settings_menu::current_option_index(
+                            self.settings_tab,
+                            row,
+                            &self.regions,
+                            self.locale,
+                        )
+                    })
+                    .unwrap_or(0);
+                current_state
+            }
+            AppCommand::ChooseSettingsOption(row, option) => {
+                self.settings_focus = row;
+                self.settings_expanded = None;
+                if let Some(cmd) = settings_menu::command_for(self.settings_tab, row, option, &self.regions) {
+                    self.state = current_state;
+                    return Box::pin(self.handle_command(cmd)).await;
                 }
                 current_state
             }
@@ -677,10 +860,9 @@ impl App {
                 current_state
             }
             AppCommand::ToggleKeyboard => {
-                if crate::ime::is_open() {
-                    crate::ime::close();
-                } else {
-                    crate::ime::open();
+                self.keyboard_open = !self.keyboard_open;
+                if !self.keyboard_open {
+                    self.release_keyboard_modifiers(&current_state);
                 }
                 current_state
             }
@@ -688,6 +870,40 @@ impl App {
                 if let AppState::Streaming { peer, .. } = &current_state {
                     peer.tap_key(key);
                 }
+                self.key_shift = false;
+                current_state
+            }
+            AppCommand::SendChord { ctrl, alt, key } => {
+                if let AppState::Streaming { peer, .. } = &current_state {
+                    if ctrl {
+                        peer.send_key(crate::gfn::input_protocol::KEY_LEFT_CTRL, true);
+                    }
+                    if alt {
+                        peer.send_key(crate::gfn::input_protocol::KEY_LEFT_ALT, true);
+                    }
+                    peer.tap_key(key);
+                    if alt {
+                        peer.send_key(crate::gfn::input_protocol::KEY_LEFT_ALT, false);
+                    }
+                    if ctrl {
+                        peer.send_key(crate::gfn::input_protocol::KEY_LEFT_CTRL, false);
+                    }
+                }
+                self.key_shift = false;
+                self.key_ctrl = false;
+                self.key_alt = false;
+                current_state
+            }
+            AppCommand::ToggleKeyShift => {
+                self.key_shift = !self.key_shift;
+                current_state
+            }
+            AppCommand::ToggleKeyCtrl => {
+                self.key_ctrl = !self.key_ctrl;
+                current_state
+            }
+            AppCommand::ToggleKeyAlt => {
+                self.key_alt = !self.key_alt;
                 current_state
             }
             AppCommand::SetAudioBoost(boost) => {
@@ -700,6 +916,16 @@ impl App {
                 // Takes effect on the next launch: the frame rate is negotiated in the SDP answer
                 // and cannot be renegotiated mid-session.
                 crate::gfn::stream_prefs::set_fps(fps);
+                current_state
+            }
+            AppCommand::SetColorDepth(depth) => {
+                crate::gfn::stream_prefs::set_color_depth(depth);
+                current_state
+            }
+            AppCommand::ToggleSessionTimer => {
+                crate::gfn::stream_prefs::set_session_timer_enabled(
+                    !crate::gfn::stream_prefs::session_timer_enabled(),
+                );
                 current_state
             }
             AppCommand::SelectGame(index) => {
@@ -965,6 +1191,511 @@ impl App {
         Ok(new_state)
     }
 
+    fn publish_active_game(&self) {
+        let app_id = match &self.state {
+            AppState::Streaming { session, .. } => Some(session.app_id.clone()),
+            AppState::Catalog {
+                games,
+                selected,
+                filtered_indices,
+                ..
+            }
+            | AppState::CreatingSession {
+                games,
+                selected,
+                filtered_indices,
+                ..
+            }
+            | AppState::SessionReady {
+                games,
+                selected,
+                filtered_indices,
+                ..
+            }
+            | AppState::Signaling {
+                games,
+                selected,
+                filtered_indices,
+                ..
+            } => ui::selected_game(games, filtered_indices, *selected)
+                .map(|game| game.app_id.clone()),
+            _ => None,
+        };
+        crate::gfn::stream_prefs::set_active_game(app_id.as_deref());
+    }
+
+    const SUSPEND_GAP: Duration = Duration::from_secs(5);
+
+    fn handle_suspend(&mut self, current_state: AppState) -> AppState {
+        let now = std::time::SystemTime::now();
+        let resumed_from_sleep = self
+            .last_tick_wall_clock
+            .and_then(|previous| now.duration_since(previous).ok())
+            .is_some_and(|gap| gap >= Self::SUSPEND_GAP);
+        self.last_tick_wall_clock = Some(now);
+
+        let in_session = matches!(
+            current_state,
+            AppState::CreatingSession { .. }
+                | AppState::SessionReady { .. }
+                | AppState::Signaling { .. }
+                | AppState::Streaming { .. }
+        );
+        if !in_session {
+            return current_state;
+        }
+
+        let suspending = crate::power::suspend_required();
+        if !suspending && !resumed_from_sleep {
+            return current_state;
+        }
+
+        crate::log_warn!(
+            "Ending the session for a console suspend (pending: {suspending}, resumed: {resumed_from_sleep})"
+        );
+        self.status_note = Some(self.tr("status-session-suspended"));
+        match self.exit_session(current_state) {
+            Ok(state) => state,
+            Err(error) => {
+                crate::log_warn!("Suspend teardown could not stop the session: {error:#}");
+                AppState::Login
+            }
+        }
+    }
+
+    const BITRATE_ADAPT_INTERVAL: Duration = Duration::from_secs(12);
+    const BITRATE_STRESS_REQUESTS: u64 = 3;
+
+    fn adapt_stream_bitrate(&mut self) {
+        let AppState::Streaming { peer, .. } = &self.state else {
+            self.bitrate_ceiling_mbps = 0;
+            self.bitrate_keyframes_seen = 0;
+            self.bitrate_checked_at = None;
+            return;
+        };
+
+        if self.bitrate_ceiling_mbps == 0 {
+            self.bitrate_ceiling_mbps = crate::gfn::link_estimate::ceiling_mbps();
+        }
+        let now = Instant::now();
+        let due = self
+            .bitrate_checked_at
+            .is_none_or(|at| now.duration_since(at) >= Self::BITRATE_ADAPT_INTERVAL);
+        if !due {
+            return;
+        }
+        let requests = peer.keyframe_requests();
+        let previous_checked = self.bitrate_checked_at.replace(now);
+        let in_window = requests.saturating_sub(self.bitrate_keyframes_seen);
+        self.bitrate_keyframes_seen = requests;
+
+        if previous_checked.is_none() || in_window < Self::BITRATE_STRESS_REQUESTS {
+            return;
+        }
+
+        let current = self.bitrate_ceiling_mbps;
+        let lowered = (current * 3 / 4).max(crate::gfn::link_estimate::MIN_CEILING_MBPS);
+        if lowered >= current {
+            return;
+        }
+        self.bitrate_ceiling_mbps = lowered;
+        peer.set_max_bitrate(lowered * 1000);
+        crate::log_warn!(
+            "Link stressed ({in_window} keyframe request(s) in {}s), lowering the ceiling {current} -> {lowered} Mbps",
+            Self::BITRATE_ADAPT_INTERVAL.as_secs()
+        );
+        self.status_note = Some(self.tr1("status-bitrate-lowered", "mbps", lowered));
+    }
+
+    const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(20);
+
+    fn check_battery(&mut self, current_state: AppState) -> AppState {
+        if self
+            .battery_checked_at
+            .is_some_and(|at| at.elapsed() < Self::BATTERY_POLL_INTERVAL)
+        {
+            return current_state;
+        }
+        self.battery_checked_at = Some(Instant::now());
+        let Some(status) = crate::power::battery_status() else {
+            return current_state;
+        };
+        self.battery = Some(status);
+
+        let streaming = matches!(
+            current_state,
+            AppState::CreatingSession { .. }
+                | AppState::SessionReady { .. }
+                | AppState::Signaling { .. }
+                | AppState::Streaming { .. }
+        );
+        if !streaming {
+            return current_state;
+        }
+
+        if status.is_critical() {
+            crate::log_warn!(
+                "Battery critical ({}%), stopping the session while it can still be released",
+                status.percent
+            );
+            self.status_note = Some(self.tr("status-battery-critical"));
+            return match self.exit_session(current_state) {
+                Ok(state) => state,
+                Err(error) => {
+                    crate::log_warn!("Battery shutdown could not stop the session: {error:#}");
+                    AppState::Login
+                }
+            };
+        }
+        if status.should_warn() {
+            self.status_note = Some(self.tr1("status-battery-low", "percent", status.percent));
+        }
+        current_state
+    }
+
+    fn open_server_picker(&mut self) {
+        self.server_picker_open = true;
+        self.regions_measured_for_picker = false;
+        let pinned = crate::gfn::stream_prefs::region();
+        self.server_picker_focus = if pinned.is_empty() {
+            0
+        } else {
+            self.regions
+                .iter()
+                .position(|region| region.url == pinned)
+                .map_or(0, |index| index + 1)
+        };
+        if self.regions_job.is_none() && self.regions.is_empty() {
+            self.start_region_fetch();
+        }
+        if self.queue_job.is_none() {
+            self.start_queue_fetch();
+        }
+    }
+
+    fn start_queue_fetch(&mut self) {
+        let client = self.http_client.clone();
+        self.queue_job = Some(PollJob::Pending(tokio::spawn(async move {
+            crate::gfn::queue_stats::fetch_queue(&client).await
+        })));
+    }
+
+    async fn advance_queue_job(&mut self) {
+        let Some(PollJob::Pending(handle)) = self.queue_job.take() else {
+            return;
+        };
+        match poll_job(handle).await {
+            PollJob::Pending(handle) => {
+                self.queue_job = Some(PollJob::Pending(handle));
+            }
+            PollJob::Done(Ok(readings)) => self.queue_stats = readings,
+            PollJob::Done(Err(error)) => {
+                crate::log_warn!("Queue stats unavailable: {error:#}");
+                self.queue_stats.clear();
+            }
+        }
+    }
+
+    fn measure_regions_for_picker(&mut self) {
+        if !self.server_picker_open
+            || self.regions_measured_for_picker
+            || self.regions.is_empty()
+            || self.regions_job.is_some()
+        {
+            return;
+        }
+        self.regions_measured_for_picker = true;
+        let regions = self.regions.clone();
+        self.regions_measuring = true;
+        self.regions_job = Some(PollJob::Pending(tokio::spawn(async move {
+            Ok(crate::gfn::regions::measure_all(regions).await)
+        })));
+    }
+
+    fn start_launch(
+        &mut self,
+        current_state: AppState,
+        zone_base_url: String,
+        bearer_token: Option<String>,
+        http_client: Client,
+    ) -> AppState {
+        let AppState::Catalog {
+            user,
+            games,
+            selected,
+            filtered_indices,
+            search_query,
+            search_requested,
+            covers,
+        } = current_state
+        else {
+            return current_state;
+        };
+
+        let game_index = filtered_indices.get(selected).copied();
+        match (
+            game_index.and_then(|index| games.get(index)),
+            bearer_token,
+        ) {
+            (Some(game), Some(token)) => {
+                let app_id = game.app_id.clone();
+                let queue_tracker =
+                    Arc::new(std::sync::Mutex::new(cloudmatch::QueueStatus::default()));
+                let tracker_clone = queue_tracker.clone();
+                if let Ok(mut slot) = self.launching_session.lock() {
+                    *slot = None;
+                }
+                self.launch_was_queued = false;
+                let launching_session = self.launching_session.clone();
+                let handle: JoinHandle<Result<SessionInfo>> = tokio::spawn(async move {
+                    let settings = cloudmatch::StreamSettings::for_vita();
+                    let language_code = crate::gfn::stream_prefs::game_language().code();
+                    let session = cloudmatch::create_session(
+                        &http_client,
+                        cloudmatch::CreateSessionRequest {
+                            token: token.as_str(),
+                            app_id: &app_id,
+                            vpc_id: "",
+                            settings: &settings,
+                            zone_base_url: &zone_base_url,
+                            language_code,
+                        },
+                    )
+                    .await?;
+                    if let Ok(mut slot) = launching_session.lock() {
+                        *slot = Some(session.clone());
+                    }
+                    let polled = cloudmatch::poll_session(
+                        &http_client,
+                        cloudmatch::PollSessionRequest {
+                            token: token.as_str(),
+                            session_id: &session.session_id,
+                            session: &session,
+                        },
+                        Some(tracker_clone),
+                    )
+                    .await;
+                    if polled.is_err() {
+                        cloudmatch::stop_session(&http_client, token.as_str(), &session).await;
+                    }
+                    polled
+                });
+                AppState::CreatingSession {
+                    user,
+                    games,
+                    selected,
+                    filtered_indices,
+                    search_query,
+                    search_requested,
+                    covers,
+                    job: PollJob::Pending(handle),
+                    queue_tracker,
+                }
+            }
+            _ => {
+                self.status_note = Some(self.tr("status-session-start-failed"));
+                AppState::Catalog {
+                    user,
+                    games,
+                    selected,
+                    filtered_indices,
+                    search_query,
+                    search_requested,
+                    covers,
+                }
+            }
+        }
+    }
+
+    fn handle_server_picker_input(
+        &mut self,
+        current_state: AppState,
+        input: InputCommand,
+        bearer_token: Option<String>,
+        http_client: Client,
+    ) -> AppState {
+        let row_count = 1 + self.regions.len();
+        match input {
+            InputCommand::MoveUp => {
+                self.server_picker_focus = self.server_picker_focus.saturating_sub(1);
+                current_state
+            }
+            InputCommand::MoveDown => {
+                self.server_picker_focus = (self.server_picker_focus + 1).min(row_count - 1);
+                current_state
+            }
+            InputCommand::Confirm => {
+                let zone = self.server_picker_zone(self.server_picker_focus);
+                self.server_picker_open = false;
+                self.start_launch(current_state, zone, bearer_token, http_client)
+            }
+            InputCommand::Back => {
+                self.server_picker_open = false;
+                current_state
+            }
+            InputCommand::MoveLeft
+            | InputCommand::MoveRight
+            | InputCommand::PrevTab
+            | InputCommand::NextTab => current_state,
+        }
+    }
+
+    fn server_picker_zone(&self, row: usize) -> String {
+        match row.checked_sub(1) {
+            None => String::new(),
+            Some(index) => self
+                .regions
+                .get(index)
+                .map(|region| region.url.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    async fn handle_settings_input(&mut self, input: InputCommand) -> Result<()> {
+        let regions_len = self.regions.len();
+        let row_count = self.settings_tab.row_count();
+
+        if let Some(row) = self.settings_expanded {
+            let option_count = settings_menu::option_count(self.settings_tab, row, regions_len).max(1);
+            match input {
+                InputCommand::MoveUp => {
+                    self.settings_option_focus = self.settings_option_focus.saturating_sub(1);
+                }
+                InputCommand::MoveDown => {
+                    self.settings_option_focus =
+                        (self.settings_option_focus + 1).min(option_count - 1);
+                }
+                InputCommand::Confirm => {
+                    let (row, option) = (row, self.settings_option_focus);
+                    self.settings_expanded = None;
+                    if let Some(cmd) =
+                        settings_menu::command_for(self.settings_tab, row, option, &self.regions)
+                    {
+                        Box::pin(self.handle_command(cmd)).await?;
+                    }
+                }
+                InputCommand::Back => {
+                    self.settings_expanded = None;
+                }
+                InputCommand::MoveLeft
+                | InputCommand::MoveRight
+                | InputCommand::PrevTab
+                | InputCommand::NextTab => {}
+            }
+            return Ok(());
+        }
+
+        match input {
+            InputCommand::MoveUp => {
+                self.settings_focus = self.settings_focus.saturating_sub(1);
+                self.settings_expanded = None;
+            }
+            InputCommand::MoveDown => {
+                if row_count > 0 {
+                    self.settings_focus = (self.settings_focus + 1).min(row_count - 1);
+                }
+                self.settings_expanded = None;
+            }
+            InputCommand::PrevTab => {
+                self.settings_tab = self.settings_tab.shifted(-1);
+                self.settings_focus = 0;
+            }
+            InputCommand::NextTab => {
+                self.settings_tab = self.settings_tab.shifted(1);
+                self.settings_focus = 0;
+            }
+            InputCommand::MoveLeft | InputCommand::MoveRight => {
+                let delta: i32 = if matches!(input, InputCommand::MoveLeft) {
+                    -1
+                } else {
+                    1
+                };
+                if let Some(info) = settings_menu::row_info(self.settings_tab, self.settings_focus) {
+                    if matches!(info.kind, settings_menu::RowKind::Choice) {
+                        let count = settings_menu::option_count(
+                            self.settings_tab,
+                            self.settings_focus,
+                            regions_len,
+                        );
+                        if count > 0 {
+                            let current = settings_menu::current_option_index(
+                                self.settings_tab,
+                                self.settings_focus,
+                                &self.regions,
+                                self.locale,
+                            );
+                            let next = (current as i32 + delta).rem_euclid(count as i32) as usize;
+                            if let Some(cmd) = settings_menu::command_for(
+                                self.settings_tab,
+                                self.settings_focus,
+                                next,
+                                &self.regions,
+                            ) {
+                                Box::pin(self.handle_command(cmd)).await?;
+                            }
+                        }
+                    }
+                }
+            }
+            InputCommand::Confirm => {
+                if let Some(info) = settings_menu::row_info(self.settings_tab, self.settings_focus) {
+                    match info.kind {
+                        settings_menu::RowKind::Toggle(_) => {
+                            if let Some(cmd) = settings_menu::command_for(
+                                self.settings_tab,
+                                self.settings_focus,
+                                0,
+                                &self.regions,
+                            ) {
+                                Box::pin(self.handle_command(cmd)).await?;
+                            }
+                        }
+                        settings_menu::RowKind::Choice
+                            if self.settings_tab == settings_menu::SettingsTab::Controls
+                                && self.settings_focus <= 1 =>
+                        {
+                            let count = settings_menu::option_count(
+                                self.settings_tab,
+                                self.settings_focus,
+                                regions_len,
+                            );
+                            if count > 0 {
+                                let current = settings_menu::current_option_index(
+                                    self.settings_tab,
+                                    self.settings_focus,
+                                    &self.regions,
+                                    self.locale,
+                                );
+                                let next = (current + 1) % count;
+                                if let Some(cmd) = settings_menu::command_for(
+                                    self.settings_tab,
+                                    self.settings_focus,
+                                    next,
+                                    &self.regions,
+                                ) {
+                                    Box::pin(self.handle_command(cmd)).await?;
+                                }
+                            }
+                        }
+                        settings_menu::RowKind::Choice | settings_menu::RowKind::Region => {
+                            self.settings_expanded = Some(self.settings_focus);
+                            self.settings_option_focus = settings_menu::current_option_index(
+                                self.settings_tab,
+                                self.settings_focus,
+                                &self.regions,
+                                self.locale,
+                            );
+                        }
+                    }
+                }
+            }
+            InputCommand::Back => {
+                self.settings_open = false;
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_input_command(
         &mut self,
         current_state: AppState,
@@ -972,6 +1703,18 @@ impl App {
         bearer_token: Option<String>,
         http_client: Client,
     ) -> Result<AppState> {
+        if self.settings_open {
+            self.handle_settings_input(input).await?;
+            return Ok(current_state);
+        }
+        if self.server_picker_open {
+            return Ok(self.handle_server_picker_input(
+                current_state,
+                input,
+                bearer_token,
+                http_client,
+            ));
+        }
         Ok(match (current_state, input) {
             (AppState::Login, InputCommand::Confirm) => self.start_login_state(),
             (AppState::WaitingForDeviceAuthorization { .. }, InputCommand::Back) => AppState::Login,
@@ -1068,86 +1811,15 @@ impl App {
                         covers,
                     }
                 } else {
-                    let game_index = filtered_indices.get(selected).copied();
-                    match (
-                        game_index.and_then(|index| games.get(index)),
-                        bearer_token.clone(),
-                    ) {
-                        (Some(game), Some(token)) => {
-                            let app_id = game.app_id.clone();
-                            let queue_tracker = Arc::new(std::sync::Mutex::new(
-                                cloudmatch::QueueStatus::default(),
-                            ));
-                            let tracker_clone = queue_tracker.clone();
-                            // Republished for the cancel path; cleared here so a cancelled launch
-                            // can't leave the previous attempt's session behind to be stopped
-                            // twice.
-                            if let Ok(mut slot) = self.launching_session.lock() {
-                                *slot = None;
-                            }
-                            self.launch_was_queued = false;
-                            let launching_session = self.launching_session.clone();
-                            let handle: JoinHandle<Result<SessionInfo>> =
-                                tokio::spawn(async move {
-                                    let settings = cloudmatch::StreamSettings::for_vita();
-                                    let session = cloudmatch::create_session(
-                                        &http_client,
-                                        cloudmatch::CreateSessionRequest {
-                                            token: token.as_str(),
-                                            app_id: &app_id,
-                                            vpc_id: "",
-                                            settings: &settings,
-                                        },
-                                    )
-                                    .await?;
-                                    if let Ok(mut slot) = launching_session.lock() {
-                                        *slot = Some(session.clone());
-                                    }
-                                    let polled = cloudmatch::poll_session(
-                                        &http_client,
-                                        cloudmatch::PollSessionRequest {
-                                            token: token.as_str(),
-                                            session_id: &session.session_id,
-                                            session: &session,
-                                        },
-                                        Some(tracker_clone),
-                                    )
-                                    .await;
-                                    if polled.is_err() {
-                                        cloudmatch::stop_session(
-                                            &http_client,
-                                            token.as_str(),
-                                            &session,
-                                        )
-                                        .await;
-                                    }
-                                    polled
-                                });
-                            AppState::CreatingSession {
-                                user,
-                                games,
-                                selected,
-                                filtered_indices,
-                                search_query,
-                                search_requested,
-                                covers,
-                                job: PollJob::Pending(handle),
-                                queue_tracker,
-                            }
-                        }
-                        _ => {
-                            self.status_note =
-                                Some(self.tr("status-session-start-failed"));
-                            AppState::Catalog {
-                                user,
-                                games,
-                                selected,
-                                filtered_indices,
-                                search_query,
-                                search_requested,
-                                covers,
-                            }
-                        }
+                    self.open_server_picker();
+                    AppState::Catalog {
+                        user,
+                        games,
+                        selected,
+                        filtered_indices,
+                        search_query,
+                        search_requested,
+                        covers,
                     }
                 }
             }
@@ -1370,6 +2042,22 @@ impl App {
         let tokens = tokens.clone();
         let cache = vpc_id_cache.clone();
         let user_id = user.user_id.clone();
+
+        let client_for_tier = client.clone();
+        let tokens_for_tier = tokens.clone();
+        let cache_for_tier = vpc_id_cache.clone();
+        let user_id_for_tier = user.user_id.clone();
+        tokio::spawn(async move {
+            if tokens_for_tier.membership_tier.is_none() {
+                if let Ok(vpc_id) = crate::gfn::catalog::resolve_vpc_id(&client_for_tier, tokens_for_tier.bearer(), &cache_for_tier).await {
+                    if let Ok(tier) = crate::gfn::auth::fetch_membership_tier(&client_for_tier, tokens_for_tier.bearer(), &vpc_id, &user_id_for_tier).await {
+                        let mut updated_tokens = tokens_for_tier.clone();
+                        updated_tokens.membership_tier = Some(tier);
+                        let _ = crate::gfn::auth::save_tokens(&updated_tokens);
+                    }
+                }
+            }
+        });
         let handle: JoinHandle<Result<catalog::CatalogPage>> = tokio::spawn(async move {
             // Renew first when the saved token is near expiry. This runs at startup with whatever
             // was on the memory card, and the proactive refresh in `tick` only gets a turn *after*
@@ -1534,6 +2222,41 @@ impl App {
             .await
         });
         self.search_job = Some((query, PollJob::Pending(handle)));
+    }
+
+    fn start_region_fetch(&mut self) {
+        let Some(token) = self.bearer_token().map(str::to_owned) else {
+            return;
+        };
+        let client = self.http_client.clone();
+        self.regions_error = None;
+        self.regions_measuring = false;
+        self.regions_job = Some(PollJob::Pending(tokio::spawn(async move {
+            crate::gfn::regions::fetch_regions(&client, &token).await
+        })));
+    }
+
+    async fn advance_region_job(&mut self) {
+        let Some(PollJob::Pending(handle)) = self.regions_job.take() else {
+            return;
+        };
+        match poll_job(handle).await {
+            PollJob::Pending(handle) => {
+                self.regions_job = Some(PollJob::Pending(handle));
+            }
+            PollJob::Done(Ok(regions)) => {
+                self.regions_measuring = false;
+                if regions.is_empty() {
+                    self.regions_error = Some(self.tr("settings-region-none"));
+                }
+                self.regions = regions;
+            }
+            PollJob::Done(Err(error)) => {
+                crate::log_warn!("Region lookup failed: {error:#}");
+                self.regions_measuring = false;
+                self.regions_error = Some(self.tr("settings-region-failed"));
+            }
+        }
     }
 
     /// Streams the remaining catalog pages in behind the UI, appending each to `games` as it
@@ -1711,10 +2434,18 @@ impl App {
     pub async fn tick(&mut self) -> Result<()> {
         self.prune_covers();
         self.track_link_quality();
-        self.pump_keyboard();
+        self.sync_keyboard_state();
         self.maintain_session().await;
         self.advance_catalog_search().await;
         self.advance_catalog_paging().await;
+        self.advance_region_job().await;
+        self.advance_queue_job().await;
+        self.measure_regions_for_picker();
+        self.publish_active_game();
+        let state = std::mem::replace(&mut self.state, AppState::Login);
+        let state = self.handle_suspend(state);
+        self.state = self.check_battery(state);
+        self.adapt_stream_bitrate();
         match std::mem::replace(&mut self.state, AppState::Login) {
             AppState::StartingDeviceLogin(job) => self.state = self.advance_login_start(job).await,
             AppState::WaitingForDeviceAuthorization {
@@ -1769,6 +2500,8 @@ impl App {
                 handle,
                 offer_sdp,
             } => {
+                self.membership_tier = crate::gfn::auth::load_tokens()
+                    .and_then(|tokens| tokens.membership_tier);
                 self.state = self.advance_signaling(
                     user,
                     games,
@@ -1793,6 +2526,7 @@ impl App {
                 session,
                 mut handle,
                 mut peer,
+                session_start,
             } => {
                 let mut fatal_reason: Option<String> = None;
 
@@ -1822,9 +2556,11 @@ impl App {
                             self.status_note = Some(status);
                         }
                         crate::gfn::peer::PeerEvent::Connected => {
+                            crate::log_stream!("UI: stream live");
                             self.status_note = Some(self.tr("status-stream-live"));
                         }
                         crate::gfn::peer::PeerEvent::Error(err) => {
+                            crate::log_error!("Streaming peer error: {err}");
                             eprintln!("Streaming peer error: {err}");
                             self.status_note = Some(self.tr1("status-peer-error", "error", &err));
                         }
@@ -1835,9 +2571,11 @@ impl App {
                                 4 => format!("La sesión finalizará en breve ({seconds_left}s)"),
                                 _ => format!("Aviso de tiempo de sesión: ~{mins} min restantes"),
                             };
+                            crate::log_stream!("session time warning code={code} left={seconds_left}s");
                             self.status_note = Some(msg);
                         }
                         crate::gfn::peer::PeerEvent::Disconnected(reason) => {
+                            crate::log_error!("Streaming peer disconnected: {reason}");
                             eprintln!("Streaming peer disconnected: {reason}");
                             fatal_reason
                                 .get_or_insert(self.tr1("error-stream-lost", "reason", &reason));
@@ -1874,6 +2612,7 @@ impl App {
                         session,
                         handle,
                         peer,
+                        session_start,
                     };
                 }
             }
@@ -1922,6 +2661,7 @@ impl App {
                                 session,
                                 handle,
                                 peer,
+                                session_start: std::time::Instant::now(),
                             };
                         }
                         Err(error) => {
@@ -2102,27 +2842,28 @@ impl App {
         state
     }
 
-    /// Pumps the in-game keyboard and forwards whatever it detected to the game.
     ///
-    /// The IME needs `update` called every frame to deliver its events at all, and its handler can
-    /// only queue keystrokes - it has no route to the peer - so the hand-off happens here.
-    fn pump_keyboard(&mut self) {
-        // The keyboard belongs to a running session; leaving it up over the catalog would send
-        // keystrokes into a game that is no longer there.
-        if crate::ime::is_open() && !matches!(self.state, AppState::Streaming { .. }) {
-            crate::ime::close();
-            return;
+    fn sync_keyboard_state(&mut self) {
+        if self.keyboard_open && !matches!(self.state, AppState::Streaming { .. }) {
+            self.keyboard_open = false;
+            let state = std::mem::replace(&mut self.state, AppState::Login);
+            self.release_keyboard_modifiers(&state);
+            self.state = state;
         }
-        crate::ime::update();
-        let keys = crate::ime::take_keys();
-        if keys.is_empty() {
-            return;
-        }
-        if let AppState::Streaming { peer, .. } = &self.state {
-            for key in keys {
-                peer.tap_key(key);
+    }
+
+    fn release_keyboard_modifiers(&mut self, state: &AppState) {
+        if let AppState::Streaming { peer, .. } = state {
+            if self.key_ctrl {
+                peer.send_key(crate::gfn::input_protocol::KEY_LEFT_CTRL, false);
+            }
+            if self.key_alt {
+                peer.send_key(crate::gfn::input_protocol::KEY_LEFT_ALT, false);
             }
         }
+        self.key_ctrl = false;
+        self.key_alt = false;
+        self.key_shift = false;
     }
 
     /// Keeps the saved login ahead of its expiry, so a request is never the thing that discovers

@@ -5,9 +5,9 @@ mod locale;
 mod power;
 mod app;
 mod gfn;
-mod ime;
 mod input;
 mod jobs;
+mod logger;
 mod safe_memory;
 mod shell;
 mod streaming;
@@ -28,6 +28,11 @@ pub static SCE_LIBC_HEAP_SIZE: u32 = 40 * 1024 * 1024;
 pub static NEWLIB_HEAP_SIZE_USER: u32 = 192 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
+    if let Err(e) = logger::init() {
+        eprintln!("Failed to initialize logger: {e}");
+    }
+    log_info!("OpenNOW-vita starting up");
+
     let _performance = power::PerformanceMode::engage();
     thread_affinity::pin_current_thread(thread_affinity::VitaCore::Render, "shell");
     let _app_util = safe_memory::AppUtil::initialize()?;

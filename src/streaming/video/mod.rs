@@ -17,7 +17,10 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// How many reference frames the Vita's hardware decoder is initialized to retain.
-pub const AVCDEC_NUM_REF_FRAMES: u32 = 4;
+pub const AVCDEC_NUM_REF_FRAMES: u32 = 1;
+
+#[allow(dead_code)] // used by Vita Internal decoder path (`cfg(target_os = "vita")`)
+pub const AU_PTS_STEP: u64 = 1500;
 
 /// Pixel format negotiated between the render thread (which knows what SDL texture formats the
 /// platform supports) and the decoder (which asks sceAvcdec for matching output).
@@ -25,6 +28,7 @@ pub const AVCDEC_NUM_REF_FRAMES: u32 = 4;
 pub enum VideoPixelFormat {
     Bgr565,
     Iyuv,
+    Rgba8888,
 }
 
 const MAX_PENDING_TEXTURE_WAIT: Duration = Duration::from_millis(34);
@@ -74,7 +78,6 @@ pub struct DirectVideoOutput {
     state: Mutex<DirectVideoOutputState>,
     frame_displayed: Condvar,
     pub decoder_ready: AtomicBool,
-    /// 0 = not yet registered, 1 = Bgr565, 2 = Iyuv.
     pixel_format: AtomicU8,
     /// Set by the decode thread when Bgr565 keeps decoding "successfully" but the output is
     /// suspiciously blank - Vita3K's HLE AVCDEC silently zeroes RGB565 output instead of erroring
@@ -119,6 +122,7 @@ impl DirectVideoOutput {
         let value = match format {
             VideoPixelFormat::Bgr565 => 1,
             VideoPixelFormat::Iyuv => 2,
+            VideoPixelFormat::Rgba8888 => 3,
         };
         self.pixel_format.store(value, Ordering::Release);
     }
@@ -127,6 +131,7 @@ impl DirectVideoOutput {
         match self.pixel_format.load(Ordering::Acquire) {
             1 => Some(VideoPixelFormat::Bgr565),
             2 => Some(VideoPixelFormat::Iyuv),
+            3 => Some(VideoPixelFormat::Rgba8888),
             _ => None,
         }
     }
@@ -163,6 +168,7 @@ impl DirectVideoOutput {
     }
 
     /// Blocks (bounded by `MAX_PENDING_TEXTURE_WAIT`) until a texture is free to write into.
+    #[allow(dead_code)]
     pub fn lock_decode_target(
         &self,
         stalls: &AtomicU64,
@@ -188,6 +194,19 @@ impl DirectVideoOutput {
             Some(index) => index,
             None => state.pending.map(|(index, _)| index)?,
         };
+        state.writing = Some(index);
+        Some(DirectVideoTargetGuard {
+            state,
+            target: targets[index],
+            index,
+            published: false,
+        })
+    }
+
+    pub fn try_lock_decode_target(&self) -> Option<DirectVideoTargetGuard<'_>> {
+        let mut state = self.state.lock().ok()?;
+        let targets = state.targets?;
+        let index = state.free_slot()?;
         state.writing = Some(index);
         Some(DirectVideoTargetGuard {
             state,
@@ -237,24 +256,15 @@ pub struct VideoMetrics {
     pub submitted: AtomicU64,
     /// Access units rejected because the queue was already full - i.e.
     pub queue_full: AtomicU64,
-    /// Calls into `HwVideoDecoder::decode`, and their cumulative wall time.
     pub decode_calls: AtomicU64,
     pub decode_us: AtomicU64,
     /// Decoder consumed the access unit but produced no picture (needs more data).
     pub no_frame: AtomicU64,
     /// Decode returned an error (or panicked); each one forces a decoder rebuild.
     pub decode_errors: AtomicU64,
-    /// Hardware decoder created from scratch (`sceVideodecInitLibrary` + CDRAM).
     pub decoder_rebuilds: AtomicU64,
-    /// `lock_decode_target` gave up waiting for the render thread to free a texture, so the
-    /// previous undisplayed frame was overwritten.
     pub target_stalls: AtomicU64,
-    /// Cumulative time the decode thread spent inside `lock_decode_target` waiting for the render
-    /// thread to hand a texture back.
     ///
-    /// `decode_us` deliberately excludes this, which makes the two easy to confuse: a `dec:` of
-    /// 1 ms alongside a saturated queue reads as "the decoder is idle" when it actually means
-    /// "the decoder is parked". Counted separately so the readout can tell those apart.
     pub target_wait_us: AtomicU64,
     pub target_wait_calls: AtomicU64,
 }

@@ -6,12 +6,13 @@
 use super::active_session;
 use super::error_codes::{GfnError, GfnErrorCode};
 use super::headers::{self, error_for_status_with_body};
+use crate::{log_info, log_warn};
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 const DEFAULT_CLOUDMATCH_BASE_URL: &str = "https://prod.cloudmatchbeta.nvidiagrid.net/";
@@ -90,12 +91,235 @@ pub struct NegotiatedStreamProfile {
     pub codec: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionAdInfo {
+    pub ad_id: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub length_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdAction {
+    Start,
+    Pause,
+    Resume,
+    Finish,
+    Cancel,
+}
+
+impl AdAction {
+    fn code(self) -> u32 {
+        match self {
+            AdAction::Start => 1,
+            AdAction::Pause => 2,
+            AdAction::Resume => 3,
+            AdAction::Finish => 4,
+            AdAction::Cancel => 5,
+        }
+    }
+}
+
+pub async fn report_session_ad(
+    client: &Client,
+    request: &PollSessionRequest<'_>,
+    ad_id: &str,
+    action: AdAction,
+    watched_ms: Option<u64>,
+) -> Result<()> {
+    const SESSION_MODIFY_ACTION_AD_UPDATE: u32 = 6;
+    let base_url = request.session.streaming_base_url.trim_end_matches('/');
+    let url = format!("{base_url}/v2/session/{}", request.session_id);
+    let identity = &request.session.identity;
+    let client_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut ad_update = json!({
+        "adId": ad_id,
+        "adAction": action.code(),
+        "clientTimestamp": client_timestamp,
+    });
+    if let Some(watched_ms) = watched_ms {
+        ad_update["watchedTimeInMs"] = json!(watched_ms);
+        ad_update["pausedTimeInMs"] = json!(0);
+    }
+    let body = json!({
+        "action": SESSION_MODIFY_ACTION_AD_UPDATE,
+        "adUpdates": [ad_update],
+    });
+
+    log_info!(
+        "reportSessionAd: adId={ad_id} action={action:?} watchedMs={watched_ms:?} sessionId={}",
+        request.session_id
+    );
+
+    let response = headers::apply_cloudmatch_headers(
+        client.put(&url),
+        request.token,
+        &identity.client_id,
+        &identity.device_id,
+    )
+    .json(&body)
+    .send()
+    .await
+    .with_context(|| format!("failed to send ad {action:?} for {ad_id}"))?;
+
+    let response = error_for_status_with_body(response)
+        .await
+        .with_context(|| format!("CloudMatch rejected ad {action:?} for {ad_id}"))?;
+
+    let body_text = response
+        .text()
+        .await
+        .context("failed to read ad update response body")?;
+    let payload: CloudMatchResponse = serde_json::from_str(&body_text)
+        .context("failed to decode ad update response")?;
+    if payload.request_status.status_code != 1 {
+        log_warn!(
+            "reportSessionAd: adId={ad_id} action={action:?} rejected: {} ({})",
+            payload.request_status.status_code,
+            payload.request_status.describe()
+        );
+        return Err(payload
+            .request_status
+            .to_error(format!(
+                "ad update rejected: {} ({})",
+                payload.request_status.status_code,
+                payload.request_status.describe()
+            ))
+            .into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum AdPlayback {
+    Playing { started_at: Instant },
+    Finished,
+}
+
+struct QueueAdRunner {
+    ads: Vec<SessionAdInfo>,
+    states: std::collections::HashMap<String, AdPlayback>,
+}
+
+impl QueueAdRunner {
+    fn new() -> Self {
+        Self {
+            ads: Vec::new(),
+            states: std::collections::HashMap::new(),
+        }
+    }
+
+    fn observe(&mut self, ads: Vec<SessionAdInfo>) {
+        if ads.is_empty() {
+            return;
+        }
+        let known: Vec<&str> = self.ads.iter().map(|a| a.ad_id.as_str()).collect();
+        if ads.iter().any(|a| !known.contains(&a.ad_id.as_str())) {
+            log_info!(
+                "QueueAds: ad list now has {} ad(s): {}",
+                ads.len(),
+                ads.iter()
+                    .map(|a| {
+                        format!(
+                            "{}({}s)",
+                            &a.ad_id[..a.ad_id.len().min(24)],
+                            a.length_ms.unwrap_or(0) / 1000
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        self.ads = ads;
+    }
+
+    fn current_ad(&self) -> Option<&SessionAdInfo> {
+        self.ads
+            .iter()
+            .find(|ad| !matches!(self.states.get(&ad.ad_id), Some(AdPlayback::Finished)))
+    }
+
+    fn progress_pct(&self) -> f32 {
+        let Some(ad) = self.current_ad() else {
+            return 1.0;
+        };
+        match self.states.get(&ad.ad_id) {
+            Some(AdPlayback::Playing { started_at }) => {
+                let length_ms = ad.length_ms.unwrap_or(15_000).max(1) as f32;
+                let elapsed_ms = started_at.elapsed().as_millis() as f32;
+                (elapsed_ms / length_ms).min(1.0)
+            }
+            Some(AdPlayback::Finished) => 1.0,
+            None => 0.0,
+        }
+    }
+
+    fn has_pending_ad(&self) -> bool {
+        self.current_ad().is_some()
+    }
+
+    async fn tick(&mut self, client: &Client, request: &PollSessionRequest<'_>) {
+        let Some(ad) = self.current_ad().cloned() else {
+            return;
+        };
+
+        match self.states.get(&ad.ad_id).copied() {
+            None => {
+                match report_session_ad(client, request, &ad.ad_id, AdAction::Start, None).await {
+                    Ok(()) => {
+                        self.states.insert(
+                            ad.ad_id.clone(),
+                            AdPlayback::Playing {
+                                started_at: Instant::now(),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        log_warn!("QueueAds: failed to start ad {}: {error:#}", ad.ad_id);
+                    }
+                }
+            }
+            Some(AdPlayback::Playing { started_at }) => {
+                let length_ms = ad.length_ms.unwrap_or(15_000);
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                if elapsed_ms < length_ms {
+                    return;
+                }
+                match report_session_ad(
+                    client,
+                    request,
+                    &ad.ad_id,
+                    AdAction::Finish,
+                    Some(elapsed_ms),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        log_info!("QueueAds: finished ad after {elapsed_ms}ms");
+                        self.states.insert(ad.ad_id.clone(), AdPlayback::Finished);
+                    }
+                    Err(error) => {
+                        log_warn!("QueueAds: failed to finish ad {}: {error:#}", ad.ad_id);
+                    }
+                }
+            }
+            Some(AdPlayback::Finished) => {}
+        }
+    }
+}
+
 /// CloudMatch session creation request.
 pub struct CreateSessionRequest<'a> {
     pub token: &'a str,
     pub app_id: &'a str,
     pub vpc_id: &'a str,
     pub settings: &'a StreamSettings,
+    pub zone_base_url: &'a str,
+    pub language_code: &'a str,
 }
 
 /// CloudMatch session poll request.
@@ -117,7 +341,24 @@ pub async fn create_session(
         client_id: uuid::Uuid::new_v4().to_string(),
         device_id: super::auth::device_id(),
     };
-    let base_url = DEFAULT_CLOUDMATCH_BASE_URL.trim_end_matches('/');
+    let provider_url = super::auth::load_tokens()
+        .and_then(|t| t.provider)
+        .map(|p| p.normalized_streaming_url());
+    let default_url = provider_url.as_deref().unwrap_or(DEFAULT_CLOUDMATCH_BASE_URL);
+    let global_base_url = default_url.trim_end_matches('/');
+    let base_url = match normalize_zone_base_url(request.zone_base_url) {
+        Some(zone) => {
+            log_info!("Creating session on pinned zone {zone}");
+            zone
+        }
+        None => global_base_url.to_owned(),
+    };
+    let base_url = base_url.as_str();
+    let cleanup_bases: Vec<&str> = if base_url == global_base_url {
+        vec![global_base_url]
+    } else {
+        vec![base_url, global_base_url]
+    };
     let (width, height) = request.settings.dimensions();
 
     let body = build_session_request_body(
@@ -127,8 +368,15 @@ pub async fn create_session(
         height,
         request.settings.fps,
     );
+    let language_code = match request.language_code.trim() {
+        "" => DEFAULT_LOCALE,
+        candidate => crate::gfn::stream_prefs::GameLanguage::ALL
+            .into_iter()
+            .find(|language| language.code() == candidate)
+            .map_or(DEFAULT_LOCALE, |language| language.code()),
+    };
     let url = format!(
-        "{base_url}/v2/session?keyboardLayout={DEFAULT_KEYBOARD_LAYOUT}&languageCode={DEFAULT_LOCALE}"
+        "{base_url}/v2/session?keyboardLayout={DEFAULT_KEYBOARD_LAYOUT}&languageCode={language_code}"
     );
 
     // Clear the decks first. Anything still open would reject this launch anyway, and finding that
@@ -136,7 +384,7 @@ pub async fn create_session(
     //
     // our own note goes first, its the only thing that survives a crash and knows the zone
     stop_remembered_session(client, request.token, &identity).await;
-    stop_active_sessions_before_launch(client, request.token, &identity, base_url).await;
+    stop_active_sessions_before_launch(client, request.token, &identity, &cleanup_bases).await;
 
     let send_request = || async {
         let mut last_err = None;
@@ -171,7 +419,7 @@ pub async fn create_session(
                                 request.token,
                                 Some(&payload),
                                 &identity,
-                                base_url,
+                                &cleanup_bases,
                             )
                             .await
                         {
@@ -198,7 +446,7 @@ pub async fn create_session(
                             request.token,
                             limit_payload.as_ref(),
                             &identity,
-                            base_url,
+                            &cleanup_bases,
                         )
                         .await
                             && let Some(limit_payload) = limit_payload
@@ -225,7 +473,7 @@ pub async fn create_session(
                         throttled += 1;
                         let wait = retry_after(&headers)
                             .unwrap_or_else(|| Duration::from_secs(2 << throttled.min(3)));
-                        eprintln!(
+                        log_warn!(
                             "CloudMatch replied {status}, waiting {:?} before retry {throttled}",
                             wait
                         );
@@ -261,7 +509,7 @@ pub async fn create_session(
         if !was_limit_exceeded {
             break payload;
         }
-        if cleanups >= 2 {
+        if cleanups >= 15 {
             // still hitting the limit after cleanup means its a session this device cant
             // delete, report it as the per-device limit and let the error screen explain
             return Err(GfnError::new(
@@ -306,6 +554,8 @@ pub struct QueueStatus {
     pub was_queued: bool,
     // rig is patching the game, can take a while so we tell the player instead of looking stuck
     pub app_patching: bool,
+    pub has_video_ad: bool,
+    pub ad_progress_pct: f32,
 }
 
 pub type QueueProgressTracker = Arc<std::sync::Mutex<QueueStatus>>;
@@ -328,6 +578,7 @@ pub async fn poll_session(
     const MAX_CONSECUTIVE_SERVER_ERRORS: usize = 12;
     const SERVER_ERROR_BACKOFF_CAP: Duration = Duration::from_secs(15);
     let mut consecutive_server_errors = 0usize;
+    let mut ad_runner = QueueAdRunner::new();
 
     for attempt in 0..MAX_ATTEMPTS {
         let response = match headers::apply_cloudmatch_headers(
@@ -442,6 +693,37 @@ pub async fn poll_session(
             .as_ref()
             .context("CloudMatch poll response had no session")?;
 
+        if body_text.contains("sessionAds") || body_text.contains("AdsRequired") {
+            let raw_ads = serde_json::from_str::<serde_json::Value>(&body_text)
+                .ok()
+                .map(|v| {
+                    format!(
+                        "sessionAdsRequired={} sessionAds={}",
+                        v["session"]["sessionAdsRequired"],
+                        v["session"]["sessionAds"]
+                    )
+                })
+                .unwrap_or_default();
+            log_info!(
+                "QueueAds: poll {attempt} status={} queuePos={:?} raw: {}",
+                session.status,
+                session.seat_setup_info.as_ref().map(|s| s.queue_position),
+                raw_ads.chars().take(1500).collect::<String>()
+            );
+        }
+
+        if let Some(ads) = &session.session_ads {
+            let parsed: Vec<SessionAdInfo> = ads
+                .iter()
+                .cloned()
+                .filter_map(CloudMatchSessionAd::into_session_ad_info)
+                .collect();
+            ad_runner.observe(parsed);
+        }
+        if ad_runner.has_pending_ad() {
+            ad_runner.tick(client, &request).await;
+        }
+
         if let Some(tr) = &tracker {
             if let Ok(mut st) = tr.lock() {
                 st.attempt = attempt + 1;
@@ -451,6 +733,8 @@ pub async fn poll_session(
                     st.eta_ms = seat.seat_setup_eta;
                     st.was_queued |= seat.queue_position > 0;
                 }
+                st.has_video_ad = ad_runner.has_pending_ad();
+                st.ad_progress_pct = ad_runner.progress_pct();
             }
         }
 
@@ -545,6 +829,28 @@ pub async fn stop_session_by_id(
     identity: &SessionIdentity,
     base_url: &str,
 ) -> StopOutcome {
+    match delete_session_once(client, token, session_id, identity, base_url).await {
+        DeleteOutcome::Deleted | DeleteOutcome::NotFound => StopOutcome::Stopped,
+        DeleteOutcome::Forbidden => StopOutcome::Forbidden,
+        DeleteOutcome::Failed => StopOutcome::Failed,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteOutcome {
+    Deleted,
+    NotFound,
+    Forbidden,
+    Failed,
+}
+
+async fn delete_session_once(
+    client: &Client,
+    token: &str,
+    session_id: &str,
+    identity: &SessionIdentity,
+    base_url: &str,
+) -> DeleteOutcome {
     let base_url = base_url.trim_end_matches('/');
     let url = format!("{base_url}/v2/session/{session_id}");
 
@@ -557,25 +863,50 @@ pub async fn stop_session_by_id(
     .send()
     .await
     else {
-        eprintln!("CloudMatch stop for session {session_id} could not be sent");
-        return StopOutcome::Failed;
+        log_warn!("CloudMatch stop for session {session_id} could not be sent");
+        return DeleteOutcome::Failed;
     };
 
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
-    // 404 means the session is already gone, which is exactly the state we wanted.
-    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-        return StopOutcome::Stopped;
+    if status.is_success() {
+        return DeleteOutcome::Deleted;
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return DeleteOutcome::NotFound;
     }
     if status == reqwest::StatusCode::FORBIDDEN {
-        eprintln!(
+        log_warn!(
             "CloudMatch refused to stop session {session_id} (HTTP 403); it belongs to another \
              device identity and has to expire on its own"
         );
-        return StopOutcome::Forbidden;
+        return DeleteOutcome::Forbidden;
     }
-    eprintln!("CloudMatch stop for session {session_id} failed: HTTP {status}: {body}");
-    StopOutcome::Failed
+    log_warn!("CloudMatch stop for session {session_id} failed: HTTP {status}: {body}");
+    DeleteOutcome::Failed
+}
+
+async fn stop_session_across_zones(
+    client: &Client,
+    token: &str,
+    session_id: &str,
+    identity: &SessionIdentity,
+    bases: &[&str],
+) -> StopOutcome {
+    let mut missing_everywhere = true;
+    for base in bases {
+        match delete_session_once(client, token, session_id, identity, base).await {
+            DeleteOutcome::Deleted => return StopOutcome::Stopped,
+            DeleteOutcome::NotFound => {}
+            DeleteOutcome::Forbidden => return StopOutcome::Forbidden,
+            DeleteOutcome::Failed => missing_everywhere = false,
+        }
+    }
+    if missing_everywhere {
+        StopOutcome::Stopped
+    } else {
+        StopOutcome::Failed
+    }
 }
 
 // deletes at the session's own zone url, not the generic entrypoint, sessions only
@@ -608,40 +939,51 @@ pub async fn get_active_sessions(
     client: &Client,
     token: &str,
     identity: &SessionIdentity,
+    bases: &[&str],
 ) -> Result<Vec<String>> {
-    let base_url = DEFAULT_CLOUDMATCH_BASE_URL.trim_end_matches('/');
-    let url = format!("{base_url}/v2/session");
-
-    // Deliberately the launch's own identity rather than a fresh random one: CloudMatch scopes the
-    // per-device session limit by these headers, so listing under a different client id can hide
-    // the very sessions that are blocking us.
-    let response = headers::apply_cloudmatch_headers(
-        client.get(&url),
-        token,
-        &identity.client_id,
-        &identity.device_id,
-    )
-    .send()
-    .await?;
-    let body_text = response.text().await.unwrap_or_default();
-    let payload: GetSessionsResponse = match serde_json::from_str(&body_text) {
-        Ok(payload) => payload,
-        Err(error) => {
-            // Worth shouting about: the caller treats a failure here as "no zombies found", so a
-            // silent decode error looks exactly like a clean account while launches keep failing.
-            eprintln!("Could not read CloudMatch active sessions: {error}: {body_text}");
-            return Err(anyhow::Error::new(error)
-                .context("failed to decode CloudMatch active sessions response"));
-        }
+    let mut all_sessions = Vec::new();
+    let query_bases: Vec<&str> = if bases.is_empty() {
+        vec![DEFAULT_CLOUDMATCH_BASE_URL.trim_end_matches('/')]
+    } else {
+        bases.to_vec()
     };
 
-    Ok(payload
-        .sessions
-        .into_iter()
-        .filter(|s| s.status.occupies_device_slot())
-        .filter_map(|s| s.session_id.map(|id| id.as_string()))
-        .filter(|id| !id.is_empty())
-        .collect())
+    for base in query_bases {
+        let base_url = base.trim_end_matches('/');
+        let url = format!("{base_url}/v2/session");
+
+        let response = headers::apply_cloudmatch_headers(
+            client.get(&url),
+            token,
+            &identity.client_id,
+            &identity.device_id,
+        )
+        .send()
+        .await?;
+        let body_text = response.text().await.unwrap_or_default();
+        let payload: GetSessionsResponse = match serde_json::from_str(&body_text) {
+            Ok(payload) => payload,
+            Err(error) => {
+                log_warn!("Could not read CloudMatch active sessions from {base_url}: {error}: {body_text}");
+                continue;
+            }
+        };
+
+        for s in payload.sessions {
+            if s.status.occupies_device_slot()
+                && let Some(id) = s.session_id
+            {
+                let id_str = id.as_string();
+                if !id_str.is_empty() {
+                    all_sessions.push(id_str);
+                }
+            }
+        }
+    }
+
+    all_sessions.sort();
+    all_sessions.dedup();
+    Ok(all_sessions)
 }
 
 /// Deletes every session squatting on this device id: the ones the error payload names, or -
@@ -653,7 +995,7 @@ async fn stop_conflicting_sessions(
     token: &str,
     payload: Option<&CloudMatchResponse>,
     identity: &SessionIdentity,
-    base_url: &str,
+    bases: &[&str],
 ) -> bool {
     let mut old_ids = Vec::new();
     if let Some(payload) = payload {
@@ -668,11 +1010,11 @@ async fn stop_conflicting_sessions(
             }
         }
     }
-    if old_ids.is_empty() {
-        old_ids = get_active_sessions(client, token, identity)
+    old_ids.extend(
+        get_active_sessions(client, token, identity, bases)
             .await
-            .unwrap_or_default();
-    }
+            .unwrap_or_default(),
+    );
     old_ids.retain(|id| !id.is_empty());
     // `dedup` only collapses *adjacent* duplicates, so the same id named by both the payload's
     // session and `otherUserSessions` would otherwise be deleted twice.
@@ -681,8 +1023,8 @@ async fn stop_conflicting_sessions(
 
     let mut stopped_any = false;
     for old_id in &old_ids {
-        eprintln!("CloudMatch session limit hit; stopping zombie session {old_id}");
-        if stop_session_by_id(client, token, old_id, identity, base_url).await
+        log_warn!("CloudMatch session limit hit; stopping zombie session {old_id}");
+        if stop_session_across_zones(client, token, old_id, identity, bases).await
             == StopOutcome::Stopped
         {
             stopped_any = true;
@@ -695,7 +1037,7 @@ async fn stop_conflicting_sessions(
     // A 200 on the DELETE only means NVIDIA accepted the request. Deprovisioning a rig that was
     // mid-setup takes appreciably longer than that, and retrying the launch before the slot is
     // actually released just spends an attempt on the same limit error.
-    wait_for_sessions_to_clear(client, token, identity).await
+    wait_for_sessions_to_clear(client, token, identity, bases).await
 }
 
 // cleans up a session we recorded but never confirmed closed (crash/force-quit path).
@@ -711,17 +1053,17 @@ async fn stop_remembered_session(client: &Client, token: &str, identity: &Sessio
         &stale.streaming_base_url
     };
 
-    eprintln!(
+    log_warn!(
         "Ending the session left over from a previous run: {}",
         stale.session_id
     );
     match stop_session_by_id(client, token, &stale.session_id, identity, base_url).await {
         StopOutcome::Stopped => {
             active_session::forget(&stale.session_id);
-            wait_for_sessions_to_clear(client, token, identity).await;
+            wait_for_sessions_to_clear(client, token, identity, &[base_url]).await;
         }
         StopOutcome::Forbidden => {
-            eprintln!(
+            log_warn!(
                 "Session {} belongs to an older device identity and has to expire on its own; \
                  dropping the note so it stops blocking launches",
                 stale.session_id
@@ -745,9 +1087,9 @@ async fn stop_active_sessions_before_launch(
     client: &Client,
     token: &str,
     identity: &SessionIdentity,
-    base_url: &str,
+    bases: &[&str],
 ) {
-    let Ok(active) = get_active_sessions(client, token, identity).await else {
+    let Ok(active) = get_active_sessions(client, token, identity, bases).await else {
         // Can't tell, so just launch: the session-limit handler is still there as a backstop.
         return;
     };
@@ -755,21 +1097,21 @@ async fn stop_active_sessions_before_launch(
         return;
     }
 
-    eprintln!(
+    log_warn!(
         "Ending {} session(s) still open before launching: {}",
         active.len(),
         active.join(", ")
     );
     let mut stopped_any = false;
     for session_id in &active {
-        if stop_session_by_id(client, token, session_id, identity, base_url).await
+        if stop_session_across_zones(client, token, session_id, identity, bases).await
             == StopOutcome::Stopped
         {
             stopped_any = true;
         }
     }
     if stopped_any {
-        wait_for_sessions_to_clear(client, token, identity).await;
+        wait_for_sessions_to_clear(client, token, identity, bases).await;
     }
 }
 
@@ -781,19 +1123,20 @@ async fn wait_for_sessions_to_clear(
     client: &Client,
     token: &str,
     identity: &SessionIdentity,
+    bases: &[&str],
 ) -> bool {
     const MAX_CHECKS: usize = 8;
     const CHECK_INTERVAL: Duration = Duration::from_secs(3);
 
     for check in 0..MAX_CHECKS {
         sleep(CHECK_INTERVAL).await;
-        match get_active_sessions(client, token, identity).await {
+        match get_active_sessions(client, token, identity, bases).await {
             Ok(remaining) if remaining.is_empty() => {
-                eprintln!("CloudMatch device slot is clear after {}s", (check + 1) * 3);
+                log_warn!("CloudMatch device slot is clear after {}s", (check + 1) * 3);
                 return true;
             }
             Ok(remaining) => {
-                eprintln!(
+                log_warn!(
                     "Waiting for CloudMatch to release {} session(s): {}",
                     remaining.len(),
                     remaining.join(", ")
@@ -801,17 +1144,22 @@ async fn wait_for_sessions_to_clear(
             }
             // Can't tell - assume it cleared rather than blocking a launch that might work.
             Err(error) => {
-                eprintln!("Could not confirm CloudMatch session cleanup: {error:#}");
+                log_warn!("Could not confirm CloudMatch session cleanup: {error:#}");
                 return true;
             }
         }
     }
-    eprintln!("CloudMatch still reports active sessions after {MAX_CHECKS} checks");
+    log_warn!("CloudMatch still reports active sessions after {MAX_CHECKS} checks");
     false
 }
 
 fn is_ready_status(status: u32) -> bool {
     status == 2 || status == 3
+}
+
+fn normalize_zone_base_url(zone_base_url: &str) -> Option<String> {
+    let normalized = super::regions::normalize_base_url(zone_base_url)?;
+    Some(normalized.trim_end_matches('/').to_owned())
 }
 
 /// Zone load balancer hostnames (e.g.
@@ -949,7 +1297,7 @@ fn build_session_request_body(
             "remoteControllersBitmap": 0,
             "clientTimezoneOffset": 0,
             "enhancedStreamMode": 1,
-            "appLaunchMode": 0,
+            "appLaunchMode": 2,
             "secureRTSPSupported": false,
             "partnerCustomData": "",
             "accountLinked": true,
@@ -964,8 +1312,8 @@ fn build_session_request_body(
                 "profile": 0,
                 "fallbackToLogicalResolution": false,
                 "chromaFormat": 0,
-                "prefilterMode": 0,
-                "prefilterSharpness": 0,
+                "prefilterMode": 1,
+                "prefilterSharpness": 50,
                 "prefilterNoiseReduction": 0,
                 "hudStreamingMode": 0,
             }
@@ -1277,6 +1625,41 @@ struct CloudMatchSession {
     ice_server_configuration: Option<IceServerConfiguration>,
     #[serde(default)]
     session_request_data: Option<CloudMatchSessionRequestData>,
+    #[serde(default, alias = "ads")]
+    session_ads: Option<Vec<CloudMatchSessionAd>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudMatchSessionAd {
+    #[serde(default)]
+    ad_id: Option<FlexibleString>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    ad_length_in_seconds: Option<f64>,
+    #[serde(default)]
+    duration_ms: Option<u64>,
+}
+
+impl CloudMatchSessionAd {
+    fn into_session_ad_info(self) -> Option<SessionAdInfo> {
+        let ad_id = self.ad_id?.as_string();
+        if ad_id.is_empty() {
+            return None;
+        }
+        let length_ms = self
+            .duration_ms
+            .or_else(|| self.ad_length_in_seconds.map(|secs| (secs * 1000.0) as u64));
+        Some(SessionAdInfo {
+            ad_id,
+            title: self.title,
+            description: self.description,
+            length_ms,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

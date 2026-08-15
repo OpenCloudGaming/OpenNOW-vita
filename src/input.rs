@@ -22,6 +22,8 @@ pub enum InputCommand {
     MoveDown,
     MoveLeft,
     MoveRight,
+    PrevTab,
+    NextTab,
 }
 
 /// Top-level command enum the shell feeds into `App::handle_command`.
@@ -40,10 +42,10 @@ pub enum AppCommand {
     SetLocale(crate::locale::Locale),
     /// Emitted by the catalog screen's sort picker.
     SetSort(crate::app::CatalogSort),
-    // my games / all games picker next to sort
     SetFilter(crate::app::CatalogFilter),
     /// Emitted by the stream-quality section of the account popup.
     SetStreamFps(crate::gfn::stream_prefs::StreamFps),
+    ToggleSessionTimer,
     /// Emitted by the rear-trigger section of the account popup.
     SetTriggerIntensity(crate::gfn::stream_prefs::TriggerIntensity),
     /// Closes the first-run controls explainer for good.
@@ -54,14 +56,22 @@ pub enum AppCommand {
     ToggleStreamStats,
     /// Shows or hides the in-game keyboard.
     ToggleKeyboard,
-    /// A key tapped on the streaming overlay's special-key row.
     SendKey(crate::gfn::input_protocol::KeyStroke),
+    SendChord {
+        ctrl: bool,
+        alt: bool,
+        key: crate::gfn::input_protocol::KeyStroke,
+    },
+    ToggleKeyShift,
+    ToggleKeyCtrl,
+    ToggleKeyAlt,
     /// Emitted by the stick-zone section of the settings modal.
     SetStickZones(crate::gfn::stream_prefs::StickZones),
     /// from the rear-touch layout picker in settings
     SetRearTouchMode(crate::gfn::stream_prefs::RearTouchMode),
     /// Emitted by the volume-boost section of the account popup.
     SetAudioBoost(crate::gfn::stream_prefs::AudioBoost),
+    SetColorDepth(crate::gfn::stream_prefs::ColorDepth),
     /// Emitted when a row in the catalog list is tapped/clicked.
     SelectGame(usize),
     /// Toggles the streaming toolbar between expanded and collapsed.
@@ -74,6 +84,21 @@ pub enum AppCommand {
     ToggleMouseTrackpad,
     /// bumps the bitrate mid session, kbps
     SetMaxBitrate(u32),
+    SetRegion(String),
+    LoadRegions,
+    TestRegionLatency,
+    OpenSettings,
+    CloseSettings,
+    SetSettingsTab(crate::app::settings_menu::SettingsTab),
+    ExpandSettingsRow(Option<usize>),
+    ChooseSettingsOption(usize, usize),
+    ToggleGameProfile,
+    ToggleTriggerSwap,
+    SetGameLanguage(crate::gfn::stream_prefs::GameLanguage),
+    CloseServerPicker,
+    FocusServerPicker(usize),
+    LaunchOnServer(String),
+    LoadQueueStats,
 }
 
 impl From<InputCommand> for AppCommand {
@@ -120,6 +145,14 @@ pub fn map_controller_button_event(event: &Event) -> Option<AppCommand> {
         Event::ControllerButtonDown {
             button: Button::A, ..
         } => Some(InputCommand::Confirm.into()),
+        Event::ControllerButtonDown {
+            button: Button::LeftShoulder,
+            ..
+        } => Some(InputCommand::PrevTab.into()),
+        Event::ControllerButtonDown {
+            button: Button::RightShoulder,
+            ..
+        } => Some(InputCommand::NextTab.into()),
         _ => None,
     }
 }
@@ -651,31 +684,57 @@ pub fn gamepad_snapshot(
     set(Button::Back, BACK);
     set(Button::LeftStick, LEFT_THUMB);
     set(Button::RightStick, RIGHT_THUMB);
-    set(Button::LeftShoulder, LEFT_SHOULDER);
-    set(Button::RightShoulder, RIGHT_SHOULDER);
     set(Button::A, A);
     set(Button::B, B);
     set(Button::X, X);
     set(Button::Y, Y);
 
-    // L3/R3 can come from either front corners or rear quadrants, whichever fires
-    if stick_zones.left_stick_click() || rear_touch.left_stick_click() {
-        buttons |= LEFT_THUMB;
-    }
-    if stick_zones.right_stick_click() || rear_touch.right_stick_click() {
-        buttons |= RIGHT_THUMB;
-    }
-
     let axis = |axis: Axis| controller.axis(axis);
     let trigger = |value: i16| (value.max(0) / 129).min(255) as u8;
+
+    let swap_triggers = crate::gfn::stream_prefs::trigger_swap_enabled();
+    let phys_l1 = controller.button(Button::LeftShoulder);
+    let phys_r1 = controller.button(Button::RightShoulder);
+    let phys_l2 = trigger(axis(Axis::TriggerLeft)).max(rear_touch.left_trigger());
+    let phys_r2 = trigger(axis(Axis::TriggerRight)).max(rear_touch.right_trigger());
+    let (left_shoulder_down, right_shoulder_down, left_trigger_val, right_trigger_val) =
+        if swap_triggers {
+            (
+                phys_l2 > 0,
+                phys_r2 > 0,
+                if phys_l1 { 255 } else { 0 },
+                if phys_r1 { 255 } else { 0 },
+            )
+        } else {
+            (phys_l1, phys_r1, phys_l2, phys_r2)
+        };
+    if left_shoulder_down {
+        buttons |= LEFT_SHOULDER;
+    }
+    if right_shoulder_down {
+        buttons |= RIGHT_SHOULDER;
+    }
+
+    if controller.button(Button::LeftStick)
+        || stick_zones.left_stick_click()
+        || rear_touch.left_stick_click()
+    {
+        buttons |= LEFT_THUMB;
+    }
+    if controller.button(Button::RightStick)
+        || stick_zones.right_stick_click()
+        || rear_touch.right_stick_click()
+    {
+        buttons |= RIGHT_THUMB;
+    }
 
     crate::gfn::input_protocol::GamepadInput {
         controller_id: 0,
         buttons,
         // Whichever source is pressing harder wins, so an attached DualShock on a Vita TV still
         // works while the rear panel covers the handheld.
-        left_trigger: trigger(axis(Axis::TriggerLeft)).max(rear_touch.left_trigger()),
-        right_trigger: trigger(axis(Axis::TriggerRight)).max(rear_touch.right_trigger()),
+        left_trigger: left_trigger_val,
+        right_trigger: right_trigger_val,
         left_stick_x: axis(Axis::LeftX),
         left_stick_y: axis(Axis::LeftY).saturating_neg(),
         right_stick_x: axis(Axis::RightX),

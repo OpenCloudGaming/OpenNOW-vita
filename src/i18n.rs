@@ -4,6 +4,7 @@ use crate::locale::Locale;
 use fluent_bundle::{FluentArgs, FluentBundle, FluentResource, FluentValue};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use unic_langid::LanguageIdentifier;
 
 type Bundle = FluentBundle<FluentResource>;
@@ -17,26 +18,43 @@ impl I18n {
         Self { locale }
     }
 
+    pub fn locale(&self) -> Locale {
+        self.locale
+    }
+
     /// Resolves `id` in the current locale, falling back to `en-US`, then to `id` itself.
-    pub fn text(&self, id: &'static str) -> String {
+    pub fn text(&self, id: &'static str) -> Rc<str> {
         thread_local! {
-            static CACHE: RefCell<HashMap<(Locale, &'static str), String>> =
+            static CACHE: RefCell<HashMap<(Locale, &'static str), Rc<str>>> =
                 RefCell::new(HashMap::new());
         }
         CACHE.with(|cell| {
             if let Some(cached) = cell.borrow().get(&(self.locale, id)) {
-                return cached.clone();
+                return Rc::clone(cached);
             }
-            let resolved = self.text_with_args(id, None);
+            let resolved: Rc<str> = self.text_with_args(id, None).into();
             cell.borrow_mut()
-                .insert((self.locale, id), resolved.clone());
+                .insert((self.locale, id), Rc::clone(&resolved));
             resolved
         })
     }
 
     /// Like [`I18n::text`], with Fluent arguments interpolated into the message.
-    pub fn text_with<'a>(&self, id: &'static str, args: FluentArgs<'a>) -> String {
-        self.text_with_args(id, Some(&args))
+    pub fn text_with<'a>(&self, id: &'static str, args: FluentArgs<'a>) -> Rc<str> {
+        let fingerprint = args_fingerprint(&args);
+        thread_local! {
+            static CACHE: RefCell<HashMap<(Locale, &'static str, String), Rc<str>>> =
+                RefCell::new(HashMap::new());
+        }
+        CACHE.with(|cell| {
+            let key = (self.locale, id, fingerprint);
+            if let Some(cached) = cell.borrow().get(&key) {
+                return Rc::clone(cached);
+            }
+            let resolved: Rc<str> = self.text_with_args(id, Some(&args)).into();
+            cell.borrow_mut().insert(key, Rc::clone(&resolved));
+            resolved
+        })
     }
 
     fn text_with_args(&self, id: &'static str, args: Option<&FluentArgs<'_>>) -> String {
@@ -49,6 +67,21 @@ impl I18n {
 /// Wraps an owned string as a [`FluentValue`] argument.
 pub fn arg_string(value: impl Into<String>) -> FluentValue<'static> {
     FluentValue::String(value.into().into())
+}
+
+fn args_fingerprint(args: &FluentArgs<'_>) -> String {
+    let mut out = String::new();
+    for (key, value) in args.iter() {
+        out.push_str(key);
+        out.push('=');
+        match value {
+            FluentValue::String(s) => out.push_str(s),
+            FluentValue::Number(n) => out.push_str(&n.as_string()),
+            other => out.push_str(&format!("{other:?}")),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn format_message(

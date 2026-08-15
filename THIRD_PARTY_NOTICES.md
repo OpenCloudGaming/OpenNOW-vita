@@ -56,3 +56,9 @@ This project uses green-vita's fork of the `rtc`/`rtc-media`/`ring` crates, patc
 for `armv7-sony-vita-newlibeabihf` (https://github.com/Day-OS/rtc, `vita` branch;
 https://github.com/vita-rust/ring, `v0.17.14-vita` branch), for the WebRTC peer connection
 (ICE/DTLS/SRTP) and H.264 RTP depacketization.
+
+## Noto Sans CJK JP (SIL Open Font License 1.1)
+
+`assets/fonts/NotoSansJP-Subset.otf` is a subset of Google's Noto Sans CJK JP (kana +
+Jōyō/Jinmeiyō kanji) used as an egui fallback so Japanese catalog titles render instead of
+tofu boxes. Full license text: `assets/fonts/LICENSE-Noto-CJK.txt`.

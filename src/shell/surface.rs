@@ -2,7 +2,7 @@
 // https://github.com/Day-OS/green-vita) src/shell/surface.rs. See THIRD_PARTY_NOTICES.md.
 
 use crate::gfn::peer::PeerEngine;
-use crate::shell::egui_painter::SdlEguiPainter;
+use crate::shell::egui_painter::{PaintStats, SdlEguiPainter};
 use crate::streaming::video::{
     DirectVideoOutput, VIDEO_TEXTURE_COUNT, VideoPixelFormat, VideoTextureTarget,
 };
@@ -12,6 +12,16 @@ use sdl2::render::{Canvas, Texture};
 use sdl2::video::Window;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+#[derive(Default, Clone, Copy)]
+pub struct FramePaintStats {
+    pub texture_apply_secs: f64,
+    pub geometry_secs: f64,
+    pub present_secs: f64,
+    pub draw_calls: u32,
+    pub textures_uploaded: u32,
+    pub vertices_drawn: u32,
+}
 
 pub const WIDTH: u32 = 960;
 pub const HEIGHT: u32 = 544;
@@ -35,13 +45,6 @@ pub struct VitaSurface {
 
 impl VitaSurface {
     pub fn new(video: &sdl2::VideoSubsystem) -> Result<Self> {
-        // Must be set before any texture is created: SDL captures the scale mode at creation time,
-        // and SDL's Vita backend maps it straight to a gxm texture filter
-        // (`SCE_GXM_TEXTURE_FILTER_LINEAR` vs `POINT`).
-        //
-        // Without it SDL defaults to nearest, so the 1280x720 stream was being downscaled to the
-        // Vita's 960x544 by dropping pixels - free on the GPU either way, but nearest shimmers on
-        // anything that moves. Linear costs nothing: the texture unit filters in hardware.
         sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "1");
 
         let window = video
@@ -80,7 +83,11 @@ impl VitaSurface {
 
     /// Registers/releases the direct video textures as streaming starts/stops and flips to the
     /// most recently published frame.
-    pub fn sync_video_frame(&mut self, streaming: Option<&PeerEngine>) -> Result<()> {
+    pub fn sync_video_frame(
+        &mut self,
+        streaming: Option<&PeerEngine>,
+        latest_video: Option<&(u64, crate::streaming::video::DecodedFrame)>,
+    ) -> Result<()> {
         let Some(streaming) = streaming else {
             self.detach_direct_video_output();
             return Ok(());
@@ -94,10 +101,10 @@ impl VitaSurface {
         }
         self.ensure_direct_video_output(streaming)?;
 
-        let Some((frame_id, frame)) = streaming.video_frame() else {
+        let Some((frame_id, frame)) = latest_video else {
             return Ok(());
         };
-        if frame_id == self.last_frame_id {
+        if *frame_id == self.last_frame_id {
             return Ok(());
         }
         let index = frame.texture_index;
@@ -108,7 +115,7 @@ impl VitaSurface {
             output.mark_displayed(index, frame.generation);
         }
         self.displayed_video_texture = Some(index);
-        self.last_frame_id = frame_id;
+        self.last_frame_id = *frame_id;
         Ok(())
     }
 
@@ -132,8 +139,8 @@ impl VitaSurface {
         let (width, height) = (output.width, output.height);
         let force_iyuv = self.force_iyuv;
         let mut format = VideoPixelFormat::Bgr565;
-        let mut create_targets = |pixel_format: PixelFormatEnum| -> Result<[Texture; VIDEO_TEXTURE_COUNT]> {
-            let mut create_one = || {
+        let create_targets = |pixel_format: PixelFormatEnum| -> Result<[Texture; VIDEO_TEXTURE_COUNT]> {
+            let create_one = || {
                 self.canvas
                     .create_texture_streaming(pixel_format, width, height)
                     .map_err(anyhow::Error::msg)
@@ -141,17 +148,32 @@ impl VitaSurface {
             };
             Ok([create_one()?, create_one()?, create_one()?])
         };
+        let want_32_bit = crate::gfn::stream_prefs::color_depth()
+            == crate::gfn::stream_prefs::ColorDepth::ThirtyTwoBit;
         let mut textures = if force_iyuv {
             format = VideoPixelFormat::Iyuv;
             create_targets(PixelFormatEnum::IYUV)?
         } else {
-            match create_targets(PixelFormatEnum::BGR565) {
-                Ok(textures) => textures,
-                Err(error) => {
-                    eprintln!("BGR565 video textures unavailable ({error:#}); using IYUV");
-                    format = VideoPixelFormat::Iyuv;
-                    create_targets(PixelFormatEnum::IYUV)?
+            let thirty_two = want_32_bit
+                .then(|| create_targets(PixelFormatEnum::ABGR8888))
+                .transpose()
+                .unwrap_or_else(|error| {
+                    eprintln!("ABGR8888 video textures unavailable ({error:#}); using BGR565");
+                    None
+                });
+            match thirty_two {
+                Some(textures) => {
+                    format = VideoPixelFormat::Rgba8888;
+                    textures
                 }
+                None => match create_targets(PixelFormatEnum::BGR565) {
+                    Ok(textures) => textures,
+                    Err(error) => {
+                        eprintln!("BGR565 video textures unavailable ({error:#}); using IYUV");
+                        format = VideoPixelFormat::Iyuv;
+                        create_targets(PixelFormatEnum::IYUV)?
+                    }
+                },
             }
         };
         let record_targets =
@@ -237,16 +259,31 @@ impl VitaSurface {
         pixels_per_point: f32,
         primitives: &[egui::ClippedPrimitive],
         textures_delta: &egui::TexturesDelta,
-    ) -> Result<()> {
-        self.egui_painter.paint(
+    ) -> Result<FramePaintStats> {
+        let PaintStats {
+            texture_apply_secs,
+            geometry_secs,
+            draw_calls,
+            textures_uploaded,
+            vertices_drawn,
+        } = self.egui_painter.paint(
             &mut self.canvas,
             [WIDTH, HEIGHT],
             pixels_per_point,
             primitives,
             textures_delta,
         )?;
+        let present_started_at = std::time::Instant::now();
         self.canvas.present();
-        Ok(())
+        let present_secs = present_started_at.elapsed().as_secs_f64();
+        Ok(FramePaintStats {
+            texture_apply_secs,
+            geometry_secs,
+            present_secs,
+            draw_calls,
+            textures_uploaded,
+            vertices_drawn,
+        })
     }
 
     fn fit_rect(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> sdl2::rect::Rect {

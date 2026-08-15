@@ -76,6 +76,29 @@ pub const KEY_F1: KeyStroke = KeyStroke::new(0x70, 0x3B);
 pub const KEY_F2: KeyStroke = KeyStroke::new(0x71, 0x3C);
 pub const KEY_F3: KeyStroke = KeyStroke::new(0x72, 0x3D);
 pub const KEY_F4: KeyStroke = KeyStroke::new(0x73, 0x3E);
+pub const KEY_F5: KeyStroke = KeyStroke::new(0x74, 0x3F);
+pub const KEY_F6: KeyStroke = KeyStroke::new(0x75, 0x40);
+pub const KEY_F7: KeyStroke = KeyStroke::new(0x76, 0x41);
+pub const KEY_F8: KeyStroke = KeyStroke::new(0x77, 0x42);
+pub const KEY_F9: KeyStroke = KeyStroke::new(0x78, 0x43);
+pub const KEY_F10: KeyStroke = KeyStroke::new(0x79, 0x44);
+pub const KEY_F11: KeyStroke = KeyStroke::new(0x7A, 0x57);
+pub const KEY_F12: KeyStroke = KeyStroke::new(0x7B, 0x58);
+pub const KEY_LEFT: KeyStroke = KeyStroke::new(0x25, 0x4B);
+pub const KEY_RIGHT: KeyStroke = KeyStroke::new(0x27, 0x4D);
+pub const KEY_UP: KeyStroke = KeyStroke::new(0x26, 0x48);
+pub const KEY_DOWN: KeyStroke = KeyStroke::new(0x28, 0x50);
+pub const KEY_HOME: KeyStroke = KeyStroke::new(0x24, 0x47);
+pub const KEY_END: KeyStroke = KeyStroke::new(0x23, 0x4F);
+pub const KEY_PAGE_UP: KeyStroke = KeyStroke::new(0x21, 0x49);
+pub const KEY_PAGE_DOWN: KeyStroke = KeyStroke::new(0x22, 0x51);
+pub const KEY_DELETE: KeyStroke = KeyStroke::new(0x2E, 0x53);
+pub const KEY_INSERT: KeyStroke = KeyStroke::new(0x2D, 0x52);
+pub const KEY_CAPS_LOCK: KeyStroke = KeyStroke::new(0x14, 0x3A);
+pub const KEY_RIGHT_CTRL: KeyStroke = KeyStroke::new(0xA3, 0x1D);
+pub const KEY_RIGHT_ALT: KeyStroke = KeyStroke::new(0xA5, 0x38);
+pub const KEY_LEFT_WIN: KeyStroke = KeyStroke::new(0x5B, 0x5B);
+pub const KEY_MENU: KeyStroke = KeyStroke::new(0x5D, 0x5D);
 
 /// Scancodes for the digits `1`..`9`, `0`, in that order - the top number row.
 const DIGIT_SCANCODES: [u16; 10] = [
@@ -423,6 +446,26 @@ mod tests {
         let encoder = InputEncoder::default();
         let payload = encoder.encode_key(KeyStroke::new(0x41, 0x1E), false, 1);
         assert_eq!(&payload[0..4], &4u32.to_le_bytes());
+    }
+
+    #[test]
+    fn special_key_constants_are_all_distinct() {
+        let keys = [
+            KEY_ESCAPE, KEY_ENTER, KEY_TAB, KEY_BACKSPACE, KEY_SPACE, KEY_LEFT_SHIFT,
+            KEY_LEFT_CTRL, KEY_LEFT_ALT, KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7,
+            KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12, KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN,
+            KEY_HOME, KEY_END, KEY_PAGE_UP, KEY_PAGE_DOWN, KEY_DELETE, KEY_INSERT, KEY_CAPS_LOCK,
+            KEY_RIGHT_CTRL, KEY_RIGHT_ALT, KEY_LEFT_WIN, KEY_MENU,
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(
+                    (a.keycode, a.scancode),
+                    (b.keycode, b.scancode),
+                    "duplicate keystroke among special key constants"
+                );
+            }
+        }
     }
 
     /// The same single-input framing mouse buttons use: `[0x23][u64 BE ts][0x22][payload]`, with

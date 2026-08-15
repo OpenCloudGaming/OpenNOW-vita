@@ -50,8 +50,17 @@ struct ServerInfoRequestStatus {
 /// The "VPC id" CloudMatch expects on catalog/session calls - not documented anywhere beyond
 /// `requestStatus.serverId` showing up in `serverInfo` responses (see protocol notes §2).
 pub async fn fetch_vpc_id(client: &Client, token: &str) -> Result<String> {
+    fetch_vpc_id_with_base_url(client, token, CLOUDMATCH_BASE_URL).await
+}
+
+pub async fn fetch_vpc_id_with_base_url(client: &Client, token: &str, base_url: &str) -> Result<String> {
+    let base_url = if base_url.ends_with('/') {
+        base_url.to_owned()
+    } else {
+        format!("{base_url}/")
+    };
     let response = headers::apply_lcars_headers(
-        client.get(format!("{CLOUDMATCH_BASE_URL}v2/serverInfo")),
+        client.get(format!("{base_url}v2/serverInfo")),
         token,
         "WEBRTC",
     )
@@ -401,7 +410,12 @@ pub async fn resolve_vpc_id(client: &Client, token: &str, cache: &VpcIdCache) ->
     if let Some(cached) = cache.get() {
         return Ok(cached.clone());
     }
-    match fetch_vpc_id(client, token).await {
+    let base_url = crate::gfn::auth::load_tokens()
+        .and_then(|t| t.provider)
+        .map(|p| p.normalized_streaming_url())
+        .unwrap_or_else(|| CLOUDMATCH_BASE_URL.to_owned());
+
+    match fetch_vpc_id_with_base_url(client, token, &base_url).await {
         Ok(vpc_id) => {
             let _ = cache.set(vpc_id.clone());
             Ok(vpc_id)

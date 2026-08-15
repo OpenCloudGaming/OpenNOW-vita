@@ -56,6 +56,7 @@ pub struct DeviceCodeChallenge {
     device_code: String,
     pub interval: Duration,
     deadline: Instant,
+    pub provider: Option<crate::gfn::providers::GfnProvider>,
 }
 
 impl DeviceCodeChallenge {
@@ -76,6 +77,25 @@ struct DeviceAuthorizationResponse {
 }
 
 pub async fn start_device_login(client: &Client) -> Result<DeviceCodeChallenge> {
+    let (provider, _) = match crate::gfn::providers::discover_providers(client).await {
+        Ok((provider, list)) => (provider, list),
+        Err(_) => (crate::gfn::providers::GfnProvider::default(), vec![]),
+    };
+    start_device_login_with_provider(client, provider).await
+}
+
+pub async fn start_device_login_with_idp(client: &Client, idp_id: &str) -> Result<DeviceCodeChallenge> {
+    let provider = crate::gfn::providers::GfnProvider {
+        idp_id: idp_id.to_owned(),
+        ..Default::default()
+    };
+    start_device_login_with_provider(client, provider).await
+}
+
+pub async fn start_device_login_with_provider(
+    client: &Client,
+    provider: crate::gfn::providers::GfnProvider,
+) -> Result<DeviceCodeChallenge> {
     let response = client
         .post(DEVICE_AUTHORIZE_ENDPOINT)
         .header("Accept", "application/json, text/plain, */*")
@@ -96,7 +116,7 @@ pub async fn start_device_login(client: &Client) -> Result<DeviceCodeChallenge> 
             ("scope", SCOPE),
             ("device_id", &device_id()),
             ("display_name", DISPLAY_NAME),
-            ("idp_id", IDP_ID),
+            ("idp_id", &provider.idp_id),
         ])
         .send()
         .await
@@ -122,6 +142,7 @@ pub async fn start_device_login(client: &Client) -> Result<DeviceCodeChallenge> 
         ),
         deadline: Instant::now()
             + Duration::from_secs(payload.expires_in.unwrap_or(DEFAULT_CHALLENGE_TTL_SECS)),
+        provider: Some(provider),
     })
 }
 
@@ -195,6 +216,8 @@ pub async fn poll_device_login(
             expires_at_unix: expires_at_unix(payload.expires_in),
             client_token: payload.client_token,
             client_token_expires_at_unix: 0,
+            membership_tier: None,
+            provider: challenge.provider.clone(),
         };
         // Grab the long-lived credential right away, while the access token is certainly valid.
         if tokens.client_token.is_none() {
@@ -240,6 +263,10 @@ pub struct AuthTokens {
     pub client_token: Option<String>,
     #[serde(default)]
     pub client_token_expires_at_unix: u64,
+    #[serde(default)]
+    pub membership_tier: Option<String>,
+    #[serde(default)]
+    pub provider: Option<crate::gfn::providers::GfnProvider>,
 }
 
 impl AuthTokens {
@@ -344,6 +371,8 @@ fn merge_refreshed(previous: &AuthTokens, response: TokenResponse) -> AuthTokens
             previous.client_token_expires_at_unix
         },
         client_token: response.client_token.or_else(|| previous.client_token.clone()),
+        membership_tier: previous.membership_tier.clone(),
+        provider: previous.provider.clone(),
     }
 }
 
@@ -599,6 +628,45 @@ pub fn device_id() -> String {
     id
 }
 
+pub async fn fetch_membership_tier(
+    client: &reqwest::Client,
+    token: &str,
+    vpc_id: &str,
+    user_id: &str,
+) -> Result<String> {
+    let url = format!(
+        "https://mes.geforcenow.com/v4/subscriptions?serviceName=gfn_pc&languageCode=en_US&vpcId={vpc_id}&userId={user_id}"
+    );
+
+    let request = client
+        .get(&url)
+        .header(reqwest::header::AUTHORIZATION, format!("GFNJWT {token}"))
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ACCEPT, "application/json");
+
+    let response = request
+        .send()
+        .await
+        .context("subscription network request failed")?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("subscription API failed with {}", response.status());
+    }
+
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .context("subscription response was not valid JSON")?;
+
+    let tier = payload
+        .get("membershipTier")
+        .and_then(|t| t.as_str())
+        .context("membershipTier field missing in subscription response")?;
+
+    Ok(tier.to_owned())
+}
+
 const DEVICE_ID_PATH: &str = "ux0:data/opennow-vita/device-id.txt";
 
 fn load_device_id() -> Option<String> {
@@ -776,6 +844,8 @@ mod tests {
             expires_at_unix: 1_000,
             client_token: Some("old-client".to_owned()),
             client_token_expires_at_unix: 2_000,
+            membership_tier: None,
+            provider: None,
         }
     }
 

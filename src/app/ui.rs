@@ -93,9 +93,25 @@ fn cart_frame(ctx: &egui::Context) -> Option<Arc<egui::TextureHandle>> {
     embedded_texture(ctx, "vita_cart_frame", CART_PNG, 200)
 }
 
+fn vita_front(ctx: &egui::Context) -> Option<Arc<egui::TextureHandle>> {
+    const FRONT_PNG: &[u8] = include_bytes!("../../assets/front.png");
+    embedded_texture(ctx, "vita_front", FRONT_PNG, 480)
+}
+
+fn vita_back(ctx: &egui::Context) -> Option<Arc<egui::TextureHandle>> {
+    const BACK_PNG: &[u8] = include_bytes!("../../assets/back.png");
+    embedded_texture(ctx, "vita_back", BACK_PNG, 480)
+}
+
 const CART_ASPECT: f32 = 447.0 / 558.0;
 const CART_WINDOW_X: (f32, f32) = (0.1611, 0.8479);
 const CART_WINDOW_Y: (f32, f32) = (0.0376, 0.8513);
+
+const REAR_PAD_X: (f32, f32) = (0.20, 0.80);
+const REAR_PAD_Y: (f32, f32) = (0.18, 0.82);
+
+const FRONT_SCREEN_X: (f32, f32) = (0.20, 0.79);
+const FRONT_SCREEN_Y: (f32, f32) = (0.12, 0.83);
 
 /// Decodes a PNG compiled into the binary into exactly one cached egui texture.
 fn embedded_texture(
@@ -159,6 +175,13 @@ enum StreamIcon {
     Collapse,
     Expand,
     Controls,
+    Clock,
+    Globe,
+    Monitor,
+    Person,
+    Signal,
+    Check,
+    ChevronDown,
 }
 
 fn paint_stream_icon(painter: &egui::Painter, rect: egui::Rect, icon: StreamIcon, tint: egui::Color32) {
@@ -268,6 +291,116 @@ fn paint_stream_icon(painter: &egui::Painter, rect: egui::Rect, icon: StreamIcon
             let btn_cx = inset.min.x + inset.width() * 0.7;
             painter.circle_filled(egui::pos2(btn_cx - 1.8, dpad_cy + 1.2), 1.0, tint);
             painter.circle_filled(egui::pos2(btn_cx + 1.8, dpad_cy - 1.2), 1.0, tint);
+        }
+        StreamIcon::Clock => {
+            let stroke = egui::Stroke::new(1.2_f32, tint);
+            let center = rect.center();
+            let radius = rect.width().min(rect.height()) * 0.45;
+            painter.circle_stroke(center, radius, stroke);
+
+            let cx = center.x;
+            let cy = center.y;
+            painter.line_segment([center, egui::pos2(cx + radius * 0.4, cy - radius * 0.5)], stroke);
+            painter.line_segment([center, egui::pos2(cx - radius * 0.5, cy)], stroke);
+        }
+        StreamIcon::Globe => {
+            let stroke = egui::Stroke::new(1.2_f32, tint);
+            let center = rect.center();
+            let radius = rect.width().min(rect.height()) * 0.42;
+            painter.circle_stroke(center, radius, stroke);
+            let meridian: Vec<egui::Pos2> = (0..=8)
+                .map(|step| {
+                    let t = step as f32 / 8.0 * std::f32::consts::PI - std::f32::consts::FRAC_PI_2;
+                    egui::pos2(center.x + radius * 0.42 * t.sin(), center.y - radius * t.cos())
+                })
+                .collect();
+            painter.line(meridian, stroke);
+            painter.line_segment(
+                [egui::pos2(center.x - radius, center.y), egui::pos2(center.x + radius, center.y)],
+                stroke,
+            );
+        }
+        StreamIcon::Monitor => {
+            let stroke = egui::Stroke::new(1.2_f32, tint);
+            let inset = rect.shrink2(egui::vec2(1.0, 3.0));
+            let screen = egui::Rect::from_min_size(
+                inset.min,
+                egui::vec2(inset.width(), inset.height() * 0.75),
+            );
+            painter.rect_stroke(screen, 1.5, stroke, egui::StrokeKind::Inside);
+            let stand_top = screen.max.y;
+            let cx = inset.center().x;
+            painter.line_segment(
+                [egui::pos2(cx, stand_top), egui::pos2(cx, inset.max.y)],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(cx - inset.width() * 0.22, inset.max.y),
+                    egui::pos2(cx + inset.width() * 0.22, inset.max.y),
+                ],
+                stroke,
+            );
+        }
+        StreamIcon::Person => {
+            let stroke = egui::Stroke::new(1.2_f32, tint);
+            let center = rect.center();
+            let head_r = rect.height() * 0.16;
+            let head_c = egui::pos2(center.x, rect.min.y + rect.height() * 0.32);
+            painter.circle_stroke(head_c, head_r, stroke);
+            let shoulders = egui::Rect::from_center_size(
+                egui::pos2(center.x, rect.max.y - rect.height() * 0.10),
+                egui::vec2(rect.width() * 0.62, rect.height() * 0.38),
+            );
+            painter.rect_stroke(
+                shoulders,
+                egui::CornerRadius {
+                    nw: (shoulders.width() * 0.5) as u8,
+                    ne: (shoulders.width() * 0.5) as u8,
+                    sw: 0,
+                    se: 0,
+                },
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+        }
+        StreamIcon::Signal => {
+            let inset = rect.shrink(2.0);
+            let bar_width = inset.width() / 5.0;
+            for (index, height_fraction) in [0.35_f32, 0.62, 0.85, 1.0].into_iter().enumerate() {
+                let height = inset.height() * height_fraction;
+                let x = inset.min.x + index as f32 * bar_width * 1.3;
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(x, inset.max.y - height),
+                        egui::vec2(bar_width * 0.7, height),
+                    ),
+                    0.5,
+                    tint,
+                );
+            }
+        }
+        StreamIcon::Check => {
+            let stroke = egui::Stroke::new(1.8_f32, tint);
+            let c = rect.center();
+            let dx = rect.width() * 0.22;
+            let dy = rect.height() * 0.22;
+            painter.line_segment(
+                [egui::pos2(c.x - dx, c.y), egui::pos2(c.x - dx * 0.15, c.y + dy)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x - dx * 0.15, c.y + dy), egui::pos2(c.x + dx, c.y - dy)],
+                stroke,
+            );
+        }
+        StreamIcon::ChevronDown => {
+            let stroke = egui::Stroke::new(1.6_f32, tint);
+            let c = rect.center();
+            let dx = rect.width() * 0.24;
+            let dy = rect.height() * 0.16;
+            painter.line_segment([egui::pos2(c.x - dx, c.y - dy), egui::pos2(c.x, c.y + dy)], stroke);
+            painter.line_segment([egui::pos2(c.x, c.y + dy), egui::pos2(c.x + dx, c.y - dy)], stroke);
         }
     }
 }
@@ -416,6 +549,23 @@ fn clear_stream_touch_reservations(ctx: &egui::Context) {
     });
 }
 
+const KEYBOARD_CAP_SIZE: egui::Vec2 = egui::vec2(38.0, 26.0);
+const KEYBOARD_CAP_SPACING: f32 = 2.0;
+const KEYBOARD_COLUMNS: f32 = 15.0;
+const KEYBOARD_ROWS: f32 = 6.0;
+const KEYBOARD_PADDING: f32 = 8.0;
+
+pub(crate) fn keyboard_panel_rect(screen: egui::Rect) -> egui::Rect {
+    let width = KEYBOARD_COLUMNS * KEYBOARD_CAP_SIZE.x
+        + (KEYBOARD_COLUMNS - 1.0) * KEYBOARD_CAP_SPACING
+        + KEYBOARD_PADDING * 2.0;
+    let height = KEYBOARD_ROWS * KEYBOARD_CAP_SIZE.y
+        + (KEYBOARD_ROWS - 1.0) * KEYBOARD_CAP_SPACING
+        + KEYBOARD_PADDING * 2.0;
+    let min = egui::pos2(screen.center().x - width / 2.0, screen.max.y - height);
+    egui::Rect::from_min_size(min, egui::vec2(width, height))
+}
+
 /// Resolves the currently highlighted game.
 pub(crate) fn selected_game<'a>(
     games: &'a [GameSummary],
@@ -426,7 +576,7 @@ pub(crate) fn selected_game<'a>(
 }
 
 /// Formats `id` with a single Fluent argument.
-fn text1(i18n: &I18n, id: &'static str, key: &'static str, value: impl ToString) -> String {
+fn text1(i18n: &I18n, id: &'static str, key: &'static str, value: impl ToString) -> std::rc::Rc<str> {
     let mut args = FluentArgs::new();
     args.set(key, arg_string(value.to_string()));
     i18n.text_with(id, args)
@@ -437,7 +587,7 @@ fn text2(
     id: &'static str,
     first: (&'static str, impl ToString),
     second: (&'static str, impl ToString),
-) -> String {
+) -> std::rc::Rc<str> {
     let mut args = FluentArgs::new();
     args.set(first.0, arg_string(first.1.to_string()));
     args.set(second.0, arg_string(second.1.to_string()));
@@ -456,7 +606,6 @@ struct CatalogView<'a> {
     covers: &'a CoverStore,
     http_client: &'a Client,
     status_note: Option<&'a str>,
-    locale: crate::locale::Locale,
     sort: CatalogSort,
     filter: CatalogFilter,
     /// `pageInfo.totalCount` from the server - generally far more than we page in, so the header
@@ -467,9 +616,65 @@ struct CatalogView<'a> {
     /// Starred app ids. Held by the app rather than re-read here, because this is rebuilt on every
     /// repaint and the list lives on the memory card.
     favorites: &'a std::collections::BTreeSet<String>,
+    regions: RegionsView<'a>,
+    settings: SettingsView,
 }
 
+#[derive(Clone, Copy)]
+struct SettingsView {
+    open: bool,
+    tab: crate::app::settings_menu::SettingsTab,
+    focus: usize,
+    expanded: Option<usize>,
+    option_focus: usize,
+}
+
+impl SettingsView {
+    fn from_app(app: &App) -> Self {
+        Self {
+            open: app.settings_open,
+            tab: app.settings_tab,
+            focus: app.settings_focus,
+            expanded: app.settings_expanded,
+            option_focus: app.settings_option_focus,
+        }
+    }
+}
+
+struct RegionsView<'a> {
+    list: &'a [crate::gfn::regions::StreamRegion],
+    busy: bool,
+    measuring: bool,
+    error: Option<&'a str>,
+}
+
+impl<'a> RegionsView<'a> {
+    fn from_app(app: &'a App) -> Self {
+        Self {
+            list: &app.regions,
+            busy: app.is_loading_regions(),
+            measuring: app.regions_measuring,
+            error: app.regions_error.as_deref(),
+        }
+    }
+}
+
+const SPLASH_FADE_IN: f64 = 0.55;
+const SPLASH_HOLD: f64 = 1.05;
+const SPLASH_FADE_OUT: f64 = 0.60;
+const SPLASH_TOTAL: f64 = SPLASH_FADE_IN + SPLASH_HOLD + SPLASH_FADE_OUT;
+const SPLASH_OPAQUE_UNTIL: f64 = SPLASH_FADE_IN + SPLASH_HOLD;
+
 pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
+    let splash_elapsed = ctx.input(|input| input.time);
+    if splash_elapsed < SPLASH_TOTAL {
+        ctx.request_repaint();
+    }
+    if splash_elapsed < SPLASH_OPAQUE_UNTIL {
+        splash_overlay(ctx);
+        return Vec::new();
+    }
+
     let i18n = I18n::new(app.locale);
     let mut commands = Vec::new();
 
@@ -502,14 +707,23 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                     covers,
                     http_client: &app.http_client,
                     status_note: app.status_note.as_deref(),
-                    locale: app.locale,
                     sort: app.catalog_sort,
                     filter: app.catalog_filter,
                     total_count: app.catalog_total_count(),
                     favorites: &app.favorites,
+                    regions: RegionsView::from_app(app),
+                    settings: SettingsView::from_app(app),
                     loading_more: app.is_loading_more_catalog(),
                 },
             ));
+            if app.server_picker_open {
+                commands.extend(server_picker_modal(
+                    ctx,
+                    &i18n,
+                    app,
+                    selected_game(games, filtered_indices, *selected),
+                ));
+            }
         }
         AppState::CreatingSession {
             user,
@@ -544,12 +758,13 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                 covers,
                 http_client: &app.http_client,
                 status_note: None,
-                locale: app.locale,
                 sort: app.catalog_sort,
                 filter: app.catalog_filter,
                 total_count: app.catalog_total_count(),
                 loading_more: app.is_loading_more_catalog(),
                 favorites: &app.favorites,
+                regions: RegionsView::from_app(app),
+                settings: SettingsView::from_app(app),
             };
             if let Some(cmd) = session_launch_overlay(ctx, &i18n, &catalog, &launch) {
                 commands.push(cmd);
@@ -585,12 +800,13 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                 covers,
                 http_client: &app.http_client,
                 status_note: None,
-                locale: app.locale,
                 sort: app.catalog_sort,
                 filter: app.catalog_filter,
                 total_count: app.catalog_total_count(),
                 loading_more: app.is_loading_more_catalog(),
                 favorites: &app.favorites,
+                regions: RegionsView::from_app(app),
+                settings: SettingsView::from_app(app),
             };
             if let Some(cmd) = session_launch_overlay(ctx, &i18n, &catalog, &launch) {
                 commands.push(cmd);
@@ -630,12 +846,13 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                 covers,
                 http_client: &app.http_client,
                 status_note: None,
-                locale: app.locale,
                 sort: app.catalog_sort,
                 filter: app.catalog_filter,
                 total_count: app.catalog_total_count(),
                 loading_more: app.is_loading_more_catalog(),
                 favorites: &app.favorites,
+                regions: RegionsView::from_app(app),
+                settings: SettingsView::from_app(app),
             };
             if let Some(cmd) = session_launch_overlay(ctx, &i18n, &catalog, &launch) {
                 commands.push(cmd);
@@ -654,7 +871,7 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                 selected_game(games, filtered_indices, *selected),
                 peer.video_frame().is_some(),
                 app.status_note.as_deref(),
-                crate::ime::is_open(),
+                app.keyboard_open,
                 app.show_stream_stats,
                 app.toolbar_expanded,
                 app.mouse_trackpad_enabled,
@@ -669,6 +886,21 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
         && let Some(cmd) = stream_controls_modal(ctx, &i18n)
     {
         commands.push(cmd);
+    }
+
+    if app.keyboard_open && matches!(app.state, AppState::Streaming { .. }) {
+        commands.extend(on_screen_keyboard(ctx, app.key_shift, app.key_ctrl, app.key_alt));
+    }
+
+    if crate::gfn::stream_prefs::session_timer_enabled() {
+        if let AppState::Streaming { session_start, .. } = &app.state {
+            session_timer_overlay(
+                ctx,
+                *session_start,
+                app.membership_tier.as_deref(),
+                app.battery,
+            );
+        }
     }
 
     if app.show_controls_hint && matches!(app.state, AppState::Streaming { .. })
@@ -688,12 +920,6 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
     commands
 }
 
-const SPLASH_FADE_IN: f64 = 0.55;
-const SPLASH_HOLD: f64 = 1.05;
-const SPLASH_FADE_OUT: f64 = 0.60;
-const SPLASH_TOTAL: f64 = SPLASH_FADE_IN + SPLASH_HOLD + SPLASH_FADE_OUT;
-
-/// Brief GeForce NOW splash drawn over whatever screen is already live.
 fn splash_overlay(ctx: &egui::Context) {
     let elapsed = ctx.input(|input| input.time);
     if elapsed >= SPLASH_TOTAL {
@@ -719,11 +945,15 @@ fn splash_overlay(ctx: &egui::Context) {
         egui::Id::new("splash_overlay"),
     ));
 
-    painter.rect_filled(
-        screen,
-        0.0,
-        egui::Color32::from_rgba_unmultiplied(0x0e, 0x0e, 0x0e, alpha_u8),
-    );
+    if alpha_u8 >= 255 {
+        painter.rect_filled(screen, 0.0, BG_DEEP);
+    } else {
+        painter.rect_filled(
+            screen,
+            0.0,
+            egui::Color32::from_rgba_unmultiplied(0x0e, 0x0e, 0x0e, alpha_u8),
+        );
+    }
 
     let Some(logo) = geforce_logo(ctx) else {
         painter.text(
@@ -767,12 +997,12 @@ fn login_screen(ctx: &egui::Context, i18n: &I18n, app: &App) {
         ui.vertical_centered(|ui| {
             ui.add_space(80.0);
             ui.heading(egui::RichText::new("OpenNOW Vita").size(32.0).strong().color(ACCENT));
-            ui.label(i18n.text("login-subtitle"));
+            ui.label(i18n.text("login-subtitle").as_ref());
             ui.add_space(24.0);
             button_hint(ui, &i18n.text("login-hint"), 13.0, TEXT_DIM, true);
             ui.add_space(24.0);
             if let Some(last_input) = app.last_input {
-                ui.weak(text1(i18n, "login-last-input", "input", format!("{last_input:?}")));
+                ui.weak(text1(i18n, "login-last-input", "input", format!("{last_input:?}")).as_ref());
             }
         });
     });
@@ -784,7 +1014,7 @@ fn starting_login_screen(ctx: &egui::Context, i18n: &I18n) {
             ui.add_space(120.0);
             ui.spinner();
             ui.add_space(12.0);
-            ui.label(i18n.text("login-requesting-code"));
+            ui.label(i18n.text("login-requesting-code").as_ref());
         });
     });
 }
@@ -797,13 +1027,13 @@ fn device_code_screen(
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
-            ui.heading(i18n.text("device-title"));
+            ui.heading(i18n.text("device-title").as_ref());
         });
         ui.add_space(16.0);
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(ui.available_width() - 220.0);
-                ui.label(i18n.text("device-step-open"));
+                ui.label(i18n.text("device-step-open").as_ref());
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(&challenge.verification_uri_complete)
@@ -811,7 +1041,7 @@ fn device_code_screen(
                         .strong(),
                 );
                 ui.add_space(20.0);
-                ui.label(i18n.text("device-step-scan"));
+                ui.label(i18n.text("device-step-scan").as_ref());
                 ui.add_space(12.0);
                 egui::Frame::NONE
                     .fill(BG_PANEL)
@@ -826,7 +1056,7 @@ fn device_code_screen(
                         );
                     });
                 ui.add_space(20.0);
-                ui.label(i18n.text("device-waiting"));
+                ui.label(i18n.text("device-waiting").as_ref());
             });
 
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
@@ -840,11 +1070,11 @@ fn loading_catalog_screen(ctx: &egui::Context, i18n: &I18n, user: &GfnUser) {
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(80.0);
-            ui.heading(text1(i18n, "catalog-welcome", "name", &user.display_name));
+            ui.heading(text1(i18n, "catalog-welcome", "name", &user.display_name).as_ref());
             ui.add_space(20.0);
             ui.spinner();
             ui.add_space(12.0);
-            ui.label(i18n.text("catalog-loading"));
+            ui.label(i18n.text("catalog-loading").as_ref());
         });
     });
 }
@@ -880,7 +1110,7 @@ fn catalog_screen(ctx: &egui::Context, i18n: &I18n, view: &CatalogView<'_>) -> V
                     }
                     None => {
                         ui.label(
-                            egui::RichText::new(i18n.text("catalog-library-title"))
+                            egui::RichText::new(i18n.text("catalog-library-title").as_ref())
                                 .strong()
                                 .size(20.0)
                                 .color(ACCENT),
@@ -895,12 +1125,15 @@ fn catalog_screen(ctx: &egui::Context, i18n: &I18n, view: &CatalogView<'_>) -> V
                         "catalog-count"
                     };
                     ui.label(
-                        egui::RichText::new(text2(
-                            i18n,
-                            key,
-                            ("shown", view.filtered_indices.len()),
-                            ("total", total),
-                        ))
+                        egui::RichText::new(
+                            text2(
+                                i18n,
+                                key,
+                                ("shown", view.filtered_indices.len()),
+                                ("total", total),
+                            )
+                            .as_ref(),
+                        )
                         .size(11.0)
                         .color(TEXT_DIM),
                     );
@@ -934,9 +1167,13 @@ fn catalog_screen(ctx: &egui::Context, i18n: &I18n, view: &CatalogView<'_>) -> V
                     ui.painter().circle_filled(dot.center(), 4.0, ACCENT);
 
                     ui.add_space(10.0);
-                    if let Some(cmd) = language_picker(ui, i18n, view.locale, view.user) {
-                        commands.push(cmd);
-                    }
+                    commands.extend(settings_modal(
+                        ui,
+                        i18n,
+                        view.user,
+                        &view.regions,
+                        view.settings,
+                    ));
                     ui.add_space(6.0);
                     if let Some(cmd) = sort_picker(ui, i18n, view.sort, view.games) {
                         commands.push(cmd);
@@ -989,13 +1226,8 @@ fn catalog_screen(ctx: &egui::Context, i18n: &I18n, view: &CatalogView<'_>) -> V
 
 /// First-run explainer for the buttons the Vita does not physically have.
 ///
-/// Animated deliberately: the quadrants light up one after another, because a static diagram of a
-/// blank black rectangle does not read as "the back of your console" at a glance.
 fn controls_hint_overlay(ctx: &egui::Context, i18n: &I18n) -> Option<AppCommand> {
     let mut command = None;
-    // Timed against egui's own clock, the way `splash_overlay` does it. `animate_value_with_time`
-    // looks like the obvious tool but returns the target outright on its first call, so the
-    // animation was over before it was ever drawn.
     const HINT_ANIMATION: f64 = 0.9;
     let started_id = egui::Id::new("controls_hint_started_at");
     let now = ctx.input(|input| input.time);
@@ -1003,8 +1235,6 @@ fn controls_hint_overlay(ctx: &egui::Context, i18n: &I18n) -> Option<AppCommand>
         .data_mut(|data| *data.get_temp_mut_or_insert_with(started_id, || now));
     let progress = ((now - started_at) / HINT_ANIMATION).clamp(0.0, 1.0) as f32;
     if progress < 1.0 {
-        // Nothing else drives frames here, and the reactive repaint would otherwise let the
-        // animation sit on whatever frame it started on.
         ctx.request_repaint();
     }
 
@@ -1018,73 +1248,25 @@ fn controls_hint_overlay(ctx: &egui::Context, i18n: &I18n) -> Option<AppCommand>
                 .inner_margin(egui::Margin::symmetric(16, 14)),
         )
         .show(ctx, |ui| {
-            ui.set_width(310.0);
-            ui.heading(egui::RichText::new(i18n.text("controls-hint-heading")).size(15.0));
+            ui.set_width(320.0);
+            ui.heading(egui::RichText::new(i18n.text("controls-hint-heading").as_ref()).size(15.0));
             ui.add_space(2.0);
             ui.label(
-                egui::RichText::new(i18n.text("controls-hint-rear"))
+                egui::RichText::new(i18n.text("controls-hint-rear").as_ref())
                     .size(10.0)
                     .color(TEXT_DIM),
             );
             ui.add_space(8.0);
-
-            // The rear panel, drawn to the same 2x2 split the input code actually uses.
-            let (rect, _) =
-                ui.allocate_exact_size(egui::vec2(ui.available_width(), 92.0), egui::Sense::hover());
-            let painter = ui.painter();
-            painter.rect_filled(rect, 6.0, BG_DEEP);
-            painter.rect_stroke(
-                rect,
-                6u8,
-                egui::Stroke::new(1.0_f32, BORDER),
-                egui::StrokeKind::Inside,
-            );
-
-            const QUADRANTS: [(&str, bool, bool); 2] = [("L2", true, true), ("R2", false, true)];
-            for (index, (label, left, top)) in QUADRANTS.into_iter().enumerate() {
-                // Each quadrant starts a quarter of the way after the previous one.
-                let start = index as f32 * 0.18;
-                let local = ((progress - start) / 0.4).clamp(0.0, 1.0);
-                if local <= 0.0 {
-                    continue;
-                }
-                let _ = top;
-                // Halves, not quadrants: the stick clicks live on the front screen now.
-                let cell = egui::Rect::from_min_size(
-                    egui::pos2(if left { rect.min.x } else { rect.center().x }, rect.min.y),
-                    egui::vec2(rect.width() / 2.0, rect.height()),
-                )
-                .shrink(4.0);
-                let alpha = (local * 255.0) as u8;
-                painter.rect_filled(
-                    cell,
-                    4.0,
-                    ACCENT.gamma_multiply(0.18).linear_multiply(local),
-                );
-                painter.rect_stroke(
-                    cell,
-                    4u8,
-                    egui::Stroke::new(1.0_f32, ACCENT.linear_multiply(local)),
-                    egui::StrokeKind::Inside,
-                );
-                painter.text(
-                    cell.center(),
-                    egui::Align2::CENTER_CENTER,
-                    label,
-                    egui::FontId::proportional(15.0),
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
-                );
-            }
-
+            rear_touch_diagram(ui, 112.0, Some(progress));
             ui.add_space(10.0);
             ui.label(
-                egui::RichText::new(i18n.text("controls-hint-sticks"))
+                egui::RichText::new(i18n.text("controls-hint-sticks").as_ref())
                     .size(10.0)
                     .color(TEXT_DIM),
             );
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new(i18n.text("controls-hint-touch"))
+                egui::RichText::new(i18n.text("controls-hint-touch").as_ref())
                     .size(10.0)
                     .color(TEXT_DIM),
             );
@@ -1093,7 +1275,7 @@ fn controls_hint_overlay(ctx: &egui::Context, i18n: &I18n) -> Option<AppCommand>
                 if ui
                     .add_sized(
                         [130.0, 28.0],
-                        egui::Button::new(i18n.text("controls-hint-dismiss")).fill(BG_RAISED),
+                        egui::Button::new(i18n.text("controls-hint-dismiss").as_ref()).fill(BG_RAISED),
                     )
                     .clicked()
                 {
@@ -1104,33 +1286,30 @@ fn controls_hint_overlay(ctx: &egui::Context, i18n: &I18n) -> Option<AppCommand>
     command
 }
 
-/// Settings button, and the modal it opens.
+const SETTINGS_MODAL_W: f32 = 520.0;
+const SETTINGS_MODAL_H: f32 = 360.0;
+const SETTINGS_BODY_H: f32 = 268.0;
+
 ///
-/// This was a dropdown anchored under the button. Every option added made it taller until it ran
-/// off the bottom of a 544 px screen with no way to reach the last rows. A modal is centred, sized
-/// to the screen, and scrolls - so it cannot outgrow the display.
-fn language_picker(
+fn settings_modal(
     ui: &mut egui::Ui,
     i18n: &I18n,
-    current: crate::locale::Locale,
     user: &GfnUser,
-) -> Option<AppCommand> {
-    let mut command = None;
-    let response = ui.add_sized(
+    regions: &RegionsView<'_>,
+    settings: SettingsView,
+) -> Vec<AppCommand> {
+    use crate::app::settings_menu::SettingsTab;
+
+    let mut commands = Vec::new();
+    let gear = ui.add_sized(
         [34.0, 30.0],
         egui::Button::new(egui::RichText::new("\u{2699}").size(15.0)).fill(BG_RAISED),
     );
-
-    let open_id = egui::Id::new("settings_modal_open");
-    let mut open = ui.ctx().data(|data| data.get_temp::<bool>(open_id).unwrap_or(false));
-    // Opens only. It used to toggle, but the gear sits in the same screen corner as the modal's
-    // close button, so one tap could both close the modal and re-open it.
-    if response.clicked() {
-        open = true;
+    if gear.clicked() {
+        commands.push(AppCommand::OpenSettings);
     }
-    if !open {
-        ui.ctx().data_mut(|data| data.insert_temp(open_id, false));
-        return command;
+    if !settings.open {
+        return commands;
     }
 
     let modal = egui::Modal::new(egui::Id::new("settings_modal"))
@@ -1138,18 +1317,19 @@ fn language_picker(
         .frame(
             egui::Frame::default()
                 .fill(BG_PANEL)
-                .stroke(egui::Stroke::new(1.0, BORDER))
+                .stroke(egui::Stroke::new(1.0_f32, BORDER))
                 .corner_radius(10.0)
                 .inner_margin(egui::Margin::symmetric(14, 12)),
         )
         .show(ui.ctx(), |ui| {
             let mut close_requested = false;
-            ui.set_width(300.0);
+            ui.set_width(SETTINGS_MODAL_W);
+            ui.set_min_height(SETTINGS_MODAL_H);
+            ui.set_max_height(SETTINGS_MODAL_H);
+
             ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new(i18n.text("settings-heading")).size(15.0));
+                ui.heading(egui::RichText::new(i18n.text("settings-heading").as_ref()).size(15.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // A plain letter, not "\u{2715}": the bundled font has no multiplication-X
-                    // glyph, so that rendered as an empty tofu box.
                     if ui
                         .add_sized(
                             [30.0, 26.0],
@@ -1161,137 +1341,1037 @@ fn language_picker(
                     }
                 });
             });
-            if let Some(email) = &user.email {
-                ui.label(egui::RichText::new(email).size(10.0).color(TEXT_DIM));
-            }
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for tab in SettingsTab::ALL {
+                    if let Some(cmd) = settings_tab_button(ui, i18n, tab, settings.tab) {
+                        commands.push(cmd);
+                    }
+                }
+            });
+            ui.add_space(4.0);
             ui.separator();
 
-            // Capped so the modal can never grow past the screen, however many options it gains.
-            egui::ScrollArea::vertical()
-                .max_height(330.0)
-                .show(ui, |ui| {
-                    if let Some(chosen) = settings_row(
-                        ui,
-                        i18n,
-                        "settings-language-heading",
-                        crate::locale::Locale::ALL.iter().copied(),
-                        current,
-                        |candidate| candidate.label().to_owned(),
-                    ) {
-                        command = Some(AppCommand::SetLocale(chosen));
-                    }
-
-                    if let Some(chosen) = settings_row(
-                        ui,
-                        i18n,
-                        "settings-fps-heading",
-                        crate::gfn::stream_prefs::StreamFps::ALL.iter().copied(),
-                        crate::gfn::stream_prefs::fps(),
-                        |candidate| candidate.value().to_string(),
-                    ) {
-                        command = Some(AppCommand::SetStreamFps(chosen));
-                    }
-
-                    if let Some(chosen) = settings_row(
-                        ui,
-                        i18n,
-                        "settings-trigger-heading",
-                        crate::gfn::stream_prefs::TriggerIntensity::ALL.iter().copied(),
-                        crate::gfn::stream_prefs::trigger_intensity(),
-                        |candidate| format!("{}%", u32::from(candidate.value()) * 100 / 255),
-                    ) {
-                        command = Some(AppCommand::SetTriggerIntensity(chosen));
-                    }
-
-                    if let Some(chosen) = settings_row(
-                        ui,
-                        i18n,
-                        "settings-rear-touch-mode-heading",
-                        crate::gfn::stream_prefs::RearTouchMode::ALL.iter().copied(),
-                        crate::gfn::stream_prefs::rear_touch_mode(),
-                        |candidate| i18n.text(candidate.label_key()),
-                    ) {
-                        command = Some(AppCommand::SetRearTouchMode(chosen));
-                    }
-
-                    // little diagram, 2 halves or 4 quadrants depending on mode
-                    let current_mode = crate::gfn::stream_prefs::rear_touch_mode();
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 70.0), egui::Sense::hover());
-                    let painter = ui.painter();
-                    painter.rect_filled(rect, 6.0, BG_DEEP);
-                    painter.rect_stroke(rect, 6u8, egui::Stroke::new(1.0_f32, BORDER), egui::StrokeKind::Inside);
-
-                    let anim_time = ui.ctx().input(|i| i.time);
-                    ui.ctx().request_repaint(); // for the pulse anim
-
-                    match current_mode {
-                        crate::gfn::stream_prefs::RearTouchMode::Quadrant => {
-                            let quadrants = [
-                                ("L2", rect.min.x, rect.min.y, 0.0),
-                                ("R2", rect.center().x, rect.min.y, 0.25),
-                                ("L3", rect.min.x, rect.center().y, 0.50),
-                                ("R3", rect.center().x, rect.center().y, 0.75),
-                            ];
-                            for (label, min_x, min_y, phase) in quadrants {
-                                let pulse = 0.5 + 0.5 * ((anim_time * 3.0 + phase * std::f64::consts::TAU).sin() as f32);
-                                let cell = egui::Rect::from_min_size(
-                                    egui::pos2(min_x, min_y),
-                                    egui::vec2(rect.width() / 2.0, rect.height() / 2.0),
-                                ).shrink(3.0);
-                                painter.rect_filled(cell, 4.0, ACCENT.gamma_multiply(0.12 + pulse * 0.25));
-                                painter.rect_stroke(cell, 4u8, egui::Stroke::new(1.5_f32, ACCENT.gamma_multiply(0.4 + pulse * 0.6)), egui::StrokeKind::Inside);
-                                painter.text(cell.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), egui::Color32::WHITE);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), SETTINGS_BODY_H),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_content")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            if let Some(email) = &user.email {
+                                if settings.tab == SettingsTab::Account {
+                                    ui.label(
+                                        egui::RichText::new(email).size(12.0).color(egui::Color32::WHITE),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "OpenNOW-Vita {}",
+                                            env!("CARGO_PKG_VERSION")
+                                        ))
+                                        .size(10.0)
+                                        .color(TEXT_DIM),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.separator();
+                                }
                             }
-                        }
-                        crate::gfn::stream_prefs::RearTouchMode::Halves => {
-                            let halves = [
-                                ("L2", rect.min.x, 0.0),
-                                ("R2", rect.center().x, 0.5),
-                            ];
-                            for (label, min_x, phase) in halves {
-                                let pulse = 0.5 + 0.5 * ((anim_time * 3.0 + phase * std::f64::consts::TAU).sin() as f32);
-                                let cell = egui::Rect::from_min_size(
-                                    egui::pos2(min_x, rect.min.y),
-                                    egui::vec2(rect.width() / 2.0, rect.height()),
-                                ).shrink(3.0);
-                                painter.rect_filled(cell, 4.0, ACCENT.gamma_multiply(0.12 + pulse * 0.25));
-                                painter.rect_stroke(cell, 4u8, egui::Stroke::new(1.5_f32, ACCENT.gamma_multiply(0.4 + pulse * 0.6)), egui::StrokeKind::Inside);
-                                painter.text(cell.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(14.0), egui::Color32::WHITE);
+
+                            if settings.tab == SettingsTab::Controls {
+                                for cmd in controls_settings_panel(ui, i18n, settings, regions) {
+                                    commands.push(cmd);
+                                }
+                            } else {
+                                let row_count = settings.tab.row_count();
+                                for row in 0..row_count {
+                                    let Some(info) =
+                                        crate::app::settings_menu::row_info(settings.tab, row)
+                                    else {
+                                        continue;
+                                    };
+                                    let focused = settings.focus == row;
+                                    let expanded = settings.expanded == Some(row);
+                                    if let Some(cmd) = settings_item(
+                                        ui,
+                                        i18n,
+                                        settings.tab,
+                                        row,
+                                        &info,
+                                        focused,
+                                        expanded,
+                                        settings.option_focus,
+                                        regions,
+                                        false,
+                                    ) {
+                                        commands.push(cmd);
+                                    }
+                                    ui.separator();
+                                }
                             }
-                        }
-                    }
+                        });
+                },
+            );
 
-                    if let Some(chosen) = settings_row(
-                        ui,
-                        i18n,
-                        "settings-stick-zones-heading",
-                        crate::gfn::stream_prefs::StickZones::ALL.iter().copied(),
-                        crate::gfn::stream_prefs::stick_zones(),
-                        |candidate| i18n.text(candidate.label_key()),
-                    ) {
-                        command = Some(AppCommand::SetStickZones(chosen));
-                    }
-
-                    if let Some(chosen) = settings_row(
-                        ui,
-                        i18n,
-                        "settings-audio-boost-heading",
-                        crate::gfn::stream_prefs::AudioBoost::ALL.iter().copied(),
-                        crate::gfn::stream_prefs::audio_boost(),
-                        |candidate| format!("{}x", candidate.percent() / 100),
-                    ) {
-                        command = Some(AppCommand::SetAudioBoost(chosen));
-                    }
-                });
             close_requested
         });
 
-    // Returned from the closure rather than assigned through a capture, so there is exactly one
-    // place that decides the modal is done: the button, the backdrop, or Escape.
     if modal.inner || modal.should_close() {
-        open = false;
+        commands.push(AppCommand::CloseSettings);
     }
-    ui.ctx().data_mut(|data| data.insert_temp(open_id, open));
+    commands
+}
+
+fn controls_settings_panel(
+    ui: &mut egui::Ui,
+    i18n: &I18n,
+    settings: SettingsView,
+    regions: &RegionsView<'_>,
+) -> Vec<AppCommand> {
+    use crate::app::settings_menu::SettingsTab;
+
+    let mut commands = Vec::new();
+    let tab = SettingsTab::Controls;
+    let gap = 10.0;
+    let half = ((ui.available_width() - gap) / 2.0).max(120.0);
+
+    ui.add_space(2.0);
+    ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(half);
+            if let Some(info) = crate::app::settings_menu::row_info(tab, 0) {
+                rear_touch_diagram(ui, 92.0, None);
+                ui.add_space(4.0);
+                if let Some(cmd) =
+                    settings_chip_choice(ui, i18n, tab, 0, &info, settings.focus == 0)
+                {
+                    commands.push(cmd);
+                }
+            }
+        });
+        ui.add_space(gap);
+        ui.vertical(|ui| {
+            ui.set_width(half);
+            if let Some(info) = crate::app::settings_menu::row_info(tab, 1) {
+                front_stick_zones_diagram(ui, 92.0);
+                ui.add_space(4.0);
+                if let Some(cmd) =
+                    settings_chip_choice(ui, i18n, tab, 1, &info, settings.focus == 1)
+                {
+                    commands.push(cmd);
+                }
+            }
+        });
+    });
+
+    ui.add_space(6.0);
+    ui.separator();
+
+    for row in 2..tab.row_count() {
+        let Some(info) = crate::app::settings_menu::row_info(tab, row) else {
+            continue;
+        };
+        if let Some(cmd) = settings_item(
+            ui,
+            i18n,
+            tab,
+            row,
+            &info,
+            settings.focus == row,
+            settings.expanded == Some(row),
+            settings.option_focus,
+            regions,
+            false,
+        ) {
+            commands.push(cmd);
+        }
+        ui.separator();
+    }
+
+    commands
+}
+
+fn settings_chip_choice(
+    ui: &mut egui::Ui,
+    i18n: &I18n,
+    tab: crate::app::settings_menu::SettingsTab,
+    row: usize,
+    info: &crate::app::settings_menu::RowInfo,
+    focused: bool,
+) -> Option<AppCommand> {
+    let mut command = None;
+    ui.add_space(4.0);
+    let current = crate::app::settings_menu::current_option_index(tab, row, &[], i18n.locale());
+    let count = crate::app::settings_menu::option_count(tab, row, 0);
+
+    let block = ui.vertical(|ui| {
+        ui.label(egui::RichText::new(i18n.text(info.label_key).as_ref()).size(12.5).strong());
+        if let Some(desc_key) = info.desc_key {
+            ui.label(egui::RichText::new(i18n.text(desc_key).as_ref()).size(9.5).color(TEXT_DIM));
+        }
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            for option in 0..count {
+                let label = crate::app::settings_menu::option_label(tab, row, option, i18n, &[]);
+                let selected = option == current;
+                let fill = if selected {
+                    ACCENT.gamma_multiply(0.35)
+                } else {
+                    BG_RAISED
+                };
+                let text = egui::RichText::new(label)
+                    .size(11.0)
+                    .color(if selected {
+                        egui::Color32::WHITE
+                    } else {
+                        TEXT_DIM
+                    });
+                if ui
+                    .add(egui::Button::new(text).fill(fill).min_size(egui::vec2(0.0, 28.0)))
+                    .clicked()
+                {
+                    command = Some(AppCommand::ChooseSettingsOption(row, option));
+                }
+            }
+        });
+    });
+    if focused {
+        ui.painter().rect_stroke(
+            block.response.rect.expand(3.0),
+            4.0,
+            egui::Stroke::new(1.5_f32, ACCENT),
+            egui::StrokeKind::Outside,
+        );
+    }
+
+    command
+}
+
+fn battery_color(battery: crate::power::BatteryStatus) -> egui::Color32 {
+    if battery.charging {
+        ACCENT
+    } else if battery.is_critical() {
+        DANGER
+    } else if battery.should_warn() {
+        egui::Color32::from_rgb(0xe0, 0xa8, 0x30)
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
+fn paint_battery(painter: &egui::Painter, rect: egui::Rect, battery: crate::power::BatteryStatus) {
+    let color = battery_color(battery);
+    let body = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(rect.max.x - 3.0, rect.max.y),
+    )
+    .shrink2(egui::vec2(0.0, 3.0));
+    painter.rect_stroke(
+        body,
+        2.0,
+        egui::Stroke::new(1.2_f32, color),
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_size(
+            egui::pos2(body.max.x + 1.0, body.center().y - 3.0),
+            egui::vec2(2.0, 6.0),
+        ),
+        1.0,
+        color,
+    );
+    let inner = body.shrink(2.5);
+    let filled = inner.width() * (f32::from(battery.percent) / 100.0);
+    if filled > 0.5 {
+        painter.rect_filled(
+            egui::Rect::from_min_size(inner.min, egui::vec2(filled, inner.height())),
+            1.0,
+            color,
+        );
+    }
+    if battery.charging {
+        let c = body.center();
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(c.x + 1.0, c.y - 5.0),
+                egui::pos2(c.x - 2.5, c.y + 0.5),
+                egui::pos2(c.x - 0.2, c.y + 0.5),
+                egui::pos2(c.x - 1.0, c.y + 5.0),
+                egui::pos2(c.x + 2.5, c.y - 0.5),
+                egui::pos2(c.x + 0.2, c.y - 0.5),
+            ],
+            BG_DEEP,
+            egui::Stroke::new(1.0_f32, BG_DEEP),
+        ));
+    }
+}
+
+fn uv_subrect(image: egui::Rect, x: (f32, f32), y: (f32, f32)) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(
+            image.min.x + image.width() * x.0,
+            image.min.y + image.height() * y.0,
+        ),
+        egui::pos2(
+            image.min.x + image.width() * x.1,
+            image.min.y + image.height() * y.1,
+        ),
+    )
+}
+
+fn allocate_device_image(
+    ui: &mut egui::Ui,
+    texture: &egui::TextureHandle,
+    max_height: f32,
+) -> Option<egui::Rect> {
+    let size = texture.size_vec2();
+    let width = ui.available_width().max(1.0);
+    let height = (width * size.y / size.x.max(1.0)).min(max_height).max(1.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return None;
+    }
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, 6.0, BG_DEEP);
+    painter.rect_stroke(
+        rect,
+        6u8,
+        egui::Stroke::new(1.0_f32, BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let pad = 4.0;
+    let inner = rect.shrink(pad);
+    let scale = (inner.width() / size.x.max(1.0)).min(inner.height() / size.y.max(1.0));
+    let draw = egui::vec2(size.x * scale, size.y * scale);
+    let image = egui::Rect::from_center_size(inner.center(), draw);
+    painter.image(
+        texture.id(),
+        image,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+    Some(image)
+}
+
+fn paint_pulsing_zone(
+    painter: &egui::Painter,
+    cell: egui::Rect,
+    label: &str,
+    time: f64,
+    phase: f64,
+    font_size: f32,
+) {
+    let pulse = 0.5 + 0.5 * ((time * 3.0 + phase * std::f64::consts::TAU).sin() as f32);
+    let cell = cell.shrink(2.0);
+    painter.rect_filled(cell, 4.0, ACCENT.gamma_multiply(0.12 + pulse * 0.25));
+    painter.rect_stroke(
+        cell,
+        4u8,
+        egui::Stroke::new(1.5_f32, ACCENT.gamma_multiply(0.4 + pulse * 0.6)),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        cell.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(font_size),
+        egui::Color32::WHITE,
+    );
+}
+
+fn paint_intro_zone(
+    painter: &egui::Painter,
+    cell: egui::Rect,
+    label: &str,
+    local: f32,
+    font_size: f32,
+) {
+    if local <= 0.0 {
+        return;
+    }
+    let cell = cell.shrink(2.0);
+    let alpha = (local * 255.0) as u8;
+    painter.rect_filled(
+        cell,
+        4.0,
+        ACCENT.gamma_multiply(0.18).linear_multiply(local),
+    );
+    painter.rect_stroke(
+        cell,
+        4u8,
+        egui::Stroke::new(1.0_f32, ACCENT.linear_multiply(local)),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        cell.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(font_size),
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
+    );
+}
+
+fn rear_touch_diagram(ui: &mut egui::Ui, max_height: f32, intro: Option<f32>) {
+    let Some(texture) = vita_back(ui.ctx()) else {
+        return;
+    };
+    let Some(image) = allocate_device_image(ui, &texture, max_height) else {
+        return;
+    };
+
+    let mode = crate::gfn::stream_prefs::rear_touch_mode();
+    let trigger_swap = crate::gfn::stream_prefs::trigger_swap_enabled();
+    let (tl, tr) = if trigger_swap {
+        ("L1", "R1")
+    } else {
+        ("L2", "R2")
+    };
+    let (bl, br) = ("L3", "R3");
+
+    let pad = uv_subrect(image, REAR_PAD_X, REAR_PAD_Y);
+    let painter = ui.painter();
+
+    if let Some(progress) = intro {
+        let halves = [("L2", 0.0_f32, 0.0), ("R2", 1.0, 0.5)];
+        let cell_size = egui::vec2(pad.width() / 2.0, pad.height());
+        for (index, (label, column, phase)) in halves.iter().enumerate() {
+            let start = index as f32 * 0.18;
+            let local = ((progress - start) / 0.4).clamp(0.0, 1.0);
+            let cell = egui::Rect::from_min_size(
+                egui::pos2(pad.min.x + column * cell_size.x, pad.min.y),
+                cell_size,
+            );
+            let _ = phase;
+            paint_intro_zone(painter, cell, label, local, 12.0);
+        }
+        return;
+    }
+
+    let time = ui.ctx().input(|input| input.time);
+    ui.ctx().request_repaint();
+
+    match mode {
+        crate::gfn::stream_prefs::RearTouchMode::Halves => {
+            let cell_size = egui::vec2(pad.width() / 2.0, pad.height());
+            for (label, column, phase) in [(tl, 0.0_f32, 0.0_f64), (tr, 1.0, 0.5)] {
+                let cell = egui::Rect::from_min_size(
+                    egui::pos2(pad.min.x + column * cell_size.x, pad.min.y),
+                    cell_size,
+                );
+                paint_pulsing_zone(painter, cell, label, time, phase, 12.0);
+            }
+        }
+        crate::gfn::stream_prefs::RearTouchMode::Quadrant => {
+            let cell_size = egui::vec2(pad.width() / 2.0, pad.height() / 2.0);
+            for (label, column, row, phase) in [
+                (tl, 0.0_f32, 0.0_f32, 0.00_f64),
+                (tr, 1.0, 0.0, 0.25),
+                (bl, 0.0, 1.0, 0.50),
+                (br, 1.0, 1.0, 0.75),
+            ] {
+                let cell = egui::Rect::from_min_size(
+                    egui::pos2(
+                        pad.min.x + column * cell_size.x,
+                        pad.min.y + row * cell_size.y,
+                    ),
+                    cell_size,
+                );
+                paint_pulsing_zone(painter, cell, label, time, phase, 10.0);
+            }
+        }
+    }
+}
+
+fn front_stick_zones_diagram(ui: &mut egui::Ui, max_height: f32) {
+    let Some(texture) = vita_front(ui.ctx()) else {
+        return;
+    };
+    let Some(image) = allocate_device_image(ui, &texture, max_height) else {
+        return;
+    };
+
+    let zones = crate::gfn::stream_prefs::stick_zones();
+    if !zones.is_active() {
+        return;
+    }
+
+    let screen = uv_subrect(image, FRONT_SCREEN_X, FRONT_SCREEN_Y);
+    let time = ui.ctx().input(|input| input.time);
+    ui.ctx().request_repaint();
+
+    let painter = ui.painter();
+    let top = crate::input::STICK_ZONE_TOP;
+    let width = crate::input::STICK_ZONE_WIDTH;
+    let left = egui::Rect::from_min_max(
+        egui::pos2(screen.min.x, screen.min.y + screen.height() * top),
+        egui::pos2(screen.min.x + screen.width() * width, screen.max.y),
+    );
+    let right = egui::Rect::from_min_max(
+        egui::pos2(
+            screen.max.x - screen.width() * width,
+            screen.min.y + screen.height() * top,
+        ),
+        egui::pos2(screen.max.x, screen.max.y),
+    );
+    paint_pulsing_zone(painter, left, "L3", time, 0.0, 10.0);
+    paint_pulsing_zone(painter, right, "R3", time, 0.5, 10.0);
+}
+
+fn ping_color(ms: u32) -> egui::Color32 {
+    match ms {
+        0..=40 => ACCENT,
+        41..=80 => egui::Color32::from_rgb(0xe0, 0xa8, 0x30),
+        _ => DANGER,
+    }
+}
+
+fn queue_color(position: u32) -> egui::Color32 {
+    match position {
+        0..=9 => ACCENT,
+        10..=24 => egui::Color32::from_rgb(0xe0, 0xa8, 0x30),
+        _ => DANGER,
+    }
+}
+
+fn format_wait(seconds: u64) -> String {
+    if seconds >= 60 {
+        format!("~{}m", seconds / 60)
+    } else {
+        format!("~{seconds}s")
+    }
+}
+
+fn server_picker_modal(
+    ctx: &egui::Context,
+    i18n: &I18n,
+    app: &App,
+    game: Option<&GameSummary>,
+) -> Vec<AppCommand> {
+    let mut commands = Vec::new();
+    let regions = &app.regions;
+    let queue = &app.queue_stats;
+    let focus = app.server_picker_focus;
+
+    let queue_for = |url: &str| {
+        crate::gfn::queue_stats::server_code_from_url(url).and_then(|code| queue.get(&code).copied())
+    };
+    let best_index = regions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, region)| region.ping_ms.map(|ping| (index, region, ping)))
+        .min_by_key(|(_, region, ping)| {
+            let depth = queue_for(&region.url).map_or(u32::MAX, |r| r.queue_position);
+            (*ping, depth)
+        })
+        .map(|(index, _, _)| index);
+    let closest_index = regions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, region)| region.ping_ms.map(|ping| (index, ping)))
+        .min_by_key(|(_, ping)| *ping)
+        .map(|(index, _)| index);
+
+    egui::Modal::new(egui::Id::new("server_picker_modal"))
+        .backdrop_color(egui::Color32::from_black_alpha(190))
+        .frame(
+            egui::Frame::default()
+                .fill(BG_PANEL)
+                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::symmetric(14, 12)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(520.0);
+
+            ui.horizontal(|ui| {
+                ui.heading(egui::RichText::new(i18n.text("server-picker-heading").as_ref()).size(15.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_sized(
+                            [30.0, 26.0],
+                            egui::Button::new(egui::RichText::new("X").size(14.0).strong()),
+                        )
+                        .clicked()
+                    {
+                        commands.push(AppCommand::CloseServerPicker);
+                    }
+                });
+            });
+            if let Some(game) = game {
+                ui.label(
+                    egui::RichText::new(&game.title)
+                        .size(10.5)
+                        .color(TEXT_DIM),
+                );
+            }
+            ui.separator();
+
+            if app.is_loading_regions() {
+                ui.label(
+                    egui::RichText::new(i18n.text(if app.regions_measuring {
+                        "settings-region-measuring"
+                    } else {
+                        "settings-region-loading"
+                    }).as_ref())
+                    .size(10.0)
+                    .color(TEXT_DIM),
+                );
+            }
+            if app.is_loading_queue_stats() {
+                ui.label(
+                    egui::RichText::new(i18n.text("server-picker-queue-loading").as_ref())
+                        .size(10.0)
+                        .color(TEXT_DIM),
+                );
+            }
+
+            egui::ScrollArea::vertical()
+                .id_salt("server_picker_list")
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    let auto_detail = best_index
+                        .and_then(|index| regions.get(index))
+                        .map(|region| match region.ping_ms {
+                            Some(ms) => format!("{} · {ms} ms", region.name),
+                            None => region.name.clone(),
+                        });
+                    if server_picker_row(
+                        ui,
+                        &i18n.text("settings-region-auto"),
+                        auto_detail.as_deref(),
+                        None,
+                        None,
+                        focus == 0,
+                        None,
+                    ) {
+                        commands.push(AppCommand::FocusServerPicker(0));
+                        commands.push(AppCommand::LaunchOnServer(String::new()));
+                    }
+
+                    for (index, region) in regions.iter().enumerate() {
+                        let row = index + 1;
+                        let badge = if Some(index) == best_index {
+                            Some(i18n.text("server-picker-auto-badge"))
+                        } else if Some(index) == closest_index {
+                            Some(i18n.text("server-picker-closest-badge"))
+                        } else {
+                            None
+                        };
+                        if server_picker_row(
+                            ui,
+                            &region.name,
+                            None,
+                            region.ping_ms,
+                            queue_for(&region.url),
+                            focus == row,
+                            badge.as_deref(),
+                        ) {
+                            commands.push(AppCommand::FocusServerPicker(row));
+                            commands.push(AppCommand::LaunchOnServer(region.url.clone()));
+                        }
+                    }
+                });
+
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(i18n.text("server-picker-hint").as_ref())
+                    .size(9.5)
+                    .color(TEXT_DIM),
+            );
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let launch = egui::Button::new(
+                        egui::RichText::new(i18n.text("server-picker-launch").as_ref())
+                            .size(12.0)
+                            .strong()
+                            .color(BG_DEEP),
+                    )
+                    .fill(ACCENT)
+                    .min_size(egui::vec2(96.0, 28.0));
+                    if ui.add(launch).clicked() {
+                        commands.push(AppCommand::LaunchOnServer(
+                            match focus.checked_sub(1) {
+                                None => String::new(),
+                                Some(index) => regions
+                                    .get(index)
+                                    .map(|region| region.url.clone())
+                                    .unwrap_or_default(),
+                            },
+                        ));
+                    }
+                    ui.add_space(6.0);
+                    let cancel = egui::Button::new(
+                        egui::RichText::new(i18n.text("server-picker-cancel").as_ref()).size(12.0),
+                    )
+                    .fill(BG_RAISED)
+                    .min_size(egui::vec2(84.0, 28.0));
+                    if ui.add(cancel).clicked() {
+                        commands.push(AppCommand::CloseServerPicker);
+                    }
+                    ui.add_space(6.0);
+                    let refresh = ui.add_sized(
+                        [28.0, 28.0],
+                        egui::Button::new("").fill(BG_RAISED),
+                    );
+                    if refresh.clicked() {
+                        commands.push(AppCommand::LoadQueueStats);
+                        commands.push(AppCommand::TestRegionLatency);
+                    }
+                    paint_stream_icon(
+                        ui.painter(),
+                        refresh.rect.shrink(7.0),
+                        StreamIcon::Signal,
+                        ACCENT,
+                    );
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(i18n.text("server-picker-powered-by").as_ref())
+                                .size(9.5)
+                                .color(TEXT_DIM),
+                        )
+                        .truncate(),
+                    );
+                });
+            });
+        });
+
+    commands
+}
+
+fn server_picker_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    detail: Option<&str>,
+    ping_ms: Option<u32>,
+    queue: Option<crate::gfn::queue_stats::QueueReading>,
+    focused: bool,
+    badge: Option<&str>,
+) -> bool {
+    let height = if detail.is_some() { 34.0 } else { 26.0 };
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response.clicked();
+    }
+
+    let painter = ui.painter();
+    if focused {
+        painter.rect_filled(rect, 5.0, ACCENT.gamma_multiply(0.16));
+        painter.rect_stroke(
+            rect,
+            5.0,
+            egui::Stroke::new(1.0_f32, ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    let text_x = rect.min.x + 8.0;
+    let name_y = if detail.is_some() {
+        rect.min.y + 11.0
+    } else {
+        rect.center().y
+    };
+    let name_end = painter.text(
+        egui::pos2(text_x, name_y),
+        egui::Align2::LEFT_CENTER,
+        name,
+        egui::FontId::proportional(11.5),
+        egui::Color32::WHITE,
+    );
+    if let Some(detail) = detail {
+        painter.text(
+            egui::pos2(text_x, rect.min.y + 24.0),
+            egui::Align2::LEFT_CENTER,
+            detail,
+            egui::FontId::proportional(9.5),
+            TEXT_DIM,
+        );
+    }
+    if let Some(badge) = badge {
+        painter.text(
+            egui::pos2(name_end.max.x + 8.0, name_y),
+            egui::Align2::LEFT_CENTER,
+            badge,
+            egui::FontId::proportional(8.5),
+            ACCENT,
+        );
+    }
+
+    let mut x = rect.max.x - 8.0;
+    if let Some(seconds) = queue.and_then(|reading| reading.eta_seconds) {
+        let drawn = painter.text(
+            egui::pos2(x, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format_wait(seconds),
+            egui::FontId::proportional(10.0),
+            TEXT_DIM,
+        );
+        x = drawn.min.x - 10.0;
+    }
+    if let Some(reading) = queue {
+        let drawn = painter.text(
+            egui::pos2(x, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format!("Q:{}", reading.queue_position),
+            egui::FontId::proportional(10.5),
+            queue_color(reading.queue_position),
+        );
+        x = drawn.min.x - 10.0;
+    }
+    if let Some(ms) = ping_ms {
+        painter.text(
+            egui::pos2(x, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            format!("{ms} ms"),
+            egui::FontId::proportional(10.5),
+            ping_color(ms),
+        );
+    }
+
+    response.clicked()
+}
+
+fn settings_tab_button(
+    ui: &mut egui::Ui,
+    i18n: &I18n,
+    tab: crate::app::settings_menu::SettingsTab,
+    current: crate::app::settings_menu::SettingsTab,
+) -> Option<AppCommand> {
+    use crate::app::settings_menu::SettingsTab;
+
+    let icon = match tab {
+        SettingsTab::Stream => StreamIcon::Globe,
+        SettingsTab::Controls => StreamIcon::Controls,
+        SettingsTab::App => StreamIcon::Monitor,
+        SettingsTab::Account => StreamIcon::Person,
+    };
+    let active = tab == current;
+    let label = i18n.text(tab.label_key());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(122.0, 28.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if active {
+            painter.rect_filled(rect, 5.0, ACCENT.gamma_multiply(0.14));
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.min.x + 8.0, rect.max.y - 3.0),
+                    egui::vec2(rect.width() - 16.0, 2.0),
+                ),
+                1.0,
+                ACCENT,
+            );
+        }
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.min.x + 16.0, rect.center().y),
+            egui::vec2(13.0, 13.0),
+        );
+        paint_stream_icon(painter, icon_rect, icon, if active { ACCENT } else { TEXT_DIM });
+        painter.text(
+            egui::pos2(rect.min.x + 30.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label.as_ref(),
+            egui::FontId::proportional(12.0),
+            if active {
+                egui::Color32::WHITE
+            } else {
+                TEXT_DIM
+            },
+        );
+    }
+    response.clicked().then_some(AppCommand::SetSettingsTab(tab))
+}
+
+fn settings_item(
+    ui: &mut egui::Ui,
+    i18n: &I18n,
+    tab: crate::app::settings_menu::SettingsTab,
+    row: usize,
+    info: &crate::app::settings_menu::RowInfo,
+    focused: bool,
+    expanded: bool,
+    option_focus: usize,
+    regions: &RegionsView<'_>,
+    show_touch_diagrams: bool,
+) -> Option<AppCommand> {
+    use crate::app::settings_menu::RowKind;
+
+    let mut command = None;
+    ui.add_space(4.0);
+
+    if matches!(info.kind, RowKind::Region)
+        && regions.list.is_empty()
+        && !regions.busy
+        && regions.error.is_none()
+    {
+        command = Some(AppCommand::LoadRegions);
+    }
+
+    let control_width = if matches!(info.kind, RowKind::Region) {
+        200.0
+    } else {
+        160.0
+    };
+    let header_response = ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width((ui.available_width() - control_width).max(80.0));
+            ui.label(egui::RichText::new(i18n.text(info.label_key).as_ref()).size(12.5).strong());
+            if let Some(desc_key) = info.desc_key {
+                ui.label(egui::RichText::new(i18n.text(desc_key).as_ref()).size(9.5).color(TEXT_DIM));
+            }
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            match info.kind {
+                RowKind::Toggle(on) => {
+                    let game_only = info.label_key == "settings-game-profile-heading";
+                    let can_toggle = !game_only || crate::gfn::stream_prefs::active_game().is_some();
+                    let mut value = on;
+                    let response = ui.add_enabled(
+                        can_toggle,
+                        egui::Checkbox::without_text(&mut value),
+                    );
+                    if response.changed() && can_toggle {
+                        command = Some(AppCommand::ChooseSettingsOption(row, 0));
+                    }
+                }
+                RowKind::Choice | RowKind::Region => {
+                    let summary = if info.kind == RowKind::Region && regions.busy {
+                        i18n.text(if regions.measuring {
+                            "settings-region-measuring"
+                        } else {
+                            "settings-region-loading"
+                        })
+                        .to_string()
+                    } else {
+                        crate::app::settings_menu::current_summary(tab, row, i18n, regions.list, i18n.locale())
+                    };
+                    let button = egui::Button::new(egui::RichText::new(format!("{summary}   ")).size(11.0))
+                        .fill(BG_RAISED)
+                        .min_size(egui::vec2(150.0, 28.0));
+                    let button_response = ui.add(button);
+                    if button_response.clicked() {
+                        command = Some(AppCommand::ExpandSettingsRow(if expanded { None } else { Some(row) }));
+                    }
+                    let chevron_rect = egui::Rect::from_center_size(
+                        egui::pos2(button_response.rect.max.x - 14.0, button_response.rect.center().y),
+                        egui::vec2(12.0, 12.0),
+                    );
+                    paint_stream_icon(ui.painter(), chevron_rect, StreamIcon::ChevronDown, TEXT_DIM);
+                    if info.kind == RowKind::Region {
+                        let test_btn = ui.add_sized([28.0, 28.0], egui::Button::new("").fill(BG_RAISED));
+                        if test_btn.clicked() {
+                            command = Some(if regions.list.is_empty() {
+                                AppCommand::LoadRegions
+                            } else {
+                                AppCommand::TestRegionLatency
+                            });
+                        }
+                        paint_stream_icon(ui.painter(), test_btn.rect.shrink(7.0), StreamIcon::Signal, ACCENT);
+                    }
+                }
+            }
+        });
+    });
+
+    if focused {
+        ui.painter().rect_stroke(
+            header_response.response.rect.expand(3.0),
+            4.0,
+            egui::Stroke::new(1.5_f32, ACCENT),
+            egui::StrokeKind::Outside,
+        );
+    }
+
+    if let RowKind::Region = info.kind {
+        if let Some(error) = regions.error {
+            ui.label(egui::RichText::new(error).size(10.0).color(DANGER));
+        }
+    }
+
+    if expanded {
+        let option_count = crate::app::settings_menu::option_count(tab, row, regions.list.len());
+        egui::Frame::default()
+            .fill(BG_DEEP)
+            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::same(4))
+            .show(ui, |ui| {
+                let current_index = crate::app::settings_menu::current_option_index(
+                    tab,
+                    row,
+                    regions.list,
+                    i18n.locale(),
+                );
+                for option in 0..option_count {
+                    let label = crate::app::settings_menu::option_label(tab, row, option, i18n, regions.list);
+                    let is_current = option == current_index;
+                    let is_focused = option == option_focus;
+                    let (rect, response) =
+                        ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
+                    if ui.is_rect_visible(rect) {
+                        if is_focused {
+                            ui.painter().rect_filled(rect, 4.0, ACCENT.gamma_multiply(0.18));
+                        }
+                        ui.painter().text(
+                            egui::pos2(rect.min.x + 8.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &label,
+                            egui::FontId::proportional(11.5),
+                            if is_current { ACCENT } else { egui::Color32::WHITE },
+                        );
+                        if is_current {
+                            let check_rect = egui::Rect::from_center_size(
+                                egui::pos2(rect.max.x - 14.0, rect.center().y),
+                                egui::vec2(12.0, 12.0),
+                            );
+                            paint_stream_icon(ui.painter(), check_rect, StreamIcon::Check, ACCENT);
+                        }
+                        if info.kind == RowKind::Region && option > 0 {
+                            if let Some(best) = regions
+                                .list
+                                .iter()
+                                .filter_map(|r| r.ping_ms)
+                                .min()
+                            {
+                                if regions.list.get(option - 1).and_then(|r| r.ping_ms) == Some(best) {
+                                    ui.painter().text(
+                                        egui::pos2(rect.max.x - 46.0, rect.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        i18n.text("settings-region-best"),
+                                        egui::FontId::proportional(8.5),
+                                        ACCENT,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if response.clicked() {
+                        command = Some(AppCommand::ChooseSettingsOption(row, option));
+                    }
+                }
+            });
+    }
+
+    if show_touch_diagrams {
+        if info.label_key == "settings-rear-touch-mode-heading" {
+            ui.add_space(8.0);
+            rear_touch_diagram(ui, 120.0, None);
+            ui.add_space(6.0);
+        }
+        if info.label_key == "settings-stick-zones-heading" {
+            ui.add_space(8.0);
+            front_stick_zones_diagram(ui, 120.0);
+            ui.add_space(6.0);
+        }
+    }
+
     command
 }
 
@@ -1309,7 +2389,7 @@ fn settings_row<T: PartialEq + Copy>(
     let mut chosen = None;
     ui.add_space(6.0);
     ui.label(
-        egui::RichText::new(i18n.text(heading_key))
+        egui::RichText::new(i18n.text(heading_key).as_ref())
             .size(10.0)
             .color(TEXT_DIM),
     );
@@ -1334,8 +2414,8 @@ fn sort_picker(
     games: &[GameSummary],
 ) -> Option<AppCommand> {
     let mut command = None;
-    let label = text1(i18n, "catalog-sort-button", "sort", i18n.text(current.label_key()));
-    let response = ui.add_sized([150.0, 30.0], egui::Button::new(label).fill(BG_RAISED));
+    let label = text1(i18n, "catalog-sort-button", "sort", i18n.text(current.label_key()).as_ref());
+    let response = ui.add_sized([150.0, 30.0], egui::Button::new(label.as_ref()).fill(BG_RAISED));
     let popup_id = ui.make_persistent_id("catalog_sort_popup");
     if response.clicked() {
         ui.memory_mut(|mem| mem.toggle_popup(popup_id));
@@ -1352,7 +2432,7 @@ fn sort_picker(
                     let count = games.iter().filter(|g| g.last_played.is_some()).count();
                     format!("{} ({count})", i18n.text(candidate.label_key()))
                 } else {
-                    i18n.text(candidate.label_key())
+                    i18n.text(candidate.label_key()).to_string()
                 };
                 if ui.selectable_label(candidate == current, label).clicked() {
                     command = Some(AppCommand::SetSort(candidate));
@@ -1366,8 +2446,8 @@ fn sort_picker(
 // same as sort_picker but for my games / all games
 fn filter_picker(ui: &mut egui::Ui, i18n: &I18n, current: CatalogFilter) -> Option<AppCommand> {
     let mut command = None;
-    let label = text1(i18n, "catalog-filter-button", "filter", i18n.text(current.label_key()));
-    let response = ui.add_sized([150.0, 30.0], egui::Button::new(label).fill(BG_RAISED));
+    let label = text1(i18n, "catalog-filter-button", "filter", i18n.text(current.label_key()).as_ref());
+    let response = ui.add_sized([150.0, 30.0], egui::Button::new(label.as_ref()).fill(BG_RAISED));
     let popup_id = ui.make_persistent_id("catalog_filter_popup");
     if response.clicked() {
         ui.memory_mut(|mem| mem.toggle_popup(popup_id));
@@ -1381,7 +2461,7 @@ fn filter_picker(ui: &mut egui::Ui, i18n: &I18n, current: CatalogFilter) -> Opti
             ui.set_min_width(170.0);
             for candidate in CatalogFilter::ALL {
                 let label = i18n.text(candidate.label_key());
-                if ui.selectable_label(candidate == current, label).clicked() {
+                if ui.selectable_label(candidate == current, label.as_ref()).clicked() {
                     command = Some(AppCommand::SetFilter(candidate));
                 }
             }
@@ -1402,7 +2482,7 @@ fn title_list(ui: &mut egui::Ui, i18n: &I18n, view: &CatalogView<'_>) -> Vec<App
             view.filtered_indices.len()
         )
     } else {
-        i18n.text("catalog-search-hint")
+        i18n.text("catalog-search-hint").to_string()
     };
     // Clearing used to take two Back presses while the on-screen keyboard was up (one to dismiss
     // it, one to actually empty the field) with no visible way to do it in one tap. The × sits
@@ -1462,11 +2542,14 @@ fn title_list(ui: &mut egui::Ui, i18n: &I18n, view: &CatalogView<'_>) -> Vec<App
     if view.filtered_indices.is_empty() {
         ui.add_space(20.0);
         ui.label(
-            egui::RichText::new(if view.games.is_empty() {
-                i18n.text("catalog-no-games-api")
-            } else {
-                i18n.text("catalog-no-match")
-            })
+            egui::RichText::new(
+                if view.games.is_empty() {
+                    i18n.text("catalog-no-games-api")
+                } else {
+                    i18n.text("catalog-no-match")
+                }
+                .as_ref(),
+            )
             .size(12.0)
             .color(TEXT_DIM),
         );
@@ -1535,7 +2618,7 @@ fn title_list(ui: &mut egui::Ui, i18n: &I18n, view: &CatalogView<'_>) -> Vec<App
                     painter.rect_stroke(
                         rect,
                         6.0,
-                        egui::Stroke::new(1.5, ACCENT),
+                        egui::Stroke::new(1.5_f32, ACCENT),
                         egui::StrokeKind::Inside,
                     );
                     painter.rect_filled(
@@ -1553,17 +2636,18 @@ fn title_list(ui: &mut egui::Ui, i18n: &I18n, view: &CatalogView<'_>) -> Vec<App
                     egui::pos2(rect.min.x + 9.0, rect.center().y - icon_size / 2.0),
                     egui::vec2(icon_size, icon_size),
                 );
-                if let Some(url) = game.cover_url.clone() {
+                if !view.covers.is_requested(&game.app_id, CoverSize::Icon)
+                    && let Some(url) = game.cover_url.clone()
+                {
                     view.covers
                         .request_icon(view.http_client, ui.ctx(), game.app_id.clone(), url);
                 }
                 painter.rect_filled(icon_rect, 3.0, BG_DEEP);
                 match view.covers.get_icon(&game.app_id) {
                     Some(CoverSnapshot::Ready(image)) => {
-                        let tex = image.texture(
-                            ui.ctx(),
-                            &CoverStore::texture_key(&game.app_id, CoverSize::Icon),
-                        );
+                        let tex = image.texture(ui.ctx(), || {
+                            CoverStore::texture_key(&game.app_id, CoverSize::Icon)
+                        });
                         let size = tex.size_vec2();
                         let src_aspect = size.x / size.y.max(1.0);
                         let uv = if src_aspect > 1.0 {
@@ -1655,7 +2739,7 @@ fn detail_panel(
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
             ui.label(
-                egui::RichText::new(i18n.text("detail-empty"))
+                egui::RichText::new(i18n.text("detail-empty").as_ref())
                     .size(13.0)
                     .color(TEXT_DIM),
             );
@@ -1663,7 +2747,9 @@ fn detail_panel(
         return commands;
     };
 
-    if let Some(url) = game.cover_url.clone() {
+    if !view.covers.is_requested(&game.app_id, CoverSize::Cover)
+        && let Some(url) = game.cover_url.clone()
+    {
         view.covers
             .request(view.http_client, ctx, game.app_id.clone(), url);
     }
@@ -1741,10 +2827,10 @@ fn detail_panel(
                 Some(date) => text1(i18n, "detail-last-played", "date", short_date(date)),
                 None => i18n.text("detail-never-played"),
             };
-            ui.label(egui::RichText::new(played).size(11.0).color(TEXT_DIM));
+            ui.label(egui::RichText::new(played.as_ref()).size(11.0).color(TEXT_DIM));
             ui.add_space(2.0);
             ui.label(
-                egui::RichText::new(text1(i18n, "detail-app-id", "id", &game.app_id))
+                egui::RichText::new(text1(i18n, "detail-app-id", "id", &game.app_id).as_ref())
                     .size(10.0)
                     .monospace()
                     .color(BORDER.gamma_multiply(3.0)),
@@ -1758,7 +2844,7 @@ fn detail_panel(
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(i18n.text("detail-press"))
+                    egui::RichText::new(i18n.text("detail-press").as_ref())
                         .size(11.0)
                         .color(TEXT_DIM),
                 );
@@ -1773,7 +2859,7 @@ fn detail_panel(
                     );
                 }
                 ui.label(
-                    egui::RichText::new(i18n.text("detail-to-start"))
+                    egui::RichText::new(i18n.text("detail-to-start").as_ref())
                         .size(11.0)
                         .color(TEXT_DIM),
                 );
@@ -1864,7 +2950,7 @@ fn draw_panel_backdrop(
         return;
     }
 
-    let tex = image.texture(ctx, &format!("gfn_cover_{}", game.app_id));
+    let tex = image.texture(ctx, || CoverStore::texture_key(&game.app_id, CoverSize::Cover));
     let tex_size = tex.size_vec2();
     let src_aspect = tex_size.x / tex_size.y.max(1.0);
     let dst_aspect = rect.width() / rect.height();
@@ -1925,7 +3011,7 @@ fn draw_cover(
     painter.rect_filled(rect, 4.0, BG_DEEP);
 
     let paint_at = |size: CoverSize, image: &Arc<crate::gfn::covers::TitleImage>| {
-        let tex = image.texture(ctx, &CoverStore::texture_key(&game.app_id, size));
+        let tex = image.texture(ctx, || CoverStore::texture_key(&game.app_id, size));
         let tex_size = tex.size_vec2();
         let src_aspect = tex_size.x / tex_size.y.max(1.0);
         let slot_aspect = rect.width() / rect.height();
@@ -2015,9 +3101,9 @@ struct LaunchView<'a> {
     stage: LaunchStage,
     game: Option<&'a GameSummary>,
     /// Large line under the stepper.
-    headline: String,
+    headline: std::rc::Rc<str>,
     /// Small line under the headline, if there's anything more specific to say.
-    detail: Option<String>,
+    detail: Option<std::rc::Rc<str>>,
     /// False on the stages that are waiting on the player rather than on NVIDIA.
     spinning: bool,
     /// The launch never sat in NVIDIA's queue, so step 1 is drawn as skipped rather than as
@@ -2047,7 +3133,7 @@ fn session_launch_overlay(
         .frame(
             egui::Frame::default()
                 .fill(BG_PANEL)
-                .stroke(egui::Stroke::new(1.0, BORDER))
+                .stroke(egui::Stroke::new(1.0_f32, BORDER))
                 .corner_radius(10.0)
                 .inner_margin(egui::Margin::symmetric(16, 14)),
         )
@@ -2065,13 +3151,13 @@ fn session_launch_overlay(
                     ui.add_space(8.0);
                 }
                 ui.label(
-                    egui::RichText::new(&launch.headline)
+                    egui::RichText::new(launch.headline.as_ref())
                         .size(15.0)
                         .color(egui::Color32::WHITE),
                 );
                 if let Some(detail) = &launch.detail {
                     ui.add_space(3.0);
-                    button_hint(ui, detail, 11.0, TEXT_DIM, true);
+                    button_hint(ui, detail.as_ref(), 11.0, TEXT_DIM, true);
                 }
             });
 
@@ -2083,7 +3169,7 @@ fn session_launch_overlay(
                 .add_sized(
                     egui::vec2(ui.available_width(), 30.0),
                     egui::Button::new(
-                        egui::RichText::new(i18n.text("session-cancel-button"))
+                        egui::RichText::new(i18n.text("session-cancel-button").as_ref())
                             .size(14.0)
                             .color(DANGER),
                     )
@@ -2198,7 +3284,9 @@ fn launch_header(
             Some(game) => {
                 // Same request + `draw_cover` path the detail panel uses, so the art, the loading
                 // spinner and the initial-letter fallback all behave identically here.
-                if let Some(url) = game.cover_url.clone() {
+                if !catalog.covers.is_requested(&game.app_id, CoverSize::Cover)
+                    && let Some(url) = game.cover_url.clone()
+                {
                     catalog
                         .covers
                         .request(catalog.http_client, ui.ctx(), game.app_id.clone(), url);
@@ -2218,7 +3306,7 @@ fn launch_header(
         ui.add_space(10.0);
         ui.vertical(|ui| {
             ui.label(
-                egui::RichText::new(i18n.text("session-now-loading"))
+                egui::RichText::new(i18n.text("session-now-loading").as_ref())
                     .size(10.0)
                     .color(ACCENT),
             );
@@ -2267,7 +3355,7 @@ fn launch_stepper(ui: &mut egui::Ui, i18n: &I18n, stage: LaunchStage, queue_skip
                     egui::pos2(x - gap + STEP_DOT_RADIUS + 2.0, dot_y),
                     egui::pos2(x - STEP_DOT_RADIUS - 2.0, dot_y),
                 ],
-                egui::Stroke::new(2.0, if reached { ACCENT } else { BORDER }),
+                egui::Stroke::new(2.0_f32, if reached { ACCENT } else { BORDER }),
             );
         }
 
@@ -2281,7 +3369,7 @@ fn launch_stepper(ui: &mut egui::Ui, i18n: &I18n, stage: LaunchStage, queue_skip
             },
         );
         if reached && step != stage.index() {
-            painter.circle_stroke(center, STEP_DOT_RADIUS, egui::Stroke::new(1.5, ACCENT));
+            painter.circle_stroke(center, STEP_DOT_RADIUS, egui::Stroke::new(1.5_f32, ACCENT));
         }
         painter.text(
             center,
@@ -2322,6 +3410,19 @@ fn creating_session_launch<'a>(
             game,
             headline: i18n.text("session-app-patching"),
             detail: Some(i18n.text("session-app-patching-detail")),
+            spinning: true,
+            session_id: None,
+            queue_skipped: !was_queued,
+        };
+    }
+
+    if queue_status.has_video_ad {
+        let percent = (queue_status.ad_progress_pct.clamp(0.0, 1.0) * 100.0).round() as u32;
+        return LaunchView {
+            stage: LaunchStage::Queue,
+            game,
+            headline: i18n.text("session-ad-playing"),
+            detail: Some(text1(i18n, "session-ad-progress", "percent", percent)),
             spinning: true,
             session_id: None,
             queue_skipped: !was_queued,
@@ -2419,7 +3520,7 @@ fn confirm_exit_modal(ctx: &egui::Context, i18n: &I18n) -> Option<AppCommand> {
         .frame(
             egui::Frame::default()
                 .fill(BG_PANEL)
-                .stroke(egui::Stroke::new(1.0, BORDER))
+                .stroke(egui::Stroke::new(1.0_f32, BORDER))
                 .corner_radius(10.0)
                 .inner_margin(egui::Margin::symmetric(16, 14)),
         )
@@ -2427,13 +3528,13 @@ fn confirm_exit_modal(ctx: &egui::Context, i18n: &I18n) -> Option<AppCommand> {
             ui.set_width(LAUNCH_MODAL_WIDTH);
             ui.vertical_centered(|ui| {
                 ui.add_space(8.0);
-                ui.heading(egui::RichText::new(i18n.text("exit-heading")).size(17.0));
+                ui.heading(egui::RichText::new(i18n.text("exit-heading").as_ref()).size(17.0));
                 ui.add_space(10.0);
-                ui.label(i18n.text("exit-body"));
+                ui.label(i18n.text("exit-body").as_ref());
                 ui.add_space(18.0);
                 ui.horizontal(|ui| {
                     if ui
-                        .add(egui::Button::new(i18n.text("exit-cancel")).fill(BG_RAISED))
+                        .add(egui::Button::new(i18n.text("exit-cancel").as_ref()).fill(BG_RAISED))
                         .clicked()
                     {
                         command = Some(AppCommand::CancelConfirmExit);
@@ -2442,7 +3543,7 @@ fn confirm_exit_modal(ctx: &egui::Context, i18n: &I18n) -> Option<AppCommand> {
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new(i18n.text("exit-confirm")).color(DANGER),
+                                egui::RichText::new(i18n.text("exit-confirm").as_ref()).color(DANGER),
                             )
                             .fill(BG_RAISED),
                         )
@@ -2480,16 +3581,16 @@ fn streaming_screen(
                 ui.add_space(16.0);
                 match game {
                     Some(game) => ui.heading(
-                        egui::RichText::new(text1(i18n, "streaming-game", "game", &game.title))
+                        egui::RichText::new(text1(i18n, "streaming-game", "game", &game.title).as_ref())
                             .size(18.0),
                     ),
                     None => {
-                        ui.heading(egui::RichText::new(i18n.text("streaming-generic")).size(18.0))
+                        ui.heading(egui::RichText::new(i18n.text("streaming-generic").as_ref()).size(18.0))
                     }
                 };
                 ui.add_space(12.0);
                 ui.label(
-                    egui::RichText::new(i18n.text("streaming-signaling-done"))
+                    egui::RichText::new(i18n.text("streaming-signaling-done").as_ref())
                         .color(ACCENT)
                         .strong(),
                 );
@@ -2497,7 +3598,7 @@ fn streaming_screen(
                 ui.label(
                     status_note
                         .map(str::to_owned)
-                        .unwrap_or_else(|| i18n.text("streaming-waiting-negotiation")),
+                        .unwrap_or_else(|| i18n.text("streaming-waiting-negotiation").to_string()),
                 );
             });
         }
@@ -2553,6 +3654,17 @@ fn streaming_screen(
                     reserve_stream_touch(ui.ctx(), stats.rect);
                     if stats.clicked() {
                         command = Some(AppCommand::ToggleStreamStats);
+                    }
+
+                    let timer_active = crate::gfn::stream_prefs::session_timer_enabled();
+                    let timer = stream_icon_button(
+                        ui,
+                        StreamIcon::Clock,
+                        if timer_active { ACCENT } else { TEXT_DIM },
+                    );
+                    reserve_stream_touch(ui.ctx(), timer.rect);
+                    if timer.clicked() {
+                        command = Some(AppCommand::ToggleSessionTimer);
                     }
 
                     // 3. Controls Settings (L2/R2 and L3/R3 modal)
@@ -2622,80 +3734,297 @@ fn stream_controls_modal(ctx: &egui::Context, i18n: &I18n) -> Option<AppCommand>
     let mut command = None;
 
     egui::Modal::new(egui::Id::new("stream_controls_modal"))
-        .frame(egui::Frame::window(&ctx.style()).fill(BG_PANEL))
+        .backdrop_color(egui::Color32::from_black_alpha(160))
+        .frame(
+            egui::Frame::default()
+                .fill(BG_PANEL)
+                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                .corner_radius(10.0)
+                .inner_margin(egui::Margin::symmetric(12, 10)),
+        )
         .show(ctx, |ui| {
-            ui.set_max_width(320.0);
+            ui.set_width(280.0);
 
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(
-                        egui::RichText::new(i18n.text("settings-title"))
-                            .size(16.0)
-                            .strong(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(egui::RichText::new("X").strong()).clicked() {
-                            command = Some(AppCommand::ToggleControlsModal);
-                        }
-                    });
-                });
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                if let Some(chosen) = settings_row(
-                    ui,
-                    i18n,
-                    "settings-trigger-heading",
-                    crate::gfn::stream_prefs::TriggerIntensity::ALL.iter().copied(),
-                    crate::gfn::stream_prefs::trigger_intensity(),
-                    |candidate| format!("{}%", u32::from(candidate.value()) * 100 / 255),
-                ) {
-                    command = Some(AppCommand::SetTriggerIntensity(chosen));
-                }
-
-                if let Some(chosen) = settings_row(
-                    ui,
-                    i18n,
-                    "settings-rear-touch-mode-heading",
-                    crate::gfn::stream_prefs::RearTouchMode::ALL.iter().copied(),
-                    crate::gfn::stream_prefs::rear_touch_mode(),
-                    |candidate| i18n.text(candidate.label_key()),
-                ) {
-                    command = Some(AppCommand::SetRearTouchMode(chosen));
-                }
-
-                ui.add_space(6.0);
-
-                if let Some(chosen) = settings_row(
-                    ui,
-                    i18n,
-                    "settings-stick-zones-heading",
-                    crate::gfn::stream_prefs::StickZones::ALL.iter().copied(),
-                    crate::gfn::stream_prefs::stick_zones(),
-                    |candidate| i18n.text(candidate.label_key()),
-                ) {
-                    command = Some(AppCommand::SetStickZones(chosen));
-                }
-
-                ui.add_space(12.0);
-
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 26.0],
-                        egui::Button::new(
-                            egui::RichText::new(i18n.text("account-close")).size(12.0),
+            ui.horizontal(|ui| {
+                ui.heading(
+                    egui::RichText::new(i18n.text("controls-hint-heading").as_ref())
+                        .size(14.0)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_sized(
+                            [26.0, 22.0],
+                            egui::Button::new(egui::RichText::new("X").size(12.0).strong()),
                         )
-                        .fill(BG_RAISED),
-                    )
-                    .clicked()
-                {
-                    command = Some(AppCommand::ToggleControlsModal);
-                }
+                        .clicked()
+                    {
+                        command = Some(AppCommand::ToggleControlsModal);
+                    }
+                });
             });
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            rear_touch_diagram(ui, 72.0, None);
+            ui.add_space(6.0);
+
+            if let Some(chosen) = settings_row(
+                ui,
+                i18n,
+                "settings-trigger-heading",
+                crate::gfn::stream_prefs::TriggerIntensity::ALL.iter().copied(),
+                crate::gfn::stream_prefs::trigger_intensity(),
+                |candidate| format!("{}%", u32::from(candidate.value()) * 100 / 255),
+            ) {
+                command = Some(AppCommand::SetTriggerIntensity(chosen));
+            }
+
+            if let Some(chosen) = settings_row(
+                ui,
+                i18n,
+                "settings-rear-touch-mode-heading",
+                crate::gfn::stream_prefs::RearTouchMode::ALL.iter().copied(),
+                crate::gfn::stream_prefs::rear_touch_mode(),
+                |candidate| i18n.text(candidate.label_key()).to_string(),
+            ) {
+                command = Some(AppCommand::SetRearTouchMode(chosen));
+            }
+
+            ui.add_space(2.0);
+
+            if let Some(chosen) = settings_row(
+                ui,
+                i18n,
+                "settings-stick-zones-heading",
+                crate::gfn::stream_prefs::StickZones::ALL.iter().copied(),
+                crate::gfn::stream_prefs::stick_zones(),
+                |candidate| i18n.text(candidate.label_key()).to_string(),
+            ) {
+                command = Some(AppCommand::SetStickZones(chosen));
+            }
+
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(2.0);
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(i18n.text("settings-trigger-swap-heading").as_ref())
+                        .size(11.0)
+                        .color(egui::Color32::WHITE),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut value = crate::gfn::stream_prefs::trigger_swap_enabled();
+                    if ui
+                        .add(egui::Checkbox::without_text(&mut value))
+                        .changed()
+                    {
+                        command = Some(AppCommand::ToggleTriggerSwap);
+                    }
+                });
+            });
+
+            ui.add_space(8.0);
+
+            if ui
+                .add_sized(
+                    [ui.available_width(), 24.0],
+                    egui::Button::new(
+                        egui::RichText::new(i18n.text("account-close").as_ref()).size(11.0),
+                    )
+                    .fill(BG_RAISED),
+                )
+                .clicked()
+            {
+                command = Some(AppCommand::ToggleControlsModal);
+            }
         });
 
     command
+}
+
+enum KeyCap {
+    Char(char, char),
+    Key(&'static str, crate::gfn::input_protocol::KeyStroke),
+    Backspace,
+    Enter,
+    Space,
+    Shift,
+    Ctrl,
+    Alt,
+}
+
+fn keyboard_layout() -> [Vec<(KeyCap, f32)>; 6] {
+    use crate::gfn::input_protocol::*;
+    [
+        vec![
+            (KeyCap::Key("Esc", KEY_ESCAPE), 1.0),
+            (KeyCap::Key("F1", KEY_F1), 1.0), (KeyCap::Key("F2", KEY_F2), 1.0),
+            (KeyCap::Key("F3", KEY_F3), 1.0), (KeyCap::Key("F4", KEY_F4), 1.0),
+            (KeyCap::Key("F5", KEY_F5), 1.0), (KeyCap::Key("F6", KEY_F6), 1.0),
+            (KeyCap::Key("F7", KEY_F7), 1.0), (KeyCap::Key("F8", KEY_F8), 1.0),
+            (KeyCap::Key("F9", KEY_F9), 1.0), (KeyCap::Key("F10", KEY_F10), 1.0),
+            (KeyCap::Key("F11", KEY_F11), 1.0), (KeyCap::Key("F12", KEY_F12), 1.0),
+            (KeyCap::Key("Home", KEY_HOME), 1.0),
+            (KeyCap::Key("End", KEY_END), 1.0),
+        ],
+        vec![
+            (KeyCap::Char('`', '~'), 1.0),
+            (KeyCap::Char('1', '!'), 1.0), (KeyCap::Char('2', '@'), 1.0),
+            (KeyCap::Char('3', '#'), 1.0), (KeyCap::Char('4', '$'), 1.0),
+            (KeyCap::Char('5', '%'), 1.0), (KeyCap::Char('6', '^'), 1.0),
+            (KeyCap::Char('7', '&'), 1.0), (KeyCap::Char('8', '*'), 1.0),
+            (KeyCap::Char('9', '('), 1.0), (KeyCap::Char('0', ')'), 1.0),
+            (KeyCap::Char('-', '_'), 1.0), (KeyCap::Char('=', '+'), 1.0),
+            (KeyCap::Backspace, 2.0),
+        ],
+        vec![
+            (KeyCap::Key("Tab", KEY_TAB), 1.5),
+            (KeyCap::Char('q', 'Q'), 1.0), (KeyCap::Char('w', 'W'), 1.0),
+            (KeyCap::Char('e', 'E'), 1.0), (KeyCap::Char('r', 'R'), 1.0),
+            (KeyCap::Char('t', 'T'), 1.0), (KeyCap::Char('y', 'Y'), 1.0),
+            (KeyCap::Char('u', 'U'), 1.0), (KeyCap::Char('i', 'I'), 1.0),
+            (KeyCap::Char('o', 'O'), 1.0), (KeyCap::Char('p', 'P'), 1.0),
+            (KeyCap::Char('[', '{'), 1.0), (KeyCap::Char(']', '}'), 1.0),
+            (KeyCap::Char('\\', '|'), 1.5),
+        ],
+        vec![
+            (KeyCap::Key("Caps", KEY_CAPS_LOCK), 1.75),
+            (KeyCap::Char('a', 'A'), 1.0), (KeyCap::Char('s', 'S'), 1.0),
+            (KeyCap::Char('d', 'D'), 1.0), (KeyCap::Char('f', 'F'), 1.0),
+            (KeyCap::Char('g', 'G'), 1.0), (KeyCap::Char('h', 'H'), 1.0),
+            (KeyCap::Char('j', 'J'), 1.0), (KeyCap::Char('k', 'K'), 1.0),
+            (KeyCap::Char('l', 'L'), 1.0), (KeyCap::Char(';', ':'), 1.0),
+            (KeyCap::Char('\'', '"'), 1.0),
+            (KeyCap::Enter, 2.25),
+        ],
+        vec![
+            (KeyCap::Shift, 2.25),
+            (KeyCap::Char('z', 'Z'), 1.0), (KeyCap::Char('x', 'X'), 1.0),
+            (KeyCap::Char('c', 'C'), 1.0), (KeyCap::Char('v', 'V'), 1.0),
+            (KeyCap::Char('b', 'B'), 1.0), (KeyCap::Char('n', 'N'), 1.0),
+            (KeyCap::Char('m', 'M'), 1.0), (KeyCap::Char(',', '<'), 1.0),
+            (KeyCap::Char('.', '>'), 1.0), (KeyCap::Char('/', '?'), 1.0),
+            (KeyCap::Shift, 2.75),
+        ],
+        vec![
+            (KeyCap::Ctrl, 1.25),
+            (KeyCap::Alt, 1.25),
+            (KeyCap::Key("Win", KEY_LEFT_WIN), 1.25),
+            (KeyCap::Space, 4.25),
+            (KeyCap::Key("AltGr", KEY_RIGHT_ALT), 1.0),
+            (KeyCap::Key("Menu", KEY_MENU), 1.0),
+            (KeyCap::Key("Ctrl", KEY_RIGHT_CTRL), 1.0),
+            (KeyCap::Key("<", KEY_LEFT), 1.0), (KeyCap::Key("^", KEY_UP), 1.0),
+            (KeyCap::Key("v", KEY_DOWN), 1.0), (KeyCap::Key(">", KEY_RIGHT), 1.0),
+        ],
+    ]
+}
+
+fn on_screen_keyboard(ctx: &egui::Context, shift: bool, ctrl: bool, alt: bool) -> Vec<AppCommand> {
+    use crate::gfn::input_protocol::key_for_char;
+
+    let mut commands = Vec::new();
+    let panel_rect = keyboard_panel_rect(ctx.screen_rect());
+    reserve_stream_touch(ctx, panel_rect);
+
+    egui::Area::new(egui::Id::new("on_screen_keyboard"))
+        .fixed_pos(panel_rect.min)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::window(&ui.style())
+                .fill(BG_PANEL.gamma_multiply(0.96))
+                .inner_margin(egui::Margin::same(KEYBOARD_PADDING as i8))
+                .outer_margin(egui::Margin::ZERO)
+                .show(ui, |ui| {
+                    ui.set_width(panel_rect.width() - KEYBOARD_PADDING * 2.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(KEYBOARD_CAP_SPACING, KEYBOARD_CAP_SPACING);
+
+                    for row in keyboard_layout() {
+                        ui.horizontal(|ui| {
+                            for (cap, units) in row {
+                                let (label, active) = match &cap {
+                                    KeyCap::Char(lower, upper) => {
+                                        (if shift { upper.to_string() } else { lower.to_string() }, false)
+                                    }
+                                    KeyCap::Key(label, _) => (label.to_string(), false),
+                                    KeyCap::Backspace => ("Bksp".to_string(), false),
+                                    KeyCap::Enter => ("Enter".to_string(), false),
+                                    KeyCap::Space => (String::new(), false),
+                                    KeyCap::Shift => ("Shift".to_string(), shift),
+                                    KeyCap::Ctrl => ("Ctrl".to_string(), ctrl),
+                                    KeyCap::Alt => ("Alt".to_string(), alt),
+                                };
+                                let width =
+                                    KEYBOARD_CAP_SIZE.x * units + KEYBOARD_CAP_SPACING * (units - 1.0);
+                                let mut button = egui::Button::new(
+                                    egui::RichText::new(label).size(11.0),
+                                );
+                                button = if active {
+                                    button.fill(ACCENT.gamma_multiply(0.35))
+                                } else {
+                                    button.fill(BG_RAISED)
+                                };
+                                let response =
+                                    ui.add_sized([width, KEYBOARD_CAP_SIZE.y], button);
+                                if !response.clicked() {
+                                    continue;
+                                }
+                                match cap {
+                                    KeyCap::Char(lower, upper) => {
+                                        let ch = if shift { upper } else { lower };
+                                        if let Some(key) = key_for_char(ch) {
+                                            commands.push(if ctrl || alt {
+                                                AppCommand::SendChord { ctrl, alt, key }
+                                            } else {
+                                                AppCommand::SendKey(key)
+                                            });
+                                        }
+                                    }
+                                    KeyCap::Key(_, key) => {
+                                        commands.push(if ctrl || alt {
+                                            AppCommand::SendChord { ctrl, alt, key }
+                                        } else {
+                                            AppCommand::SendKey(key)
+                                        });
+                                    }
+                                    KeyCap::Backspace => {
+                                        let key = crate::gfn::input_protocol::KEY_BACKSPACE;
+                                        commands.push(if ctrl || alt {
+                                            AppCommand::SendChord { ctrl, alt, key }
+                                        } else {
+                                            AppCommand::SendKey(key)
+                                        });
+                                    }
+                                    KeyCap::Enter => {
+                                        let key = crate::gfn::input_protocol::KEY_ENTER;
+                                        commands.push(if ctrl || alt {
+                                            AppCommand::SendChord { ctrl, alt, key }
+                                        } else {
+                                            AppCommand::SendKey(key)
+                                        });
+                                    }
+                                    KeyCap::Space => {
+                                        let key = crate::gfn::input_protocol::KEY_SPACE;
+                                        commands.push(if ctrl || alt {
+                                            AppCommand::SendChord { ctrl, alt, key }
+                                        } else {
+                                            AppCommand::SendKey(key)
+                                        });
+                                    }
+                                    KeyCap::Shift => commands.push(AppCommand::ToggleKeyShift),
+                                    KeyCap::Ctrl => commands.push(AppCommand::ToggleKeyCtrl),
+                                    KeyCap::Alt => commands.push(AppCommand::ToggleKeyAlt),
+                                }
+                            }
+                        });
+                    }
+                });
+        });
+
+    commands
 }
 
 /// How long a fallback error body may run before it is cut. Past this it wraps into a wall of text
@@ -2735,12 +4064,12 @@ fn present_error(
 ) -> (String, String) {
     if let Some(code) = code {
         if let Some((title, body)) = code.message_keys() {
-            return (i18n.text(title), i18n.text(body));
+            return (i18n.text(title).to_string(), i18n.text(body).to_string());
         }
         // A code NVIDIA has not given wording to. Naming it still beats the raw JSON this used to
         // print, and it is the string a player can search for or quote in a bug report.
         return (
-            i18n.text("error-gfn-unknown-title"),
+            i18n.text("error-gfn-unknown-title").to_string(),
             text1(
                 i18n,
                 "error-gfn-unknown-body",
@@ -2749,12 +4078,13 @@ fn present_error(
                     Some(name) => format!("{name} ({})", code.0),
                     None => code.0.to_string(),
                 },
-            ),
+            )
+            .to_string(),
         );
     }
 
     if let Some((title, body)) = legacy_error_keys(message) {
-        return (i18n.text(title), i18n.text(body));
+        return (i18n.text(title).to_string(), i18n.text(body).to_string());
     }
 
     let mut body = message.trim().to_owned();
@@ -2762,7 +4092,7 @@ fn present_error(
         // By chars, not bytes: truncating mid-codepoint would panic on an accented message.
         body = body.chars().take(MAX_ERROR_BODY - 3).collect::<String>() + "...";
     }
-    (i18n.text("error-title"), body)
+    (i18n.text("error-title").to_string(), body)
 }
 
 fn error_screen(
@@ -2780,7 +4110,7 @@ fn error_screen(
             ui.label(egui::RichText::new(body).size(13.0));
             ui.add_space(24.0);
             ui.label(
-                egui::RichText::new(i18n.text("error-hint"))
+                egui::RichText::new(i18n.text("error-hint").as_ref())
                     .size(11.0)
                     .color(TEXT_DIM),
             );
@@ -2848,9 +4178,93 @@ fn draw_qr(ui: &mut egui::Ui, verification_uri: &str, target_size: f32) {
     }
 }
 
+fn session_timer_overlay(
+    ctx: &egui::Context,
+    start_time: std::time::Instant,
+    tier_str: Option<&str>,
+    battery: Option<crate::power::BatteryStatus>,
+) {
+    let tier_val = tier_str.unwrap_or("Free");
+    let max_duration: u32 = match tier_val {
+        "Ultimate" | "RTX3080" => 8 * 60 * 60, // 8 hours
+        "Premium" | "Priority" => 6 * 60 * 60, // 6 hours
+        _ => 60 * 60,                          // 1 hour for Free
+    };
+    
+    let elapsed = start_time.elapsed().as_secs() as u32;
+    let _remaining = max_duration.saturating_sub(elapsed);
+    let progress = (elapsed as f32 / max_duration as f32).clamp(0.0, 1.0);
+
+    let format_time = |secs: u32| -> String {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        let s = secs % 60;
+        if hours > 0 {
+            format!("{hours}:{mins:02}:{s:02}")
+        } else {
+            format!("{mins:02}:{s:02}")
+        }
+    };
+
+    let elapsed_str = format_time(elapsed);
+    let total_str = format_time(max_duration);
+    let text = format!("{elapsed_str} / {total_str}");
+
+    egui::Window::new("session_timer_overlay")
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -10.0))
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(egui::Color32::from_black_alpha(200))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .corner_radius(8.0),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                paint_stream_icon(ui.painter(), icon_rect, StreamIcon::Clock, egui::Color32::WHITE);
+
+                let (arrow_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 16.0), egui::Sense::hover());
+                let arrow_center = arrow_rect.center();
+                let arrow_points = [
+                    egui::pos2(arrow_center.x - 3.5, arrow_center.y - 2.0),
+                    egui::pos2(arrow_center.x + 3.5, arrow_center.y - 2.0),
+                    egui::pos2(arrow_center.x, arrow_center.y + 2.5),
+                ];
+                ui.painter().add(egui::Shape::convex_polygon(
+                    arrow_points.to_vec(),
+                    egui::Color32::WHITE,
+                    egui::Stroke::NONE,
+                ));
+
+                let bar = egui::ProgressBar::new(progress)
+                    .text(egui::RichText::new(text).color(egui::Color32::WHITE))
+                    .desired_width(120.0);
+                ui.add(bar);
+
+                if let Some(battery) = battery {
+                    ui.add_space(6.0);
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(22.0, 16.0), egui::Sense::hover());
+                    paint_battery(ui.painter(), rect, battery);
+                    ui.label(
+                        egui::RichText::new(format!("{}%", battery.percent))
+                            .size(10.5)
+                            .color(battery_color(battery)),
+                    );
+                }
+            });
+        });
+}
+
 #[cfg(test)]
 mod error_presentation_tests {
-    use super::legacy_error_keys;
+    use super::{
+        keyboard_layout, keyboard_panel_rect, legacy_error_keys, KEYBOARD_CAP_SIZE,
+        KEYBOARD_CAP_SPACING, KEYBOARD_COLUMNS, KEYBOARD_PADDING,
+    };
     use crate::gfn::error_codes::GfnErrorCode;
 
     fn classify(message: &str) -> &'static str {
@@ -2907,5 +4321,30 @@ mod error_presentation_tests {
         let long = "é".repeat(400);
         let truncated: String = long.chars().take(MAX - 3).collect::<String>() + "...";
         assert_eq!(truncated.chars().count(), MAX);
+    }
+
+    #[test]
+    fn keyboard_rows_all_span_full_width() {
+        for (index, row) in keyboard_layout().iter().enumerate() {
+            let units: f32 = row.iter().map(|(_, units)| units).sum();
+            assert!(
+                (units - KEYBOARD_COLUMNS).abs() < f32::EPSILON,
+                "row {index} sums to {units} cap-units, but the panel is sized for \
+                 {KEYBOARD_COLUMNS}; caps outside it cannot be touched",
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_width_row_exactly_fills_the_panel() {
+        let inner = keyboard_panel_rect(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(960.0 / 1.3, 544.0 / 1.3),
+        ))
+        .width()
+            - KEYBOARD_PADDING * 2.0;
+        let row = KEYBOARD_COLUMNS * KEYBOARD_CAP_SIZE.x
+            + (KEYBOARD_COLUMNS - 1.0) * KEYBOARD_CAP_SPACING;
+        assert!((inner - row).abs() < f32::EPSILON, "{inner} != {row}");
     }
 }
