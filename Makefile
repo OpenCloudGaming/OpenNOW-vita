@@ -1,4 +1,4 @@
-.PHONY: vpk desktop ftp eboot upload-vpk update-run-vita run-vita
+.PHONY: vpk desktop ftp eboot upload-vpk update-run-vita run-vita sync-version
 
 RUSTFLAGS ?= -C target-feature=-neon
 CARGO_VITA ?= cargo +nightly vita
@@ -8,7 +8,11 @@ DESKTOP_DIR ?= $(HOME)/Desktop
 VPK_NAME := opennow-vita.vpk
 FTP_PORT ?= 1337
 
-vpk:
+# Keeps the VPK's APP_VER lined up with [package].version - see scripts/sync-vita-version.sh.
+sync-version:
+	@./scripts/sync-vita-version.sh
+
+vpk: sync-version
 	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO_VITA) build vpk --release
 
 # Release build dropped straight on the Desktop for manual install via VitaShell/USB.
@@ -46,7 +50,7 @@ endif
 		| tr -d '\r' | awk -F': ' '/[Cc]ontent-[Ll]ength/ {print $$2 " bytes"}'
 	@echo "Now install ux0:/data/$(VPK_NAME) from VitaShell - copying the file does not install it."
 
-eboot:
+eboot: sync-version
 	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO_VITA) build eboot --release
 
 upload-vpk: vpk
@@ -55,7 +59,7 @@ ifndef VITA_IP
 endif
 	$(CARGO_VITA) upload --vita-ip $(VITA_IP) --source $(VPK) --destination $(VITA_UPLOAD_DIR)
 
-update-run-vita:
+update-run-vita: sync-version
 ifndef VITA_IP
 	$(error Usage: make update-run-vita VITA_IP=192.168.0.103)
 endif
