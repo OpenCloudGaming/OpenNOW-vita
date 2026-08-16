@@ -10,7 +10,7 @@ use crate::streaming::audio::AudioPacket;
 use crate::streaming::video::{
     DecodedFrame, DecoderConfig, DirectVideoOutput, VideoDecodeWorker,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::BytesMut;
 use rtc::interceptor::{NackGeneratorBuilder, NackResponderBuilder, Registry};
 use rtc::peer_connection::RTCPeerConnectionBuilder;
@@ -328,12 +328,11 @@ async fn run_peer(
         video_output.clone(),
         latest_frame.clone(),
     ) {
-        Ok(worker) => Some(worker),
+        Ok(worker) => worker,
         Err(error) => {
-            let _ = event_tx.send(PeerEvent::Error(format!(
-                "hardware decoder unavailable: {error:#}"
-            )));
-            None
+            let message = format!("hardware decoder unavailable: {error:#}");
+            let _ = event_tx.send(PeerEvent::Error(message.clone()));
+            bail!("{message}");
         }
     };
 
@@ -473,7 +472,7 @@ async fn run_peer(
     );
     let _ = std::fs::write("ux0:data/opennow-vita/nvst.sdp", &nvst_sdp);
     log_stream!(
-        "session profile {}x{} @ {}fps ref_frames={} bitrate_ceiling={}Mbps peer_loop=reorder_grace_drain decoder=avcdec_internal present=latest",
+        "session profile {}x{} @ {}fps ref_frames={} bitrate_ceiling={}Mbps peer_loop=reorder_grace_drain decoder=avcdec_auto present=latest",
         stream_settings
             .dimensions()
             .0,
@@ -523,7 +522,7 @@ async fn run_peer(
     let mut access_units_last: u64 = 0;
     let mut dropped_frames_last: u64 = 0;
     let mut stats_last_at = Instant::now();
-    let decoder_metrics = decode_worker.as_ref().map(|worker| worker.metrics());
+    let decoder_metrics = decode_worker.metrics();
     let mut metrics_last = MetricsSnapshot::default();
     fn classify(first_byte: Option<&u8>) -> usize {
         match first_byte {
@@ -697,11 +696,8 @@ async fn run_peer(
                 video_ssrc = Some(packet.header.ssrc);
                 let mut keyframe_requested = false;
                 let arrival_us = session_clock.elapsed().as_micros() as u64;
-                let sample_stats = if let Some(worker) = &decode_worker {
-                    video_rtp.receive(worker, packet, &mut keyframe_requested, arrival_us)
-                } else {
-                    continue;
-                };
+                let sample_stats =
+                    video_rtp.receive(&decode_worker, packet, &mut keyframe_requested, arrival_us);
                 dropped_frames_total += u64::from(sample_stats.dropped);
                 reorder_rescued_total += u64::from(sample_stats.reorder_rescued);
                 reorder_expired_total += u64::from(sample_stats.reorder_expired);
@@ -740,12 +736,13 @@ async fn run_peer(
         let delay = timeout.saturating_duration_since(Instant::now());
         if delay.is_zero() {
             let now_us = session_clock.elapsed().as_micros() as u64;
-            if let Some(worker) = &decode_worker
-                && video_rtp.reorder_deadline_us().is_some_and(|d| now_us >= d)
-            {
+            if video_rtp.reorder_deadline_us().is_some_and(|d| now_us >= d) {
                 let mut keyframe_requested = false;
-                let expire_stats =
-                    video_rtp.expire_reorder_grace_if_due(worker, &mut keyframe_requested, now_us);
+                let expire_stats = video_rtp.expire_reorder_grace_if_due(
+                    &decode_worker,
+                    &mut keyframe_requested,
+                    now_us,
+                );
                 dropped_frames_total += u64::from(expire_stats.dropped);
                 reorder_rescued_total += u64::from(expire_stats.reorder_rescued);
                 reorder_expired_total += u64::from(expire_stats.reorder_expired);
@@ -771,12 +768,10 @@ async fn run_peer(
 
             _ = &mut timer => {
                 let now_us = session_clock.elapsed().as_micros() as u64;
-                if let Some(worker) = &decode_worker
-                    && video_rtp.reorder_deadline_us().is_some_and(|d| now_us >= d)
-                {
+                if video_rtp.reorder_deadline_us().is_some_and(|d| now_us >= d) {
                     let mut keyframe_requested = false;
                     let expire_stats = video_rtp.expire_reorder_grace_if_due(
-                        worker,
+                        &decode_worker,
                         &mut keyframe_requested,
                         now_us,
                     );
@@ -821,21 +816,19 @@ async fn run_peer(
                 access_units_last = access_units_sent;
                 dropped_frames_last = dropped_frames_total;
 
-                let (sub, qfull, calls, dec_us, noframe, errs, rebuilds, stalls, wait_us, wait_calls) = match &decoder_metrics {
-                    Some(m) => (
-                        rate(m.submitted.load(Ordering::Relaxed), metrics_last.submitted),
-                        rate(m.queue_full.load(Ordering::Relaxed), metrics_last.queue_full),
-                        m.decode_calls.load(Ordering::Relaxed),
-                        m.decode_us.load(Ordering::Relaxed),
-                        rate(m.no_frame.load(Ordering::Relaxed), metrics_last.no_frame),
-                        rate(m.decode_errors.load(Ordering::Relaxed), metrics_last.decode_errors),
-                        m.decoder_rebuilds.load(Ordering::Relaxed),
-                        rate(m.target_stalls.load(Ordering::Relaxed), metrics_last.target_stalls),
-                        m.target_wait_us.load(Ordering::Relaxed),
-                        m.target_wait_calls.load(Ordering::Relaxed),
-                    ),
-                    None => (0.0, 0.0, 0, 0, 0.0, 0.0, 0, 0.0, 0, 0),
-                };
+                let m = &decoder_metrics;
+                let (sub, qfull, calls, dec_us, noframe, errs, rebuilds, stalls, wait_us, wait_calls) = (
+                    rate(m.submitted.load(Ordering::Relaxed), metrics_last.submitted),
+                    rate(m.queue_full.load(Ordering::Relaxed), metrics_last.queue_full),
+                    m.decode_calls.load(Ordering::Relaxed),
+                    m.decode_us.load(Ordering::Relaxed),
+                    rate(m.no_frame.load(Ordering::Relaxed), metrics_last.no_frame),
+                    rate(m.decode_errors.load(Ordering::Relaxed), metrics_last.decode_errors),
+                    m.decoder_rebuilds.load(Ordering::Relaxed),
+                    rate(m.target_stalls.load(Ordering::Relaxed), metrics_last.target_stalls),
+                    m.target_wait_us.load(Ordering::Relaxed),
+                    m.target_wait_calls.load(Ordering::Relaxed),
+                );
                 let avg_wait_ms = if wait_calls > metrics_last.target_wait_calls {
                     (wait_us - metrics_last.target_wait_us) as f32
                         / (wait_calls - metrics_last.target_wait_calls) as f32
@@ -850,9 +843,7 @@ async fn run_peer(
                 } else {
                     0.0
                 };
-                if let Some(m) = &decoder_metrics {
-                    metrics_last = MetricsSnapshot::capture(m);
-                }
+                metrics_last = MetricsSnapshot::capture(&decoder_metrics);
 
                 let jitter_ms = video_rtp.current_jitter_ms();
                 let report = pc.get_stats(Instant::now(), StatsSelector::None);
@@ -1001,25 +992,26 @@ async fn run_peer(
                 break;
             }
         }
-        if let Some(worker) = &decode_worker {
-            let now_us = session_clock.elapsed().as_micros() as u64;
-            if video_rtp.reorder_deadline_us().is_some_and(|d| now_us >= d) {
-                let mut keyframe_requested = false;
-                let expire_stats =
-                    video_rtp.expire_reorder_grace_if_due(worker, &mut keyframe_requested, now_us);
-                dropped_frames_total += u64::from(expire_stats.dropped);
-                reorder_rescued_total += u64::from(expire_stats.reorder_rescued);
-                reorder_expired_total += u64::from(expire_stats.reorder_expired);
-                send_pli_if_needed(
-                    &mut pc,
-                    &mut last_pli_sent,
-                    &mut pli_sent_count,
-                    keyframe_requested,
-                    true,
-                    video_receiver_id,
-                    video_ssrc,
-                );
-            }
+        let now_us = session_clock.elapsed().as_micros() as u64;
+        if video_rtp.reorder_deadline_us().is_some_and(|d| now_us >= d) {
+            let mut keyframe_requested = false;
+            let expire_stats = video_rtp.expire_reorder_grace_if_due(
+                &decode_worker,
+                &mut keyframe_requested,
+                now_us,
+            );
+            dropped_frames_total += u64::from(expire_stats.dropped);
+            reorder_rescued_total += u64::from(expire_stats.reorder_rescued);
+            reorder_expired_total += u64::from(expire_stats.reorder_expired);
+            send_pli_if_needed(
+                &mut pc,
+                &mut last_pli_sent,
+                &mut pli_sent_count,
+                keyframe_requested,
+                true,
+                video_receiver_id,
+                video_ssrc,
+            );
         }
         while let Ok(command) = command_rx.try_recv() {
             pending_commands.push(command);
