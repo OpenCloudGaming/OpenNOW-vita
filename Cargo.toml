@@ -45,8 +45,7 @@ rtc-shared = { git = "https://github.com/Day-OS/rtc.git", branch = "vita" }
 title_id = "OPENNOWV0"
 title_name = "OpenNOW Vita"
 assets = "static"
-# Vita APP_VER is XX.YY (not Cargo semver). Keep in sync with [package].version (0.3.1 → 00.31).
-vita_mksfoex_flags = ["-s", "APP_VER=00.31"]
+vita_mksfoex_flags = ["-s", "APP_VER=00.32"]
 
 [profile.release]
 # Nothing tuned the release profile before. On armv7 these are typically worth 5-15% for build
