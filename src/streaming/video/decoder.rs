@@ -9,7 +9,7 @@ mod vita {
     use super::super::memory::{CdramBlock, release_reserved_decoder_cdram};
     use super::super::AU_PTS_STEP;
     use super::{DecoderConfig, VideoPixelFormat, VideoTextureTarget};
-    use anyhow::{Result, bail};
+    use anyhow::{Context, Result, bail};
     use std::os::raw::c_void;
     use vitasdk_sys::*;
 
@@ -126,38 +126,53 @@ mod vita {
         }
     }
 
+    enum LibraryBackend {
+        Internal { _codec_memory: CodecEngineMemory },
+        Public,
+    }
+
     struct AvcdecLibrary {
         module_loaded: bool,
-        _codec_memory: CodecEngineMemory,
+        backend: LibraryBackend,
     }
 
     impl AvcdecLibrary {
-        fn initialize(width: u32, height: u32) -> Result<Self> {
-            let module_loaded = unsafe {
+        fn uses_internal(&self) -> bool {
+            matches!(self.backend, LibraryBackend::Internal { .. })
+        }
+
+        fn load_module() -> Result<bool> {
+            unsafe {
                 let loaded_before = sceSysmoduleIsLoaded(SCE_SYSMODULE_AVCDEC);
                 let ret = sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC);
                 if ret >= 0 {
-                    true
+                    Ok(true)
                 } else if ret as u32 == SCE_SYSMODULE_ERROR_INVALID_VALUE {
                     eprintln!(
                         "sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC) returned {ret:#x}; continuing with SceVideodec imports; is_loaded_before={loaded_before:#x}",
                     );
-                    false
+                    Ok(false)
                 } else {
                     bail!(
                         "sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC) failed: {ret:#x}; is_loaded_before={loaded_before:#x}",
                     );
                 }
-            };
+            }
+        }
 
-            let mut init_info: SceVideodecQueryInitInfo = unsafe { std::mem::zeroed() };
-            init_info.hwAvc = SceVideodecQueryInitInfoHwAvcdec {
+        fn hw_avc_init_info(width: u32, height: u32) -> SceVideodecQueryInitInfoHwAvcdec {
+            SceVideodecQueryInitInfoHwAvcdec {
                 size: size_of::<SceVideodecQueryInitInfoHwAvcdec>() as u32,
                 horizontal: width,
                 vertical: height,
                 numOfRefFrames: AVCDEC_NUM_REF_FRAMES,
                 numOfStreams: 1,
-            };
+            }
+        }
+
+        unsafe fn try_initialize_internal(width: u32, height: u32) -> Result<CodecEngineMemory> {
+            let mut init_info: SceVideodecQueryInitInfo = unsafe { std::mem::zeroed() };
+            init_info.hwAvc = Self::hw_avc_init_info(width, height);
 
             let config_ret = unsafe {
                 sceVideodecSetConfigInternal(SCE_VIDEODEC_TYPE_HW_AVCDEC, INTERNAL_CODEC_CONFIG)
@@ -180,9 +195,7 @@ mod vita {
                 )
             };
             if query_ret < 0 || codec_size == 0 {
-                bail!(
-                    "sceVideodecQueryMemSizeInternal failed: {query_ret:#x}, size={codec_size}"
-                );
+                bail!("sceVideodecQueryMemSizeInternal failed: {query_ret:#x}, size={codec_size}");
             }
 
             release_reserved_decoder_cdram();
@@ -202,18 +215,62 @@ mod vita {
                 )
             };
             if ret < 0 {
-                if module_loaded {
-                    unsafe {
-                        sceSysmoduleUnloadModule(SCE_SYSMODULE_AVCDEC);
-                    }
-                }
                 bail!("sceVideodecInitLibraryWithUnmapMemInternal failed: {ret:#x}");
             }
 
-            Ok(Self {
-                module_loaded,
-                _codec_memory: codec_memory,
-            })
+            Ok(codec_memory)
+        }
+
+        unsafe fn initialize_public(width: u32, height: u32) -> Result<()> {
+            let init_info = Self::hw_avc_init_info(width, height);
+            let ret = unsafe { sceVideodecInitLibrary(SCE_VIDEODEC_TYPE_HW_AVCDEC, &init_info) };
+            if ret < 0 {
+                bail!("sceVideodecInitLibrary failed: {ret:#x}");
+            }
+            Ok(())
+        }
+
+        fn initialize(width: u32, height: u32) -> Result<Self> {
+            let module_loaded = Self::load_module()?;
+
+            match unsafe { Self::try_initialize_internal(width, height) } {
+                Ok(codec_memory) => {
+                    eprintln!("AVCDEC backend: internal (DecodeAuInternal)");
+                    Ok(Self {
+                        module_loaded,
+                        backend: LibraryBackend::Internal {
+                            _codec_memory: codec_memory,
+                        },
+                    })
+                }
+                Err(internal_error) => {
+                    eprintln!(
+                        "AVCDEC internal init failed ({internal_error:#}); falling back to public InitLibrary"
+                    );
+                    unsafe {
+                        sceVideodecTermLibrary(SCE_VIDEODEC_TYPE_HW_AVCDEC);
+                    }
+                    match unsafe { Self::initialize_public(width, height) } {
+                        Ok(()) => {
+                            eprintln!("AVCDEC backend: public (sceAvcdecDecode)");
+                            Ok(Self {
+                                module_loaded,
+                                backend: LibraryBackend::Public,
+                            })
+                        }
+                        Err(public_error) => {
+                            if module_loaded {
+                                unsafe {
+                                    sceSysmoduleUnloadModule(SCE_SYSMODULE_AVCDEC);
+                                }
+                            }
+                            Err(public_error).context(format!(
+                                "public fallback also failed after internal error: {internal_error:#}"
+                            ))
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -244,6 +301,8 @@ mod vita {
         decoder: AvcdecDecoder,
         _frame_memory: CdramBlock,
         _library: AvcdecLibrary,
+        uses_internal: bool,
+        pending_public_au: Option<Vec<u8>>,
         width: u32,
         height: u32,
         decoder_timeout: i32,
@@ -255,6 +314,7 @@ mod vita {
             unsafe {
                 let library =
                     AvcdecLibrary::initialize(config.decode_width, config.decode_height)?;
+                let uses_internal = library.uses_internal();
 
                 let mut query = SceAvcdecQueryDecoderInfo {
                     horizontal: config.decode_width,
@@ -262,13 +322,28 @@ mod vita {
                     numOfRefFrames: AVCDEC_NUM_REF_FRAMES,
                 };
                 let mut decoder_info = SceAvcdecDecoderInfo { frameMemSize: 0 };
-                let ret = sceAvcdecQueryDecoderMemSizeInternal(
-                    SCE_VIDEODEC_TYPE_HW_AVCDEC,
-                    &mut query,
-                    &mut decoder_info,
-                );
+                let ret = if uses_internal {
+                    sceAvcdecQueryDecoderMemSizeInternal(
+                        SCE_VIDEODEC_TYPE_HW_AVCDEC,
+                        &mut query,
+                        &mut decoder_info,
+                    )
+                } else {
+                    sceAvcdecQueryDecoderMemSize(
+                        SCE_VIDEODEC_TYPE_HW_AVCDEC,
+                        &query,
+                        &mut decoder_info,
+                    )
+                };
                 if ret < 0 {
-                    bail!("sceAvcdecQueryDecoderMemSizeInternal failed: {ret:#x}");
+                    bail!(
+                        "{} failed: {ret:#x}",
+                        if uses_internal {
+                            "sceAvcdecQueryDecoderMemSizeInternal"
+                        } else {
+                            "sceAvcdecQueryDecoderMemSize"
+                        }
+                    );
                 }
                 release_reserved_decoder_cdram();
                 let frame_memory = CdramBlock::allocate_with_alignments(
@@ -284,13 +359,24 @@ mod vita {
                         size: decoder_info.frameMemSize,
                     },
                 };
-                let ret = sceAvcdecCreateDecoderInternal(
-                    SCE_VIDEODEC_TYPE_HW_AVCDEC,
-                    &mut decoder_control,
-                    &mut query,
-                );
+                let ret = if uses_internal {
+                    sceAvcdecCreateDecoderInternal(
+                        SCE_VIDEODEC_TYPE_HW_AVCDEC,
+                        &mut decoder_control,
+                        &mut query,
+                    )
+                } else {
+                    sceAvcdecCreateDecoder(SCE_VIDEODEC_TYPE_HW_AVCDEC, &mut decoder_control, &query)
+                };
                 if ret < 0 {
-                    bail!("sceAvcdecCreateDecoderInternal failed: {ret:#x}");
+                    bail!(
+                        "{} failed: {ret:#x}",
+                        if uses_internal {
+                            "sceAvcdecCreateDecoderInternal"
+                        } else {
+                            "sceAvcdecCreateDecoder"
+                        }
+                    );
                 }
 
                 Ok(Self {
@@ -299,6 +385,8 @@ mod vita {
                     },
                     _frame_memory: frame_memory,
                     _library: library,
+                    uses_internal,
+                    pending_public_au: None,
                     width: config.output_width,
                     height: config.output_height,
                     decoder_timeout: 0,
@@ -312,11 +400,14 @@ mod vita {
         }
 
         pub fn submit_access_unit(&mut self, access_unit: &[u8]) -> Result<()> {
+            self.next_au_seq = self.next_au_seq.saturating_add(1);
+            if !self.uses_internal {
+                self.pending_public_au = Some(access_unit.to_vec());
+                return Ok(());
+            }
+
             unsafe {
-                self.next_au_seq = self.next_au_seq.saturating_add(1);
-                let input_pts = self
-                    .next_au_seq
-                    .saturating_mul(AU_PTS_STEP);
+                let input_pts = self.next_au_seq.saturating_mul(AU_PTS_STEP);
                 let mut au = SceAvcdecAu {
                     pts: SceVideodecTimeStamp {
                         upper: (input_pts >> 32) as u32,
@@ -348,72 +439,100 @@ mod vita {
             direct_target: VideoTextureTarget,
             format: VideoPixelFormat,
         ) -> Result<Option<u64>> {
-            unsafe {
-                let output_ptr = direct_target.ptr as *mut u8;
-                let output_capacity = direct_target.capacity;
-                let (pixel_type, output_pitch, required_capacity) = match format {
-                    VideoPixelFormat::Bgr565 => (
-                        SCE_AVCDEC_PIXELFORMAT_RGBA565 as u32,
-                        direct_target.pitch / 2,
-                        (direct_target.pitch / 2).saturating_mul(self.height) * 2,
-                    ),
-                    VideoPixelFormat::Iyuv => (
-                        SCE_AVCDEC_PIXELFORMAT_YUV420_RASTER as u32,
-                        direct_target.pitch,
-                        self.width.saturating_mul(self.height) * 3 / 2,
-                    ),
-                    VideoPixelFormat::Rgba8888 => (
-                        SCE_AVCDEC_PIXELFORMAT_RGBA8888 as u32,
-                        direct_target.pitch / 4,
-                        (direct_target.pitch / 4).saturating_mul(self.height) * 4,
-                    ),
-                };
-                if output_pitch < self.width {
-                    bail!(
-                        "direct video texture pitch {output_pitch} is smaller than {}",
-                        self.width
-                    );
-                }
-                if required_capacity > output_capacity {
-                    bail!(
-                        "video output needs {required_capacity} bytes but texture has {output_capacity}"
-                    );
-                }
+            if self.uses_internal {
+                self.get_picture_internal(direct_target, format)
+            } else {
+                self.get_picture_public(direct_target, format)
+            }
+        }
 
-                let mut picture = SceAvcdecPicture {
-                    size: size_of::<SceAvcdecPicture>() as u32,
-                    frame: SceAvcdecFrame {
-                        pixelType: pixel_type,
-                        framePitch: output_pitch,
-                        frameWidth: self.width,
-                        frameHeight: self.height,
-                        horizontalSize: self.width,
-                        verticalSize: self.height,
-                        frameCropLeftOffset: 0,
-                        frameCropRightOffset: 0,
-                        frameCropTopOffset: 0,
-                        frameCropBottomOffset: 0,
-                        opt: SceAvcdecFrameOption {
-                            rgba: SceAvcdecFrameOptionRGBA {
-                                alpha: 0xff,
-                                cscCoefficient: 1, // ITU-R BT.709 for GFN HD video
-                                reserved: [0; 14],
-                            },
-                        },
-                        pPicture: match format {
-                            VideoPixelFormat::Bgr565 | VideoPixelFormat::Rgba8888 => {
-                                [output_ptr.cast(), std::ptr::null_mut()]
-                            }
-                            VideoPixelFormat::Iyuv => [
-                                output_ptr.cast(),
-                                output_ptr
-                                    .add((self.width * self.height) as usize)
-                                    .cast(),
-                            ],
+        fn picture_layout(
+            &self,
+            direct_target: VideoTextureTarget,
+            format: VideoPixelFormat,
+        ) -> Result<(u32, u32, *mut u8)> {
+            let output_ptr = direct_target.ptr as *mut u8;
+            let output_capacity = direct_target.capacity;
+            let (pixel_type, output_pitch, required_capacity) = match format {
+                VideoPixelFormat::Bgr565 => (
+                    SCE_AVCDEC_PIXELFORMAT_RGBA565 as u32,
+                    direct_target.pitch / 2,
+                    (direct_target.pitch / 2).saturating_mul(self.height) * 2,
+                ),
+                VideoPixelFormat::Iyuv => (
+                    SCE_AVCDEC_PIXELFORMAT_YUV420_RASTER as u32,
+                    direct_target.pitch,
+                    self.width.saturating_mul(self.height) * 3 / 2,
+                ),
+                VideoPixelFormat::Rgba8888 => (
+                    SCE_AVCDEC_PIXELFORMAT_RGBA8888 as u32,
+                    direct_target.pitch / 4,
+                    (direct_target.pitch / 4).saturating_mul(self.height) * 4,
+                ),
+            };
+            if output_pitch < self.width {
+                bail!(
+                    "direct video texture pitch {output_pitch} is smaller than {}",
+                    self.width
+                );
+            }
+            if required_capacity > output_capacity {
+                bail!(
+                    "video output needs {required_capacity} bytes but texture has {output_capacity}"
+                );
+            }
+            Ok((pixel_type, output_pitch, output_ptr))
+        }
+
+        fn build_picture(
+            &self,
+            pixel_type: u32,
+            output_pitch: u32,
+            output_ptr: *mut u8,
+            format: VideoPixelFormat,
+        ) -> SceAvcdecPicture {
+            SceAvcdecPicture {
+                size: size_of::<SceAvcdecPicture>() as u32,
+                frame: SceAvcdecFrame {
+                    pixelType: pixel_type,
+                    framePitch: output_pitch,
+                    frameWidth: self.width,
+                    frameHeight: self.height,
+                    horizontalSize: self.width,
+                    verticalSize: self.height,
+                    frameCropLeftOffset: 0,
+                    frameCropRightOffset: 0,
+                    frameCropTopOffset: 0,
+                    frameCropBottomOffset: 0,
+                    opt: SceAvcdecFrameOption {
+                        rgba: SceAvcdecFrameOptionRGBA {
+                            alpha: 0xff,
+                            cscCoefficient: 1, // ITU-R BT.709 for GFN HD video
+                            reserved: [0; 14],
                         },
                     },
-                    info: std::mem::zeroed(),
-                };
+                    pPicture: match format {
+                        VideoPixelFormat::Bgr565 | VideoPixelFormat::Rgba8888 => {
+                            [output_ptr.cast(), std::ptr::null_mut()]
+                        }
+                        VideoPixelFormat::Iyuv => [output_ptr.cast(), unsafe {
+                            output_ptr.add((self.width * self.height) as usize).cast()
+                        }],
+                    },
+                },
+                info: unsafe { std::mem::zeroed() },
+            }
+        }
+
+        fn get_picture_internal(
+            &mut self,
+            direct_target: VideoTextureTarget,
+            format: VideoPixelFormat,
+        ) -> Result<Option<u64>> {
+            unsafe {
+                let (pixel_type, output_pitch, output_ptr) =
+                    self.picture_layout(direct_target, format)?;
+                let mut picture = self.build_picture(pixel_type, output_pitch, output_ptr, format);
                 let mut picture_ptr: *mut SceAvcdecPicture = &mut picture;
                 let mut array_picture = SceAvcdecArrayPicture {
                     numOfOutput: 0,
@@ -433,9 +552,7 @@ mod vita {
                     &mut self.decoder_timeout,
                 );
                 if ret < 0 {
-                    bail!(
-                        "sceAvcdecDecodeGetPictureWithWorkPictureInternal failed: {ret:#x}"
-                    );
+                    bail!("sceAvcdecDecodeGetPictureWithWorkPictureInternal failed: {ret:#x}");
                 }
                 if array_picture.numOfOutput == 0 {
                     return Ok(None);
@@ -444,6 +561,54 @@ mod vita {
                 let returned_pts =
                     ((picture.info.pts.upper as u64) << 32) | picture.info.pts.lower as u64;
                 Ok(Some(returned_pts))
+            }
+        }
+
+        fn get_picture_public(
+            &mut self,
+            direct_target: VideoTextureTarget,
+            format: VideoPixelFormat,
+        ) -> Result<Option<u64>> {
+            let Some(access_unit) = self.pending_public_au.take() else {
+                return Ok(None);
+            };
+            let input_pts = self.next_au_seq.saturating_mul(AU_PTS_STEP);
+
+            unsafe {
+                let (pixel_type, output_pitch, output_ptr) =
+                    self.picture_layout(direct_target, format)?;
+                let mut picture = self.build_picture(pixel_type, output_pitch, output_ptr, format);
+                let mut picture_ptr: *mut SceAvcdecPicture = &mut picture;
+                let mut array_picture = SceAvcdecArrayPicture {
+                    numOfOutput: 0,
+                    numOfElm: 1,
+                    pPicture: &mut picture_ptr,
+                };
+
+                let au = SceAvcdecAu {
+                    pts: SceVideodecTimeStamp {
+                        upper: (input_pts >> 32) as u32,
+                        lower: input_pts as u32,
+                    },
+                    dts: SceVideodecTimeStamp {
+                        upper: (input_pts >> 32) as u32,
+                        lower: input_pts as u32,
+                    },
+                    es: SceAvcdecBuf {
+                        pBuf: access_unit.as_ptr() as *mut c_void,
+                        size: access_unit.len() as u32,
+                    },
+                };
+
+                let ret = sceAvcdecDecode(&self.decoder.ctrl, &au, &mut array_picture);
+                if ret < 0 {
+                    bail!("sceAvcdecDecode failed: {ret:#x}");
+                }
+                if array_picture.numOfOutput == 0 {
+                    return Ok(None);
+                }
+
+                Ok(Some(input_pts))
             }
         }
     }
