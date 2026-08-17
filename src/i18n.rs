@@ -120,6 +120,8 @@ fn ftl_source(locale: Locale) -> &'static str {
     match locale {
         Locale::EnUs => include_str!("i18n/en-US.ftl"),
         Locale::EsEs => include_str!("i18n/es-ES.ftl"),
+        Locale::FrFr => include_str!("i18n/fr-FR.ftl"),
+        Locale::RuRu => include_str!("i18n/ru-RU.ftl"),
     }
 }
 

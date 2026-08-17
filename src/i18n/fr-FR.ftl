@@ -1,20 +1,20 @@
-# Connexion / Flux de code appareil
-login-subtitle = Client GeForce NOW non officiel pour PS Vita
+# Login / device-code flow
+login-subtitle = Client non officiel GeForce NOW pour PS Vita
 login-hint = Appuyez sur Confirmer (X) pour vous connecter avec votre compte NVIDIA.
 login-last-input = Dernière entrée détectée : { $input }
 login-requesting-code = Demande d'un code d'accès à NVIDIA...
 
 device-title = Connexion sur un autre appareil
-device-step-open = 1. Ouvrez cette adresse dans le navigateur de votre téléphone ou de votre ordinateur :
-device-step-scan = 2. Ou scannez le QR code et saisissez ce code :
-device-waiting = En attente de la fin de la connexion... (Retour pour annuler)
+device-step-open = 1. Ouvrez cette adresse dans le navigateur de votre téléphone ou ordinateur :
+device-step-scan = 2. Ou scannez le code QR et saisissez ce code :
+device-waiting = En attente de la fin de votre connexion... (Retour pour annuler)
 
-# Catalogue
+# Catalog
 catalog-welcome = Bienvenue, { $name }
 catalog-loading = Chargement de votre catalogue GeForce NOW...
 catalog-search-hint = Rechercher des jeux...
 catalog-search-button = Rechercher
-catalog-library-title = TITRES CLOUD
+catalog-library-title = TITRES EN LIGNE
 catalog-sort-button = Trier : { $sort }
 catalog-sort-last-played = Récemment joués
 catalog-sort-relevance = Recommandés
@@ -29,30 +29,32 @@ catalog-footer-hint = Haut/Bas pour parcourir · Confirmer (X) pour jouer · Ret
 catalog-count = { $shown } sur { $total }
 catalog-count-loading = { $shown } sur { $total } · chargement en cours...
 
-# Panneau de détails (côté droit du catalogue)
+# Detail panel (right-hand side of the catalog)
 detail-play = JOUER
-detail-app-id = ID de l'application : { $id }
+detail-app-id = ID de l'app : { $id }
 detail-last-played = Dernière partie : { $date }
-detail-never-played = Jamais joué sur ce compte
+detail-never-played = Jamais joué avec ce compte
 detail-press = Appuyez sur
 detail-to-start = pour démarrer
-detail-play-hint = Appuyez sur Confirmer (X) ou touchez JOUER pour lancer le streaming de ce jeu.
+detail-play-hint = Appuyez sur Confirmer (X) ou touchez JOUER pour démarrer le streaming de ce jeu.
 detail-empty = Sélectionnez un jeu dans la liste pour voir ses détails.
 
-# Création de session / file d'attente
+# Session creation / queue
 session-stop-button = Arrêter la session
-session-queue-position = Position dans la file d'attente NVIDIA : n° { $position }
+session-queue-position = Position dans la file d'attente NVIDIA : #{ $position }
 session-eta-minutes = Attente estimée : ~{ $minutes } min { $seconds } s
 session-eta-seconds = Attente estimée : ~{ $seconds } secondes
 session-queue-live = Actualisation du statut en direct (vérification { $attempt })...
-session-connecting-attempt = Connexion au serveur NVIDIA (tentative { $attempt })...
-session-waiting-ready = En attente de disponibilité du serveur NVIDIA...
+session-connecting-attempt = Connexion au serveur NVIDIA (vérification { $attempt })...
+session-waiting-ready = En attente que le serveur NVIDIA soit prêt...
 session-server-busy = Les serveurs NVIDIA sont occupés
-session-server-busy-retry = Nouvelle tentative... (tentative { $attempt })
+session-server-busy-retry = Nouvelle tentative... (essai { $attempt })
 session-app-patching = Mise à jour du jeu
-session-app-patching-detail = NVIDIA installe une mise à jour du jeu sur votre machine cloud. Cela peut prendre plusieurs minutes ; le streaming démarrera automatiquement une fois l'opération terminée.
+session-app-patching-detail = NVIDIA installe une mise à jour du jeu sur votre machine cloud. Cela peut prendre plusieurs minutes ; le streaming démarre automatiquement une fois terminé.
+session-ad-playing = Visionnage d'une publicité pour garder votre place dans la file
+session-ad-progress = { $percent }% terminé
 session-cancel-button = Annuler la session
-session-exit-hint = Appuyez sur « Annuler la session » ou sur (O) pour confirmer la sortie
+session-exit-hint = Touchez « Annuler la session » ou appuyez sur (O) pour confirmer la sortie
 session-now-loading = Chargement en cours
 session-step-queue = File d'attente
 session-step-setup = Configuration
@@ -60,57 +62,60 @@ session-step-ready = Prêt
 session-preparing-rig = Préparation de votre machine cloud
 session-ready-headline = Votre machine est prête
 
-# Session prête (écran de débogage/transition)
+# Session ready (debug/transition screen)
 session-ready-hint = Appuyez sur Confirmer (X) pour établir la signalisation NVIDIA.
 
-# Signalisation WebRTC
+# WebRTC signaling
 signaling-title = Signalisation
 signaling-offer-received = Offre SDP reçue ({ $bytes } octets).
 signaling-waiting-offer = En attente de l'offre SDP du serveur GFN...
 
-# Confirmation de sortie
+# Exit confirmation
 exit-heading = Arrêter la session de streaming ?
-exit-body = Voulez-vous vraiment quitter et annuler la session GeForce NOW active ?
+exit-body = Voulez-vous vraiment quitter et annuler la session GeForce NOW en cours ?
 exit-cancel = Retour à la session
 exit-confirm = Oui, quitter et arrêter
 
 # Streaming
 streaming-game = Streaming de « { $game } »
-streaming-generic = Streaming du jeu...
+streaming-generic = Streaming du jeu en cours...
 streaming-signaling-done = Signalisation WebRTC et échange SDP terminés
 streaming-waiting-negotiation = En attente de la négociation WebRTC...
 
-# Erreurs
+# Errors
 error-title = Erreur
-error-hint = Appuyez sur Confirmer ou Retour pour revenir en arrière.
+error-hint = Confirmer ou Retour pour revenir.
 
-# Erreurs et notes d'état (intégrées dans app/mod.rs)
+# Errors and status notes (built in app/mod.rs)
 error-login-start = Impossible de démarrer la connexion : { $error }
-error-login-code-expired = Le code a expiré avant la fin de la connexion. Veuillez réessayer.
+error-login-code-expired = Le code a expiré avant la fin de la connexion. Réessayez.
 error-login-denied = La connexion a été refusée.
-error-login-check = Échec de la vérification de la connexion : { $error }
+error-login-check = Échec de la vérification de connexion : { $error }
 error-profile-read = Connexion réussie mais impossible de lire le profil : { $error }
 error-session-expired = Votre session a expiré. Veuillez vous reconnecter.
 error-catalog-load = Impossible de charger votre bibliothèque de jeux : { $error }
-error-session-create = Impossible de démarrer le flux : { $error }
-error-signaling-disconnected = Connexion de signalisation interrompue : { $reason }
+error-session-create = Impossible de démarrer le streaming : { $error }
+error-signaling-disconnected = Signalisation déconnectée : { $reason }
 error-stream-lost = Connexion de streaming perdue : { $reason }
 status-search-results = { $count } résultat(s) pour « { $query } »
 status-search-failed = Échec de la recherche : { $error }
 status-stream-live = Flux vidéo en direct actif
 status-peer-error = Pair : { $error }
-status-signaling-connected = Connexion de signalisation établie, en attente de l'offre SDP...
-status-offer-received = Offre SDP reçue ({ $bytes } octets). Négociation WebRTC en cours...
+status-signaling-connected = Signalisation connectée, en attente de l'offre SDP...
+status-offer-received = Offre SDP reçue ({ $bytes } octets). Négociation WebRTC...
 status-remote-ice = Candidat ICE distant reçu de NVIDIA : { $candidate }
 status-session-start-failed = Impossible de démarrer la session : connexion ou jeu manquant.
 status-signaling-connecting = Connexion à la signalisation NVIDIA...
 status-signaling-connect-failed = Impossible de se connecter à la signalisation : { $error }
 
-settings-fps-heading = Fréquence d'images du flux
-settings-fps-60 = 60 fps - mouvement plus fluide
-settings-fps-30 = 30 fps - image plus nette
-settings-trigger-heading = Pression L2/R2 sur le pavé arrière
+settings-fps-heading = Fréquence d'images du streaming
+settings-fps-60 = 60 im/s - mouvement plus fluide
+settings-fps-30 = 30 im/s - image plus nette
+settings-trigger-heading = Pression L2/R2 du panneau arrière
 settings-audio-boost-heading = Amplification du volume
+settings-color-depth-heading = Profondeur des couleurs
+settings-color-depth-32 = 32 bits
+settings-color-depth-16 = 16 bits
 session-keyboard-show = Clavier
 session-keyboard-hide = Masquer le clavier
 key-esc = Échap
@@ -127,28 +132,60 @@ settings-heading = Paramètres
 settings-title = Paramètres
 account-close = Fermer
 settings-language-heading = Langue
-controls-hint-heading = Commandes Vita
-controls-hint-rear = Le pavé arrière remplace les boutons absents de cette console :
-controls-hint-touch = L'écran tactile avant déplace le curseur ; touchez pour cliquer.
+controls-hint-heading = Contrôles Vita
+controls-hint-rear = Le panneau arrière remplace les boutons absents de cette console :
+controls-hint-touch = L'écran tactile avant déplace la souris ; touchez pour cliquer.
 controls-hint-dismiss = Compris
 settings-stick-zones-heading = L3/R3 sur l'écran avant
 settings-stick-zones-off = Désactivé
 settings-stick-zones-hidden = Activé
-settings-stick-zones-visible = Activé + visible
-settings-rear-touch-mode-heading = Pavé tactile arrière
+settings-stick-zones-visible = Activé + afficher
+settings-rear-touch-mode-heading = Panneau tactile arrière
 settings-rear-touch-quadrant = 4 zones (L2/R2 + L3/R3)
 settings-rear-touch-halves = 2 zones (L2/R2)
-settings-shoulder-trigger-heading = Attribution L1/R1 et L2/R2
-settings-shoulder-trigger-default = L1/R1 = L1/R1, pavé arrière = L2/R2
-settings-shoulder-trigger-swapped = L1/R1 = L2/R2, pavé arrière = L1/R1
-controls-hint-sticks = Les coins inférieurs de l'écran correspondent à L3 et R3.
+settings-region-heading = Région du serveur
+settings-region-auto = Automatique
+settings-region-loading = Chargement des emplacements des serveurs...
+settings-region-measuring = Mesure de la latence pour chaque région...
+settings-region-test = Tester la latence
+settings-region-retry = Réessayer
+settings-region-none = NVIDIA n'a listé aucun emplacement de serveur pour ce compte.
+settings-region-failed = Impossible de charger les emplacements des serveurs. Le mode automatique fonctionne toujours.
+settings-region-note-auto = Région du serveur : automatique
+settings-region-note-pinned = Région du serveur : { $region }
+settings-region-best = MEILLEUR
+settings-tab-stream = Streaming
+settings-tab-controls = Contrôles
+settings-tab-app = App
+settings-tab-account = Compte
+settings-group-streaming = STREAMING
+settings-group-controls = CONTRÔLES
+settings-group-app = APP
+settings-group-account = COMPTE
+settings-region-desc = La zone GeForce NOW depuis laquelle cet appareil diffuse.
+settings-fps-desc = Plus élevé est plus fluide ; plus bas peut paraître plus net sur une connexion lente.
+settings-audio-boost-desc = Amplifie le flux décodé au-delà du gain unitaire.
+settings-color-depth-desc = 32 bits supprime le banding dans les ciels et les scènes sombres ; 16 bits est plus léger en mémoire. S'applique au prochain lancement.
+settings-trigger-desc = À quel point une pression sur le panneau arrière appuie sur L2/R2.
+settings-rear-touch-desc = Comment le panneau arrière est partagé entre L2/R2 et L3/R3.
+settings-stick-zones-desc = L3/R3, depuis les coins inférieurs de l'écran avant.
+settings-language-desc = Langue dans laquelle les menus et messages de cette app sont affichés.
+settings-game-language-heading = Langue du jeu
+settings-game-language-desc = Langue des menus, sous-titres et audio du jeu lui-même, lorsque le jeu le prend en charge.
+settings-game-profile-heading = Paramètres pour ce jeu uniquement
+settings-game-profile-desc = Garde les paramètres de contrôle de ce jeu séparés des paramètres globaux.
+settings-session-timer-heading = Minuteur de session
+settings-session-timer-desc = Affiche le temps écoulé pendant un streaming.
+settings-trigger-swap-heading = Échanger L1/R1 avec L2/R2
+settings-trigger-swap-desc = Envoie L2/R2 lorsque vous appuyez sur L1/R1 et inversement, pour les jeux qui placent leur action principale sur une gâchette.
+controls-hint-sticks = Les coins inférieurs de l'écran sont L3 et R3.
 error-session-busy-title = Une session est déjà ouverte
-error-session-busy-body = Une session GeForce NOW est toujours active pour ce compte, et cette application ne peut pas la fermer. Solution la plus rapide : rendez-vous sur play.geforcenow.com et lancez un jeu pour reprendre la main. Sinon, déconnectez-vous de GeForce NOW sur vos autres appareils ou attendez environ 8 minutes que la session expire.
+error-session-busy-body = GeForce NOW a encore une session active sur ce compte, et cette app ne peut pas la fermer. Solution la plus rapide : ouvrez play.geforcenow.com et démarrez un jeu depuis là pour la reprendre. Sinon, déconnectez-vous de GeForce NOW sur vos autres appareils, ou attendez environ 8 minutes le délai d'expiration.
 error-auth-title = Reconnectez-vous
 error-auth-body = Votre autorisation NVIDIA a expiré. Reconnectez-vous à ce compte pour continuer.
 
-# Messages d'erreur GeForce NOW ; une paire par code ayant une signification spécifique pour NVIDIA.
-# Issu de gfnErrorMessages.ts (OpenNOW) ; tout autre cas utilise error-gfn-unknown par défaut.
+# GeForce NOW failure wording, one pair per code NVIDIA gives a distinct meaning to.
+# Ported from OpenNOW's gfnErrorMessages.ts; anything else falls back to error-gfn-unknown.
 
 error-gfn-session-setup-cancelled-title = Session annulée
 error-gfn-session-setup-cancelled-body = La configuration de la session a été annulée.
@@ -159,119 +196,119 @@ error-gfn-request-cancelled-body = La requête a été annulée.
 error-gfn-system-sleep-during-session-setup-title = Mise en veille du système
 error-gfn-system-sleep-during-session-setup-body = La configuration de la session a été interrompue par la mise en veille du système.
 error-gfn-no-internet-during-session-setup-title = Pas d'Internet
-error-gfn-no-internet-during-session-setup-body = Aucune connexion Internet lors de la configuration de la session.
+error-gfn-no-internet-during-session-setup-body = Aucune connexion Internet pendant la configuration de la session.
 error-gfn-invalid-operation-title = Opération invalide
-error-gfn-invalid-operation-body = L'opération demandée n'est pas valide pour le moment.
+error-gfn-invalid-operation-body = L'opération demandée n'est pas valide actuellement.
 error-gfn-network-error-title = Erreur réseau
-error-gfn-network-error-body = Une erreur réseau s'est produite. Veuillez vérifier votre connexion Internet.
+error-gfn-network-error-body = Une erreur réseau est survenue. Veuillez vérifier votre connexion Internet.
 error-gfn-auth-token-not-updated-title = Authentification requise
 error-gfn-auth-token-not-updated-body = Votre session a expiré. Veuillez vous reconnecter.
-error-gfn-response-parse-failure-title = Erreur d'analyse de la réponse du serveur
+error-gfn-response-parse-failure-title = Erreur de réponse du serveur
 error-gfn-response-parse-failure-body = Échec de l'analyse de la réponse du serveur. Veuillez réessayer.
 error-gfn-invalid-server-response-title = Réponse du serveur invalide
 error-gfn-invalid-server-response-body = Le serveur a renvoyé une réponse invalide.
 error-gfn-dom-exception-in-session-control-title = Erreur de session
-error-gfn-dom-exception-in-session-control-body = Une erreur s'est produite lors de la configuration de la session.
+error-gfn-dom-exception-in-session-control-body = Une erreur est survenue pendant la configuration de la session.
 error-gfn-auth-token-update-timeout-title = Délai d'authentification dépassé
-error-gfn-auth-token-update-timeout-body = Le délai de mise à jour du jeton d'authentification a expiré. Veuillez vous reconnecter.
-error-gfn-request-forbidden-title = Accès refusé
-error-gfn-request-forbidden-body = L'accès à ce service est refusé.
-error-gfn-server-internal-timeout-title = Délai d'attente du serveur dépassé
-error-gfn-server-internal-timeout-body = Le délai d'attente du serveur a été dépassé. Veuillez réessayer.
-error-gfn-server-internal-error-title = Erreur serveur
-error-gfn-server-internal-error-body = Une erreur interne du serveur s'est produite. Veuillez réessayer plus tard.
+error-gfn-auth-token-update-timeout-body = La mise à jour du jeton d'authentification a expiré. Veuillez vous reconnecter.
+error-gfn-request-forbidden-title = Accès interdit
+error-gfn-request-forbidden-body = L'accès à ce service est interdit.
+error-gfn-server-internal-timeout-title = Délai du serveur dépassé
+error-gfn-server-internal-timeout-body = Le serveur a mis trop de temps à répondre. Veuillez réessayer.
+error-gfn-server-internal-error-title = Erreur du serveur
+error-gfn-server-internal-error-body = Une erreur interne du serveur est survenue. Veuillez réessayer plus tard.
 error-gfn-server-invalid-request-title = Requête invalide
 error-gfn-server-invalid-request-body = La requête était invalide.
 error-gfn-session-list-limit-exceeded-title = Trop de sessions
-error-gfn-session-list-limit-exceeded-body = Vous avez trop de sessions actives. Veuillez fermer certaines sessions et réessayer.
+error-gfn-session-list-limit-exceeded-body = Vous avez trop de sessions actives. Veuillez en fermer quelques-unes et réessayer.
 error-gfn-session-limit-exceeded-title = Limite de sessions atteinte
 error-gfn-session-limit-exceeded-body = Vous avez atteint votre limite de sessions. Une autre session est peut-être déjà en cours sur votre compte.
-error-gfn-session-entitled-time-exceeded-title = Durée de session dépassée
-error-gfn-session-entitled-time-exceeded-body = La durée de votre session a été dépassée.
+error-gfn-session-entitled-time-exceeded-title = Temps de session dépassé
+error-gfn-session-entitled-time-exceeded-body = Votre temps de session a été dépassé.
 error-gfn-auth-failure-title = Échec de l'authentification
 error-gfn-auth-failure-body = L'authentification a échoué. Veuillez vous reconnecter.
 error-gfn-invalid-authentication-expired-title = Session expirée
 error-gfn-invalid-authentication-expired-body = Votre authentification a expiré. Veuillez vous reconnecter.
 error-gfn-entitlement-failure-title = Erreur de droits d'accès
-error-gfn-entitlement-failure-body = Vous n'avez pas accès à ce jeu ou à ce service.
-error-gfn-invalid-app-id-not-available-title = Jeu indisponible
-error-gfn-invalid-app-id-not-available-body = Ce jeu n'est pas disponible pour le moment.
+error-gfn-entitlement-failure-body = Vous n'avez pas accès à ce jeu ou service.
+error-gfn-invalid-app-id-not-available-title = Jeu non disponible
+error-gfn-invalid-app-id-not-available-body = Ce jeu n'est pas disponible actuellement.
 error-gfn-invalid-app-id-not-found-title = Jeu introuvable
-error-gfn-invalid-app-id-not-found-body = Ce jeu est introuvable dans la bibliothèque.
+error-gfn-invalid-app-id-not-found-body = Ce jeu n'a pas été trouvé dans la bibliothèque.
 error-gfn-eula-un-accepted-title = CLUF requis
-error-gfn-eula-un-accepted-body = Vous devez accepter le Contrat de licence utilisateur final pour continuer.
+error-gfn-eula-un-accepted-body = Vous devez accepter le contrat de licence utilisateur final pour continuer.
 error-gfn-maintenance-status-title = En maintenance
 error-gfn-maintenance-status-body = Le service est actuellement en maintenance. Veuillez réessayer plus tard.
 error-gfn-service-un-available-title = Service indisponible
 error-gfn-service-un-available-body = Le service est temporairement indisponible. Veuillez réessayer plus tard.
 error-gfn-steam-guard-required-title = Steam Guard requis
-error-gfn-steam-guard-required-body = L'authentification Steam Guard est requise. Veuillez effectuer la vérification Steam Guard.
+error-gfn-steam-guard-required-body = L'authentification Steam Guard est requise. Veuillez terminer la vérification Steam Guard.
 error-gfn-steam-login-required-title = Connexion Steam requise
-error-gfn-steam-login-required-body = Vous devez associer votre compte Steam pour jouer à ce jeu.
+error-gfn-steam-login-required-body = Vous devez lier votre compte Steam pour jouer à ce jeu.
 error-gfn-steam-guard-invalid-title = Steam Guard invalide
 error-gfn-steam-guard-invalid-body = Le code Steam Guard est invalide. Veuillez réessayer.
 error-gfn-steam-profile-private-title = Profil Steam privé
-error-gfn-steam-profile-private-body = Votre profil Steam est privé. Veuillez le rendre public ou visible par vos amis uniquement.
+error-gfn-steam-profile-private-body = Votre profil Steam est privé. Rendez-le public ou accessible aux amis.
 error-gfn-email-not-verified-title = E-mail non vérifié
 error-gfn-email-not-verified-body = Veuillez vérifier votre adresse e-mail pour continuer.
 error-gfn-app-patching-title = Mise à jour du jeu
-error-gfn-app-patching-body = Ce jeu est en cours de mise à jour. Veuillez réessayer plus tard.
+error-gfn-app-patching-body = Ce jeu est actuellement en cours de mise à jour. Veuillez réessayer plus tard.
 error-gfn-game-not-found-title = Jeu introuvable
-error-gfn-game-not-found-body = Ce jeu est introuvable.
+error-gfn-game-not-found-body = Ce jeu n'a pas été trouvé.
 error-gfn-not-enough-credits-title = Crédits insuffisants
 error-gfn-not-enough-credits-body = Vous n'avez pas assez de crédits pour cette session.
-error-gfn-session-terminated-by-another-client-title = Session reprise par un autre appareil
+error-gfn-session-terminated-by-another-client-title = Session reprise
 error-gfn-session-terminated-by-another-client-body = Votre session a été reprise par un autre appareil.
 error-gfn-session-expired-title = Session expirée
 error-gfn-session-expired-body = Votre session a expiré.
-error-gfn-session-limit-per-device-reached-title = Limite d'appareils atteinte
+error-gfn-session-limit-per-device-reached-title = Limite d'appareil atteinte
 error-gfn-session-limit-per-device-reached-body = Vous avez atteint la limite de sessions pour cet appareil.
-error-gfn-forwarding-zone-out-of-capacity-title = Capacité de la région atteinte
-error-gfn-forwarding-zone-out-of-capacity-body = La capacité de votre région est actuellement atteinte. Veuillez réessayer plus tard.
+error-gfn-forwarding-zone-out-of-capacity-title = Région à pleine capacité
+error-gfn-forwarding-zone-out-of-capacity-body = Votre région est actuellement à pleine capacité. Veuillez réessayer plus tard.
 error-gfn-region-not-supported-indefinitely-title = Région non prise en charge
 error-gfn-region-not-supported-indefinitely-body = Le service n'est pas disponible dans votre région.
-error-gfn-region-banned-title = Région bloquée
+error-gfn-region-banned-title = Région bannie
 error-gfn-region-banned-body = Le service n'est pas disponible dans votre région.
-error-gfn-region-on-hold-for-free-title = Offre gratuite suspendue
+error-gfn-region-on-hold-for-free-title = Offre gratuite en pause
 error-gfn-region-on-hold-for-free-body = L'offre gratuite est temporairement indisponible dans votre région.
-error-gfn-region-on-hold-for-paid-title = Offre payante suspendue
+error-gfn-region-on-hold-for-paid-title = Offre payante en pause
 error-gfn-region-on-hold-for-paid-body = L'offre payante est temporairement indisponible dans votre région.
 error-gfn-app-maintenance-status-title = Maintenance du jeu
-error-gfn-app-maintenance-status-body = Ce jeu est actuellement en cours de maintenance.
-error-gfn-insufficient-vm-capacity-title = Capacité insuffisante
-error-gfn-insufficient-vm-capacity-body = Aucune machine de jeu n'est disponible pour le moment. Veuillez réessayer plus tard ou rejoindre la file d'attente.
-error-gfn-server-session-queue-length-exceeded-title = File d'attente complète
-error-gfn-server-session-queue-length-exceeded-body = La file d'attente est actuellement complète. Veuillez réessayer plus tard.
+error-gfn-app-maintenance-status-body = Ce jeu est actuellement en maintenance.
+error-gfn-insufficient-vm-capacity-title = Aucune capacité
+error-gfn-insufficient-vm-capacity-body = Aucune machine de jeu n'est disponible actuellement. Veuillez réessayer plus tard ou rejoindre la file d'attente.
+error-gfn-server-session-queue-length-exceeded-title = File d'attente pleine
+error-gfn-server-session-queue-length-exceeded-body = La file d'attente est actuellement pleine. Veuillez réessayer plus tard.
 error-gfn-region-not-supported-for-streaming-title = GeForce NOW indisponible dans votre région
-error-gfn-region-not-supported-for-streaming-body = GeForce NOW a restreint le streaming dans votre région. Il ne s'agit pas d'un problème lié à OpenNOW ; NVIDIA a bloqué l'accès depuis votre emplacement. Vous devrez peut-être utiliser un VPN ou consulter la liste des pays pris en charge par GeForce NOW.
-error-gfn-game-binaries-not-available-in-region-title = Jeu indisponible
+error-gfn-region-not-supported-for-streaming-body = GeForce NOW a restreint le streaming dans votre région. Ceci n'est pas un problème d'OpenNOW - NVIDIA a bloqué l'accès depuis votre localisation. Vous devrez peut-être utiliser un VPN ou consulter la liste des pays pris en charge par GeForce NOW.
+error-gfn-game-binaries-not-available-in-region-title = Jeu non disponible
 error-gfn-game-binaries-not-available-in-region-body = Ce jeu n'est pas disponible dans votre région.
-error-gfn-session-in-queue-abandoned-title = Session en file d'attente abandonnée
-error-gfn-session-in-queue-abandoned-body = Votre session en file d'attente a été abandonnée.
+error-gfn-session-in-queue-abandoned-title = File d'attente abandonnée
+error-gfn-session-in-queue-abandoned-body = Votre session dans la file d'attente a été abandonnée.
 error-gfn-member-terminated-title = Compte résilié
 error-gfn-member-terminated-body = Votre compte a été résilié.
 error-gfn-session-removed-from-queue-maintenance-title = Maintenance de la file d'attente
-error-gfn-session-removed-from-queue-maintenance-body = La file d'attente a été vidée en raison d'une maintenance.
-error-gfn-zone-maintenance-status-title = Maintenance de zone
-error-gfn-zone-maintenance-status-body = Cette zone de serveur est en cours de maintenance.
-error-gfn-session-waiting-ads-time-expired-title = Délai d'attente des publicités dépassé
-error-gfn-session-waiting-ads-time-expired-body = La session a expiré pendant l'attente des publicités. Les utilisateurs de l'offre gratuite doivent regarder des publicités pour jouer. Veuillez démarrer une nouvelle session.
-error-gfn-user-cancelled-watching-ads-title = Visionnage des publicités annulé
-error-gfn-user-cancelled-watching-ads-body = Session annulée car les publicités ont été ignorées. Les utilisateurs de l'offre gratuite doivent regarder des publicités pour jouer.
+error-gfn-session-removed-from-queue-maintenance-body = La file d'attente a été vidée pour cause de maintenance.
+error-gfn-zone-maintenance-status-title = Maintenance de la zone
+error-gfn-zone-maintenance-status-body = Cette zone de serveur est en maintenance.
+error-gfn-session-waiting-ads-time-expired-title = Délai de publicité dépassé
+error-gfn-session-waiting-ads-time-expired-body = La session a expiré en attendant les publicités. Les utilisateurs de l'offre gratuite doivent regarder des publicités pour jouer. Veuillez démarrer une nouvelle session.
+error-gfn-user-cancelled-watching-ads-title = Publicités annulées
+error-gfn-user-cancelled-watching-ads-body = Session annulée car les publicités ont été passées. Les utilisateurs de l'offre gratuite doivent regarder des publicités pour jouer.
 error-gfn-streaming-not-allowed-in-limited-mode-title = Mode limité
 error-gfn-streaming-not-allowed-in-limited-mode-body = Le streaming n'est pas autorisé en mode limité.
-error-gfn-max-session-number-limit-exceeded-title = Limite de sessions atteinte
-error-gfn-max-session-number-limit-exceeded-body = Le nombre maximal de sessions a été atteint.
-error-gfn-session-rejected-no-capacity-title = Capacité insuffisante
+error-gfn-max-session-number-limit-exceeded-title = Limite de sessions
+error-gfn-max-session-number-limit-exceeded-body = Nombre maximal de sessions atteint.
+error-gfn-session-rejected-no-capacity-title = Aucune capacité
 error-gfn-session-rejected-no-capacity-body = Aucune machine de jeu n'est disponible. Veuillez réessayer plus tard.
-error-gfn-session-insufficient-playability-level-title = Mise à niveau de l'abonnement requise
-error-gfn-session-insufficient-playability-level-body = Votre abonnement GeForce NOW actuel ne vous permet pas de jouer à ce jeu. Passez à une offre supérieure et réessayez.
-error-gfn-user-storage-not-available-title = Stockage utilisateur indisponible
+error-gfn-session-insufficient-playability-level-title = Mise à niveau d'abonnement requise
+error-gfn-session-insufficient-playability-level-body = Votre abonnement GeForce NOW actuel n'est pas suffisant pour jouer à ce jeu. Passez à un niveau supérieur et réessayez.
+error-gfn-user-storage-not-available-title = Stockage indisponible
 error-gfn-user-storage-not-available-body = Le stockage utilisateur n'est pas disponible.
 error-gfn-gfn-storage-not-available-title = Erreur de stockage
 error-gfn-gfn-storage-not-available-body = Le stockage du service n'est pas disponible.
 error-gfn-app-not-allowed-to-stream-title = Streaming non autorisé
-error-gfn-app-not-allowed-to-stream-body = Cette application n'est pas autorisée à diffuser du contenu avec votre compte GeForce NOW ou dans votre région actuelle.
+error-gfn-app-not-allowed-to-stream-body = Cette app n'est pas autorisée à diffuser sur votre compte ou région GeForce NOW actuel.
 error-gfn-socket-error-title = Erreur de socket
 error-gfn-socket-error-body = Une erreur de socket est survenue. Veuillez vérifier votre réseau.
 error-gfn-address-resolve-failed-title = Erreur DNS
@@ -281,12 +318,28 @@ error-gfn-connect-failed-body = Échec de la connexion au serveur. Veuillez vér
 error-gfn-ssl-error-title = Erreur SSL
 error-gfn-ssl-error-body = Une erreur de connexion sécurisée est survenue.
 error-gfn-connection-timeout-title = Délai de connexion dépassé
-error-gfn-connection-timeout-body = Le délai de connexion a expiré. Veuillez vérifier votre réseau.
+error-gfn-connection-timeout-body = La connexion a expiré. Veuillez vérifier votre réseau.
 error-gfn-data-receive-timeout-title = Délai de réception dépassé
-error-gfn-data-receive-timeout-body = Le délai de réception des données a expiré. Veuillez vérifier votre réseau.
+error-gfn-data-receive-timeout-body = La réception des données a expiré. Veuillez vérifier votre réseau.
 error-gfn-peer-no-response-title = Aucune réponse
 error-gfn-peer-no-response-body = Le serveur ne répond pas. Veuillez réessayer.
 error-gfn-certificate-rejected-title = Erreur de certificat
 error-gfn-certificate-rejected-body = Le certificat du serveur a été rejeté.
-error-gfn-unknown-title = Impossible de démarrer la session
+error-gfn-unknown-title = La session n'a pas pu démarrer
 error-gfn-unknown-body = GeForce NOW a refusé le lancement : { $detail }
+
+# Pre-launch server picker
+server-picker-heading = Sélectionner un serveur
+server-picker-queue-loading = Chargement des données de la file d'attente...
+server-picker-auto-badge = MEILLEUR
+server-picker-closest-badge = LE PLUS PROCHE
+server-picker-launch = Lancer
+server-picker-cancel = Annuler
+server-picker-powered-by = Données de file d'attente fournies par PrintedWaste
+server-picker-hint = Haut/Bas pour choisir · X pour lancer · O pour annuler
+
+# Power / link health
+status-battery-low = Batterie faible ({ $percent }%) - la session s'arrêtera avant qu'elle ne soit épuisée.
+status-battery-critical = Batterie critique - session arrêtée pour permettre une fermeture propre.
+status-session-suspended = Session arrêtée car la console est passée en veille.
+status-bitrate-lowered = Connexion instable - débit plafonné à { $mbps } Mbps.
