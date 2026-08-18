@@ -29,4 +29,33 @@ impl Locale {
     pub fn label(self) -> &'static str {
         self.info().2
     }
+
+    pub fn from_str(code: &str) -> Self {
+        let code = code.trim();
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Locale;
+
+    #[test]
+    fn every_locale_round_trips_through_as_str() {
+        for locale in Locale::ALL {
+            assert_eq!(Locale::from_str(locale.as_str()), locale);
+        }
+    }
+
+    #[test]
+    fn unknown_or_empty_codes_fall_back_to_english() {
+        assert_eq!(Locale::from_str(""), Locale::EnUs);
+        assert_eq!(Locale::from_str("  "), Locale::EnUs);
+        assert_eq!(Locale::from_str("zz-ZZ"), Locale::EnUs);
+        assert_eq!(Locale::from_str(" ru-RU "), Locale::RuRu);
+        assert_eq!(Locale::from_str(" es-ES "), Locale::EsEs);
+    }
 }

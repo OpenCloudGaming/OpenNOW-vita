@@ -175,7 +175,7 @@ pub fn build_nvst_sdp_from_answer(
         a=video.mapRtpTimestampsToFrames:1\r\n\
         a=video.encoderCscMode:3\r\n\
         a=video.dynamicRangeMode:0\r\n\
-        a=video.bitDepth:8\r\n\
+        a=video.bitDepth:{bit_depth}\r\n\
         a=video.scalingFeature1:0\r\n\
         a=video.prefilterParams.prefilterModel:0\r\n\
         a=vqos.bllFec.enable:0\r\n\
@@ -203,6 +203,7 @@ pub fn build_nvst_sdp_from_answer(
         ufrag = ours.ufrag,
         fingerprint = ours.fingerprint,
         fps = settings.fps,
+        bit_depth = settings.bit_depth,
         ri_threshold = ri.partial_reliable_threshold_ms,
         ri_hid_mask = ri.hid_device_mask,
         ri_gamepad_mask = ri.partial_reliable_gamepad_mask,
@@ -343,6 +344,10 @@ fn line_ending(sdp: &str) -> &'static str {
     if sdp.contains("\r\n") { "\r\n" } else { "\n" }
 }
 
+pub fn host_ice_candidate(ip: &str, port: u16) -> String {
+    format!("candidate:1 1 UDP 2122260223 {ip} {port} typ host")
+}
+
 // sets b=AS bitrate + forces good opus params (stereo, minptime) on the answer sdp
 pub fn munge_answer_sdp(sdp: &str, kbps: u32) -> String {
     let ending = line_ending(sdp);
@@ -361,6 +366,13 @@ pub fn munge_answer_sdp(sdp: &str, kbps: u32) -> String {
             lines.push(line.to_owned());
             if current_section == "video" {
                 lines.push(format!("b=AS:{kbps}"));
+                if !sdp.contains("nack") {
+                    lines.push("a=rtcp-fb:* nack".to_owned());
+                    lines.push("a=rtcp-fb:* nack pli".to_owned());
+                }
+                if !sdp.contains("goog-remb") {
+                    lines.push("a=rtcp-fb:* goog-remb".to_owned());
+                }
             } else if current_section == "audio" {
                 lines.push("b=AS:256".to_owned());
             }
@@ -423,6 +435,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_ice_candidate_is_udp_host() {
+        let line = host_ice_candidate("203.0.113.10", 48010);
+        assert_eq!(line, "candidate:1 1 UDP 2122260223 203.0.113.10 48010 typ host");
+        assert!(!crate::gfn::signaling::is_tcp_candidate(&line));
+    }
+
+    #[test]
+    fn extract_public_ip_decodes_alliance_hostname() {
+        assert_eq!(
+            extract_public_ip("66-22-133-156.cloudmatchbeta.nvidiagrid.net"),
+            Some("66.22.133.156".to_owned())
+        );
+        assert_eq!(extract_public_ip("203.0.113.10"), Some("203.0.113.10".to_owned()));
+        assert_eq!(extract_public_ip("not-an-ip.example"), None);
+    }
+
+    #[test]
     fn parse_ri_input_capabilities_parses_hex_and_decimal() {
         let offer = "v=0\r\n\
             m=application 0 RTP/AVP\r\n\
@@ -453,6 +482,8 @@ mod tests {
             a=rtpmap:96 H264/90000\r\n";
         let munged = munge_answer_sdp(answer, 15000);
         assert!(munged.contains("m=video 9 UDP/TLS/RTP/SAVPF 96\r\nb=AS:15000"));
+        assert!(munged.contains("a=rtcp-fb:* nack"));
+        assert!(munged.contains("a=rtcp-fb:* goog-remb"));
         assert!(munged.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nb=AS:256"));
         assert!(munged.contains("a=fmtp:111 useinbandfec=1;stereo=1;minptime=10"));
     }

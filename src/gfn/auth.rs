@@ -659,12 +659,54 @@ pub async fn fetch_membership_tier(
         .await
         .context("subscription response was not valid JSON")?;
 
-    let tier = payload
-        .get("membershipTier")
-        .and_then(|t| t.as_str())
+    // Try finding membershipTier in object, array, or nested subscriptions array
+    let find_tier = |val: &serde_json::Value| -> Option<String> {
+        if let Some(tier) = val.get("membershipTier").and_then(|t| t.as_str()) {
+            return Some(tier.to_owned());
+        }
+        if let Some(arr) = val.as_array() {
+            for item in arr {
+                if let Some(tier) = item.get("membershipTier").and_then(|t| t.as_str()) {
+                    return Some(tier.to_owned());
+                }
+            }
+        }
+        if let Some(subs) = val.get("subscriptions").and_then(|s| s.as_array()) {
+            for item in subs {
+                if let Some(tier) = item.get("membershipTier").and_then(|t| t.as_str()) {
+                    return Some(tier.to_owned());
+                }
+            }
+        }
+        None
+    };
+
+    let tier = find_tier(&payload)
         .context("membershipTier field missing in subscription response")?;
 
-    Ok(tier.to_owned())
+    Ok(tier)
+}
+
+/// Returns the maximum allowed streaming session length in seconds based on membership tier.
+pub fn tier_max_duration_secs(tier: Option<&str>) -> u32 {
+    let Some(tier_str) = tier else {
+        return 60 * 60; // 1 hour for Free
+    };
+    let t = tier_str.to_ascii_uppercase();
+    if t.contains("ULTIMATE") || t.contains("RTX") || t.contains("4080") || t.contains("3080") {
+        8 * 60 * 60 // 8 hours for Ultimate
+    } else if t.contains("PRIORITY")
+        || t.contains("PREMIUM")
+        || t.contains("PERFORMANCE")
+        || t.contains("FOUNDER")
+        || t.contains("STANDARD")
+        || t.contains("DAY_PASS")
+        || t.contains("PASS")
+    {
+        6 * 60 * 60 // 6 hours for Priority, Performance, Founders, Alliance Premium
+    } else {
+        60 * 60 // 1 hour for Free
+    }
 }
 
 const DEVICE_ID_PATH: &str = "ux0:data/opennow-vita/device-id.txt";

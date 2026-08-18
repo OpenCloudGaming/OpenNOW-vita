@@ -179,7 +179,7 @@ async fn run(
                 "connected": true,
                 "id": local_peer_id,
                 "name": peer_name,
-                "peerRole": 0,
+                "peerRole": 1,
                 "resolution": "960x544",
                 "version": 2,
             }
@@ -326,6 +326,9 @@ async fn handle_incoming_message(
     }
 
     if let Some(candidate) = payload.get("candidate").and_then(Value::as_str) {
+        if is_tcp_candidate(candidate) {
+            return true;
+        }
         let ice = IceCandidate {
             candidate: candidate.to_owned(),
             sdp_mid: payload.get("sdpMid").and_then(Value::as_str).map(str::to_owned),
@@ -367,9 +370,24 @@ fn next_ack(counter: &mut u32) -> u32 {
 /// SDP/local ICE candidates encode transport as the 3rd space-separated token
 /// (`candidate:<foundation> <component> <transport> ...`) - matches the reference client's own
 /// `isTcpIceCandidate`.
-fn is_tcp_candidate(candidate: &str) -> bool {
+pub(crate) fn is_tcp_candidate(candidate: &str) -> bool {
     candidate
         .split_whitespace()
         .nth(2)
         .is_some_and(|token| token.eq_ignore_ascii_case("tcp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_candidates_are_detected() {
+        assert!(is_tcp_candidate(
+            "candidate:1 1 TCP 2122260223 203.0.113.10 9 typ host tcptype active"
+        ));
+        assert!(!is_tcp_candidate(
+            "candidate:1 1 UDP 2122260223 203.0.113.10 48010 typ host"
+        ));
+    }
 }

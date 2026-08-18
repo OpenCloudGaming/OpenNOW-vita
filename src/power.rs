@@ -125,6 +125,38 @@ pub fn suspend_required() -> bool {
     false
 }
 
+/// Signals the Vita OS that the app is actively in use, resetting the idle sleep timer.
+#[cfg(target_os = "vita")]
+pub fn keep_awake_tick() {
+    unsafe {
+        vitasdk_sys::sceKernelPowerTick(0);
+    }
+}
+
+#[cfg(not(target_os = "vita"))]
+pub fn keep_awake_tick() {}
+
+/// Returns the formatted local time string "HH:MM".
+pub fn formatted_system_time() -> String {
+    use sdl2::libc;
+    let mut time_val: libc::time_t = 0;
+    unsafe {
+        libc::time(&mut time_val);
+        let mut tm_s: libc::tm = std::mem::zeroed();
+        if !libc::localtime_r(&time_val, &mut tm_s).is_null() {
+            return format!("{:02}:{:02}", tm_s.tm_hour, tm_s.tm_min);
+        }
+    }
+    if let Ok(duration) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        let total_secs = duration.as_secs();
+        let hours = (total_secs / 3600) % 24;
+        let mins = (total_secs / 60) % 60;
+        format!("{hours:02}:{mins:02}")
+    } else {
+        "--:--".to_string()
+    }
+}
+
 /// Restoring reads the previous values back rather than hardcoding a default, so launching from a
 /// shell that already changed clocks puts them back where they actually were.
 #[cfg(target_os = "vita")]

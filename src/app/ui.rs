@@ -12,12 +12,13 @@ use std::sync::Arc;
 /// interaction (buttons etc.) so the caller can feed them back through `App::handle_command`.
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x76, 0xb9, 0x00);
-const BG_DEEP: egui::Color32 = egui::Color32::from_rgb(0x0e, 0x0e, 0x0e);
-const BG_PANEL: egui::Color32 = egui::Color32::from_rgb(0x14, 0x14, 0x14);
-const BG_RAISED: egui::Color32 = egui::Color32::from_rgb(0x24, 0x24, 0x24);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(0x2c, 0x2c, 0x2c);
+const BG_DEEP: egui::Color32 = egui::Color32::from_rgb(0x00, 0x00, 0x00);
+const BG_PANEL: egui::Color32 = egui::Color32::from_rgb(0x0a, 0x0a, 0x0a);
+const BG_RAISED: egui::Color32 = egui::Color32::from_rgb(0x16, 0x16, 0x16);
+const BORDER: egui::Color32 = egui::Color32::from_rgb(0x22, 0x22, 0x22);
 const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(0xa0, 0xa4, 0xac);
 const DANGER: egui::Color32 = egui::Color32::from_rgb(0xff, 0x6b, 0x6b);
+const WARNING: egui::Color32 = egui::Color32::from_rgb(0xff, 0xc1, 0x07);
 
 /// Width of the left-hand title list.
 const LIST_WIDTH: f32 = 250.0;
@@ -36,11 +37,12 @@ pub(crate) fn apply_theme(ctx: &egui::Context) {
 
     ctx.set_style(style);
 
-    // egui's dark theme selects in blue, which fought with the NVIDIA green everything else uses.
-    // Muted rather than `ACCENT` itself: selected labels draw white text, and white on the full
-    // brightness green is hard to read. The bright green stays for what already pairs it with dark
-    // text - PLAY, the launch stepper.
+    // OLED Pure Black (#000000) base theme for PS Vita OLED displays
     let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = BG_DEEP;
+    visuals.window_fill = BG_PANEL;
+    visuals.extreme_bg_color = egui::Color32::BLACK;
+    visuals.faint_bg_color = BG_RAISED;
     visuals.selection.bg_fill = ACCENT.gamma_multiply(0.45);
     visuals.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
     visuals.hyperlink_color = ACCENT;
@@ -468,38 +470,70 @@ fn stream_icon_button(ui: &mut egui::Ui, icon: StreamIcon, tint: egui::Color32) 
     response
 }
 
-/// The diagnostics panel: the peer's line plus the audio counters, on a backing plate.
+/// Pulls a `key:value` token (e.g. `"kbps:4200"`) out of the peer's stats line.
+fn stat_token<'a>(note: &'a str, key: &str) -> Option<&'a str> {
+    note.split_whitespace()
+        .find_map(|tok| tok.strip_prefix(key))
+}
+
+/// FPS color thresholds, loosely matching GeForce NOW's own overlay (green/yellow/red).
+fn fps_color(fps: f32) -> egui::Color32 {
+    if fps >= 55.0 {
+        egui::Color32::from_rgb(0x4c, 0xd9, 0x64)
+    } else if fps >= 30.0 {
+        egui::Color32::from_rgb(0xe8, 0xc1, 0x3a)
+    } else {
+        DANGER
+    }
+}
+
+/// The diagnostics bar: just the FPS readout and its sparkline, on a backing plate.
 ///
-/// Hidden unless asked for. Raw white text straight over the video was unreadable against light
-/// scenes and covered the game for a readout that only matters while something is being debugged.
-fn stream_stats_panel(ui: &mut egui::Ui, note: &str) {
-    let font = egui::FontId::monospace(10.0);
-    let text_color = egui::Color32::from_rgb(0xc8, 0xcc, 0xd4);
-    let lines = [
-        note.to_owned(),
-        crate::streaming::audio::stats_line(),
-        crate::shell::render_stats::line(),
-        crate::input::stick_zone_stats::line(),
-    ];
+/// Hidden unless asked for. Deliberately terse - this sits over live video, and a wall of
+/// counters only matters while something is being actively debugged (use the log for that).
+fn stream_stats_panel(
+    ui: &mut egui::Ui,
+    screen_width: f32,
+    note: &str,
+    fps_history: &std::collections::VecDeque<f32>,
+) {
+    let label_font = egui::FontId::proportional(9.5);
+    let value_font = egui::FontId::monospace(9.5);
+    let extra_font = egui::FontId::monospace(8.0);
 
-    let galleys: Vec<_> = lines
-        .iter()
-        .map(|line| {
-            ui.fonts(|fonts| fonts.layout_no_wrap(line.clone(), font.clone(), text_color))
-        })
-        .collect();
+    let current_fps = fps_history.back().copied().unwrap_or(0.0);
+    let kbps = stat_token(note, "kbps:").unwrap_or("-");
+    let rtt = stat_token(note, "rtt:").unwrap_or("-");
+    let jit = stat_token(note, "jit:")
+        .and_then(|s| s.strip_suffix("ms"))
+        .unwrap_or("-");
+    let dec = stat_token(note, "dec:")
+        .and_then(|s| s.strip_suffix("ms"))
+        .unwrap_or("-");
+    let drop = stat_token(note, "drop:").unwrap_or("0");
+    let loss = stat_token(note, "loss:")
+        .and_then(|s| s.strip_suffix('%'))
+        .unwrap_or("0");
+    let loss_val: f32 = loss.parse().unwrap_or(0.0);
+    let drop_val: f32 = drop.parse().unwrap_or(0.0);
 
-    let padding = egui::vec2(8.0, 6.0);
-    let line_gap = 2.0;
-    let width = galleys
-        .iter()
-        .map(|galley| galley.size().x)
-        .fold(0.0_f32, f32::max);
-    let height: f32 = galleys.iter().map(|galley| galley.size().y).sum::<f32>()
-        + line_gap * (galleys.len().saturating_sub(1)) as f32;
+    let graph_size = egui::vec2(44.0, 12.0);
+    let padding = egui::vec2(10.0, 4.0);
+    let gap = 5.0;
 
+    let fps_text = format!("{current_fps:.0}");
+    let fps_galley = ui.fonts(|f| f.layout_no_wrap(fps_text, value_font.clone(), fps_color(current_fps)));
+    let fps_label_galley = ui.fonts(|f| f.layout_no_wrap("FPS".to_owned(), label_font.clone(), TEXT_DIM));
+    let extra_text =
+        format!("{kbps} kbps  |  {rtt} ms ping  |  {jit} ms jitter  |  {dec} ms decode  |  {loss}% perdida  |  {drop}/s drop");
+    let extra_color = if loss_val >= 2.0 || drop_val >= 1.0 { DANGER } else { TEXT_DIM };
+    let extra_galley = ui.fonts(|f| f.layout_no_wrap(extra_text, extra_font.clone(), extra_color));
+
+    let content_height = graph_size.y.max(fps_galley.size().y);
+
+    // Full-width strip flush against the bottom edge, not a floating box.
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(width + padding.x * 2.0, height + padding.y * 2.0),
+        egui::vec2(screen_width, content_height + padding.y * 2.0),
         egui::Sense::hover(),
     );
     if !ui.is_rect_visible(rect) {
@@ -509,16 +543,54 @@ fn stream_stats_panel(ui: &mut egui::Ui, note: &str) {
     let painter = ui.painter();
     painter.rect_filled(
         rect,
-        6.0,
-        egui::Color32::from_rgba_unmultiplied(10, 10, 10, 205),
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(10, 10, 10, 210),
     );
 
-    let mut y = rect.min.y + padding.y;
-    for galley in galleys {
-        let line_height = galley.size().y;
-        painter.galley(egui::pos2(rect.min.x + padding.x, y), galley, text_color);
-        y += line_height + line_gap;
+    let mut x = rect.min.x + padding.x;
+    let top_y = rect.min.y + padding.y;
+
+    // "FPS 60" readout, color-coded like the reference GFN overlay.
+    let label_y = top_y + (content_height - fps_label_galley.size().y) / 2.0;
+    painter.galley(egui::pos2(x, label_y), fps_label_galley.clone(), TEXT_DIM);
+    x += fps_label_galley.size().x + 3.0;
+    let value_y = top_y + (content_height - fps_galley.size().y) / 2.0;
+    painter.galley(egui::pos2(x, value_y), fps_galley.clone(), fps_color(current_fps));
+    x += fps_galley.size().x + gap;
+
+    // Sparkline of recent FPS samples.
+    let graph_rect = egui::Rect::from_min_size(egui::pos2(x, top_y), graph_size);
+    painter.rect_filled(
+        graph_rect,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+    );
+    if fps_history.len() >= 2 {
+        let max_fps = fps_history.iter().copied().fold(1.0_f32, f32::max).max(60.0);
+        let n = fps_history.len();
+        let points: Vec<egui::Pos2> = fps_history
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let t = i as f32 / (n - 1) as f32;
+                let norm = (v / max_fps).clamp(0.0, 1.0);
+                egui::pos2(
+                    graph_rect.min.x + t * graph_rect.width(),
+                    graph_rect.max.y - norm * graph_rect.height(),
+                )
+            })
+            .collect();
+        painter.add(egui::Shape::line(
+            points,
+            egui::Stroke::new(1.0_f32, fps_color(current_fps)),
+        ));
     }
+    x += graph_size.x + gap;
+
+    // Bitrate, latency and packet loss: the numbers that actually matter for stream quality.
+    // Loss turns red past 2% since that's where it starts showing up as visible artifacts.
+    let extra_y = top_y + (content_height - extra_galley.size().y) / 2.0;
+    painter.galley(egui::pos2(x, extra_y), extra_galley, extra_color);
 }
 
 const STREAM_UI_RECTS: &str = "stream_ui_rects";
@@ -556,14 +628,19 @@ const KEYBOARD_ROWS: f32 = 6.0;
 const KEYBOARD_PADDING: f32 = 8.0;
 
 pub(crate) fn keyboard_panel_rect(screen: egui::Rect) -> egui::Rect {
-    let width = KEYBOARD_COLUMNS * KEYBOARD_CAP_SIZE.x
-        + (KEYBOARD_COLUMNS - 1.0) * KEYBOARD_CAP_SPACING
-        + KEYBOARD_PADDING * 2.0;
     let height = KEYBOARD_ROWS * KEYBOARD_CAP_SIZE.y
         + (KEYBOARD_ROWS - 1.0) * KEYBOARD_CAP_SPACING
         + KEYBOARD_PADDING * 2.0;
-    let min = egui::pos2(screen.center().x - width / 2.0, screen.max.y - height);
-    egui::Rect::from_min_size(min, egui::vec2(width, height))
+    let min = egui::pos2(screen.min.x, screen.max.y - height);
+    egui::Rect::from_min_size(min, egui::vec2(screen.width(), height))
+}
+
+fn keyboard_unit_width(inner_width: f32) -> f32 {
+    (inner_width - (KEYBOARD_COLUMNS - 1.0) * KEYBOARD_CAP_SPACING) / KEYBOARD_COLUMNS
+}
+
+fn keyboard_key_width(units: f32, unit_width: f32) -> f32 {
+    unit_width * units + KEYBOARD_CAP_SPACING * (units - 1.0)
 }
 
 /// Resolves the currently highlighted game.
@@ -863,6 +940,7 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
             selected,
             filtered_indices,
             peer,
+            session_start,
             ..
         } => {
             if let Some(cmd) = streaming_screen(
@@ -871,10 +949,14 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
                 selected_game(games, filtered_indices, *selected),
                 peer.video_frame().is_some(),
                 app.status_note.as_deref(),
+                &app.fps_history,
                 app.keyboard_open,
                 app.show_stream_stats,
                 app.toolbar_expanded,
                 app.mouse_trackpad_enabled,
+                app.battery,
+                Some(*session_start),
+                app.membership_tier.as_deref(),
             ) {
                 commands.push(cmd);
             }
@@ -890,17 +972,6 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
 
     if app.keyboard_open && matches!(app.state, AppState::Streaming { .. }) {
         commands.extend(on_screen_keyboard(ctx, app.key_shift, app.key_ctrl, app.key_alt));
-    }
-
-    if crate::gfn::stream_prefs::session_timer_enabled() {
-        if let AppState::Streaming { session_start, .. } = &app.state {
-            session_timer_overlay(
-                ctx,
-                *session_start,
-                app.membership_tier.as_deref(),
-                app.battery,
-            );
-        }
     }
 
     if app.show_controls_hint && matches!(app.state, AppState::Streaming { .. })
@@ -1165,7 +1236,6 @@ fn catalog_screen(ctx: &egui::Context, i18n: &I18n, view: &CatalogView<'_>) -> V
                     let (dot, _) =
                         ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot.center(), 4.0, ACCENT);
-
                     ui.add_space(10.0);
                     commands.extend(settings_modal(
                         ui,
@@ -3564,10 +3634,14 @@ fn streaming_screen(
     game: Option<&GameSummary>,
     has_video: bool,
     status_note: Option<&str>,
+    fps_history: &std::collections::VecDeque<f32>,
     keyboard_open: bool,
     show_stats: bool,
     toolbar_expanded: bool,
     mouse_trackpad_enabled: bool,
+    battery: Option<crate::power::BatteryStatus>,
+    session_start: Option<std::time::Instant>,
+    membership_tier: Option<&str>,
 ) -> Option<AppCommand> {
     let mut command = None;
 
@@ -3631,6 +3705,78 @@ fn streaming_screen(
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130),
                 );
             }
+        }
+
+        // Top-right status badge (Countdown Session Timer 🕒 & Battery 🔋) - toggled by the toolbar clock button
+        if crate::gfn::stream_prefs::session_timer_enabled() {
+            let (timer_text, timer_color) = if let Some(start) = session_start {
+                let elapsed = start.elapsed().as_secs() as u32;
+                let max_duration = crate::gfn::auth::tier_max_duration_secs(membership_tier);
+                let remaining = max_duration.saturating_sub(elapsed);
+                let hours = remaining / 3600;
+                let mins = (remaining % 3600) / 60;
+                let s = remaining % 60;
+                let text = format!("{hours:02}:{mins:02}:{s:02}");
+                let color = if remaining < 180 {
+                    DANGER
+                } else if remaining < 600 {
+                    WARNING
+                } else {
+                    egui::Color32::WHITE
+                };
+                (text, color)
+            } else {
+                (crate::power::formatted_system_time(), egui::Color32::WHITE)
+            };
+
+            egui::Area::new(egui::Id::new("stream_status_pill"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_black_alpha(190))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+                        ))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+
+                                // 🕒 Clock Icon
+                                let (icon_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(14.0, 14.0),
+                                    egui::Sense::hover(),
+                                );
+                                paint_stream_icon(ui.painter(), icon_rect, StreamIcon::Clock, timer_color);
+
+                                ui.label(
+                                    egui::RichText::new(&timer_text)
+                                        .size(12.0)
+                                        .strong()
+                                        .color(timer_color),
+                                );
+
+                                // 🔋 Battery
+                                if let Some(battery) = battery {
+                                    ui.label(egui::RichText::new("|").size(11.0).color(TEXT_DIM));
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(20.0, 14.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    paint_battery(ui.painter(), rect, battery);
+                                    ui.label(
+                                        egui::RichText::new(format!("{}%", battery.percent))
+                                            .size(11.0)
+                                            .strong()
+                                            .color(battery_color(battery)),
+                                    );
+                                }
+                            });
+                        });
+                });
         }
 
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -3719,10 +3865,12 @@ fn streaming_screen(
         });
 
         if show_stats && let Some(note) = status_note {
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.add_space(6.0);
-                stream_stats_panel(ui, note);
-            });
+            egui::Area::new(egui::Id::new("stream_stats_panel_area"))
+                .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(0.0, 0.0))
+                .interactable(false)
+                .show(ctx, |ui| {
+                    stream_stats_panel(ui, ctx.screen_rect().width(), note, fps_history);
+                });
         }
     });
 
@@ -3938,8 +4086,12 @@ fn on_screen_keyboard(ctx: &egui::Context, shift: bool, ctrl: bool, alt: bool) -
                 .fill(BG_PANEL.gamma_multiply(0.96))
                 .inner_margin(egui::Margin::same(KEYBOARD_PADDING as i8))
                 .outer_margin(egui::Margin::ZERO)
+                .shadow(egui::Shadow::NONE)
+                .corner_radius(0.0)
                 .show(ui, |ui| {
-                    ui.set_width(panel_rect.width() - KEYBOARD_PADDING * 2.0);
+                    let inner_width = panel_rect.width() - KEYBOARD_PADDING * 2.0;
+                    let unit_width = keyboard_unit_width(inner_width);
+                    ui.set_width(inner_width);
                     ui.spacing_mut().item_spacing = egui::vec2(KEYBOARD_CAP_SPACING, KEYBOARD_CAP_SPACING);
 
                     for row in keyboard_layout() {
@@ -3957,8 +4109,7 @@ fn on_screen_keyboard(ctx: &egui::Context, shift: bool, ctrl: bool, alt: bool) -
                                     KeyCap::Ctrl => ("Ctrl".to_string(), ctrl),
                                     KeyCap::Alt => ("Alt".to_string(), alt),
                                 };
-                                let width =
-                                    KEYBOARD_CAP_SIZE.x * units + KEYBOARD_CAP_SPACING * (units - 1.0);
+                                let width = keyboard_key_width(units, unit_width);
                                 let mut button = egui::Button::new(
                                     egui::RichText::new(label).size(11.0),
                                 );
@@ -4178,92 +4329,13 @@ fn draw_qr(ui: &mut egui::Ui, verification_uri: &str, target_size: f32) {
     }
 }
 
-fn session_timer_overlay(
-    ctx: &egui::Context,
-    start_time: std::time::Instant,
-    tier_str: Option<&str>,
-    battery: Option<crate::power::BatteryStatus>,
-) {
-    let tier_val = tier_str.unwrap_or("Free");
-    let max_duration: u32 = match tier_val {
-        "Ultimate" | "RTX3080" => 8 * 60 * 60, // 8 hours
-        "Premium" | "Priority" => 6 * 60 * 60, // 6 hours
-        _ => 60 * 60,                          // 1 hour for Free
-    };
-    
-    let elapsed = start_time.elapsed().as_secs() as u32;
-    let _remaining = max_duration.saturating_sub(elapsed);
-    let progress = (elapsed as f32 / max_duration as f32).clamp(0.0, 1.0);
 
-    let format_time = |secs: u32| -> String {
-        let hours = secs / 3600;
-        let mins = (secs % 3600) / 60;
-        let s = secs % 60;
-        if hours > 0 {
-            format!("{hours}:{mins:02}:{s:02}")
-        } else {
-            format!("{mins:02}:{s:02}")
-        }
-    };
-
-    let elapsed_str = format_time(elapsed);
-    let total_str = format_time(max_duration);
-    let text = format!("{elapsed_str} / {total_str}");
-
-    egui::Window::new("session_timer_overlay")
-        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -10.0))
-        .title_bar(false)
-        .resizable(false)
-        .collapsible(false)
-        .frame(
-            egui::Frame::window(&ctx.style())
-                .fill(egui::Color32::from_black_alpha(200))
-                .inner_margin(egui::Margin::symmetric(10, 6))
-                .corner_radius(8.0),
-        )
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                paint_stream_icon(ui.painter(), icon_rect, StreamIcon::Clock, egui::Color32::WHITE);
-
-                let (arrow_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 16.0), egui::Sense::hover());
-                let arrow_center = arrow_rect.center();
-                let arrow_points = [
-                    egui::pos2(arrow_center.x - 3.5, arrow_center.y - 2.0),
-                    egui::pos2(arrow_center.x + 3.5, arrow_center.y - 2.0),
-                    egui::pos2(arrow_center.x, arrow_center.y + 2.5),
-                ];
-                ui.painter().add(egui::Shape::convex_polygon(
-                    arrow_points.to_vec(),
-                    egui::Color32::WHITE,
-                    egui::Stroke::NONE,
-                ));
-
-                let bar = egui::ProgressBar::new(progress)
-                    .text(egui::RichText::new(text).color(egui::Color32::WHITE))
-                    .desired_width(120.0);
-                ui.add(bar);
-
-                if let Some(battery) = battery {
-                    ui.add_space(6.0);
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(22.0, 16.0), egui::Sense::hover());
-                    paint_battery(ui.painter(), rect, battery);
-                    ui.label(
-                        egui::RichText::new(format!("{}%", battery.percent))
-                            .size(10.5)
-                            .color(battery_color(battery)),
-                    );
-                }
-            });
-        });
-}
 
 #[cfg(test)]
 mod error_presentation_tests {
     use super::{
-        keyboard_layout, keyboard_panel_rect, legacy_error_keys, KEYBOARD_CAP_SIZE,
-        KEYBOARD_CAP_SPACING, KEYBOARD_COLUMNS, KEYBOARD_PADDING,
+        keyboard_key_width, keyboard_layout, keyboard_panel_rect, keyboard_unit_width,
+        legacy_error_keys, KEYBOARD_CAP_SPACING, KEYBOARD_COLUMNS, KEYBOARD_PADDING,
     };
     use crate::gfn::error_codes::GfnErrorCode;
 
@@ -4337,14 +4409,13 @@ mod error_presentation_tests {
 
     #[test]
     fn a_full_width_row_exactly_fills_the_panel() {
-        let inner = keyboard_panel_rect(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(960.0 / 1.3, 544.0 / 1.3),
-        ))
-        .width()
-            - KEYBOARD_PADDING * 2.0;
-        let row = KEYBOARD_COLUMNS * KEYBOARD_CAP_SIZE.x
-            + (KEYBOARD_COLUMNS - 1.0) * KEYBOARD_CAP_SPACING;
-        assert!((inner - row).abs() < f32::EPSILON, "{inner} != {row}");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 544.0));
+        let panel = keyboard_panel_rect(screen);
+        assert!((panel.width() - screen.width()).abs() < f32::EPSILON);
+        let inner = panel.width() - KEYBOARD_PADDING * 2.0;
+        let unit = keyboard_unit_width(inner);
+        let row = KEYBOARD_COLUMNS * unit + (KEYBOARD_COLUMNS - 1.0) * KEYBOARD_CAP_SPACING;
+        assert!((inner - row).abs() < 0.01, "{inner} != {row}");
+        assert!((keyboard_key_width(2.0, unit) - (2.0 * unit + KEYBOARD_CAP_SPACING)).abs() < 0.01);
     }
 }

@@ -397,6 +397,9 @@ pub enum AppState {
     },
 }
 
+/// Rolling window length for the streaming stats FPS sparkline.
+const FPS_HISTORY_LEN: usize = 60;
+
 pub struct App {
     pub(crate) state: AppState,
     /// Used both for GFN REST/GraphQL calls (from the async `AppState` tasks below) and - via
@@ -427,6 +430,9 @@ pub struct App {
     pub(crate) last_input: Option<InputCommand>,
     /// Transient one-line status message (e.g.
     pub(crate) status_note: Option<String>,
+    /// Recent FPS samples (newest last) for the streaming stats sparkline. Capped at
+    /// `FPS_HISTORY_LEN` so the graph shows a fixed rolling window.
+    pub(crate) fps_history: std::collections::VecDeque<f32>,
     /// Debounce/dispatch state for server-side catalog search.
     search_job: Option<(String, PollJob<catalog::CatalogPage>)>,
     /// Set when the query changed and a debounced server search hasn't fired for it yet.
@@ -583,6 +589,7 @@ impl App {
             show_controls_hint: !crate::gfn::stream_prefs::controls_hint_seen(),
             last_input: None,
             status_note: None,
+            fps_history: std::collections::VecDeque::with_capacity(FPS_HISTORY_LEN),
             search_job: None,
             search_pending_since: None,
             last_dispatched_search_query: None,
@@ -594,7 +601,7 @@ impl App {
             key_ctrl: false,
             key_alt: false,
             mouse_trackpad_enabled: true,
-            locale: Locale::default(),
+            locale: crate::gfn::stream_prefs::ui_locale(),
             catalog_sort: CatalogSort::from_text(&crate::gfn::stream_prefs::saved_catalog_sort()),
             catalog_filter,
             vpc_id_cache,
@@ -663,6 +670,7 @@ impl App {
                 self.exit_session(current_state)?
             }
             AppCommand::SetLocale(locale) => {
+                crate::gfn::stream_prefs::set_ui_locale(locale);
                 self.locale = locale;
                 current_state
             }
@@ -1329,7 +1337,9 @@ impl App {
                 | AppState::Signaling { .. }
                 | AppState::Streaming { .. }
         );
-        if !streaming {
+        if streaming {
+            crate::power::keep_awake_tick();
+        } else {
             return current_state;
         }
 
@@ -2583,6 +2593,16 @@ impl App {
                             handle.send_local_ice(candidate);
                         }
                         crate::gfn::peer::PeerEvent::Status(status) => {
+                            if let Some(fps) = status
+                                .split_whitespace()
+                                .find_map(|tok| tok.strip_prefix("fps:"))
+                                .and_then(|v| v.parse::<f32>().ok())
+                            {
+                                if self.fps_history.len() >= FPS_HISTORY_LEN {
+                                    self.fps_history.pop_front();
+                                }
+                                self.fps_history.push_back(fps);
+                            }
                             self.status_note = Some(status);
                         }
                         crate::gfn::peer::PeerEvent::Connected => {
