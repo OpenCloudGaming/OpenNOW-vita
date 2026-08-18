@@ -3,16 +3,20 @@ pub enum Locale {
     #[default]
     EnUs,
     EsEs,
+    FrFr,
+    RuRu,
 }
 
 impl Locale {
-    pub const ALL: [Locale; 2] = [Self::EnUs, Self::EsEs];
+    pub const ALL: [Locale; 4] = [Self::EnUs, Self::EsEs, Self::FrFr, Self::RuRu];
 
     /// `(locale code, store market, native-language label)`.
     fn info(self) -> (&'static str, &'static str, &'static str) {
         match self {
             Self::EnUs => ("en-US", "US", "English (US)"),
             Self::EsEs => ("es-ES", "ES", "Español (España)"),
+            Self::FrFr => ("fr-FR", "FR", "Français (France)"),
+            Self::RuRu => ("ru-RU", "RU", "Русский"),
         }
     }
 
