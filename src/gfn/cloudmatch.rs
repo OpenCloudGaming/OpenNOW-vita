@@ -32,6 +32,7 @@ pub struct StreamSettings {
     pub resolution: String,
     pub fps: u32,
     pub max_bitrate_mbps: u32,
+    pub bit_depth: u32,
 }
 
 impl StreamSettings {
@@ -43,7 +44,12 @@ impl StreamSettings {
             resolution: "960x544".to_owned(),
             fps: super::stream_prefs::fps().value(),
             max_bitrate_mbps: super::link_estimate::ceiling_mbps(),
+            bit_depth: super::stream_prefs::color_depth().stream_bit_depth(),
         }
+    }
+
+    pub fn cloudmatch_bit_depth(&self) -> u32 {
+        if self.bit_depth >= 10 { 10 } else { 0 }
     }
 
     pub fn dimensions(&self) -> (u32, u32) {
@@ -75,6 +81,12 @@ pub struct SessionInfo {
 pub struct MediaConnectionInfo {
     pub ip: String,
     pub port: u16,
+}
+
+impl MediaConnectionInfo {
+    pub fn is_webrtc_ice_host_port(&self) -> bool {
+        self.port > 1024 && self.port != 443
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -364,6 +376,7 @@ pub async fn create_session(
         width,
         height,
         request.settings.fps,
+        request.settings.cloudmatch_bit_depth(),
     );
     let language_code = match request.language_code.trim() {
         "" => DEFAULT_LOCALE,
@@ -1258,6 +1271,7 @@ fn build_session_request_body(
     width: u32,
     height: u32,
     fps: u32,
+    bit_depth: u32,
 ) -> serde_json::Value {
     let sub_session_id = uuid::Uuid::new_v4().to_string();
     let metadata = json!([
@@ -1317,7 +1331,7 @@ fn build_session_request_body(
             "userAge": 26,
             "requestedStreamingFeatures": {
                 "reflex": false,
-                "bitDepth": 0,
+                "bitDepth": bit_depth,
                 "cloudGsync": false,
                 "enabledL4S": false,
                 "supportedHidDevices": 0,
@@ -1376,21 +1390,26 @@ fn parse_session_info(
         format!("{effective_host}:443")
     };
 
-    let media_connection_info = session
-        .connection_info
-        .iter()
-        .find(|conn| conn.matches_usage(2) || conn.matches_usage(17) || conn.matches_usage(14))
-        .and_then(|conn| match (&conn.ip, conn.port) {
-            (Some(ip), Some(port)) => Some(MediaConnectionInfo {
-                ip: ip.as_string(),
-                port,
-            }),
-            (None, Some(port)) if !server_ip.is_empty() => Some(MediaConnectionInfo {
-                ip: server_ip.clone(),
-                port,
-            }),
-            _ => None,
-        });
+    let media_connection_info = [2u64, 17]
+        .into_iter()
+        .find_map(|usage| {
+            session
+                .connection_info
+                .iter()
+                .find(|conn| conn.matches_usage(usage))
+                .and_then(|conn| match (&conn.ip, conn.port) {
+                    (Some(ip), Some(port)) => Some(MediaConnectionInfo {
+                        ip: ip.as_string(),
+                        port,
+                    }),
+                    (None, Some(port)) if !server_ip.is_empty() => Some(MediaConnectionInfo {
+                        ip: server_ip.clone(),
+                        port,
+                    }),
+                    _ => None,
+                })
+        })
+        .filter(|media| media.is_webrtc_ice_host_port());
 
     let ice_servers = session
         .ice_server_configuration
@@ -1878,12 +1897,35 @@ mod tests {
 
     #[test]
     fn parse_resolution_splits() {
-        let settings = StreamSettings {
+        let mut settings = StreamSettings {
             resolution: "1280x720".to_owned(),
             fps: 30,
             max_bitrate_mbps: 5,
+            bit_depth: 8,
         };
         assert_eq!(settings.dimensions(), (1280, 720));
+        assert_eq!(settings.cloudmatch_bit_depth(), 0);
+        settings.bit_depth = 10;
+        assert_eq!(settings.cloudmatch_bit_depth(), 10);
+    }
+
+    #[test]
+    fn signaling_ports_are_not_webrtc_ice_hosts() {
+        assert!(!MediaConnectionInfo {
+            ip: "66.22.137.132".into(),
+            port: 322,
+        }
+        .is_webrtc_ice_host_port());
+        assert!(!MediaConnectionInfo {
+            ip: "66.22.137.132".into(),
+            port: 443,
+        }
+        .is_webrtc_ice_host_port());
+        assert!(MediaConnectionInfo {
+            ip: "66.22.137.132".into(),
+            port: 48010,
+        }
+        .is_webrtc_ice_host_port());
     }
 
     #[test]

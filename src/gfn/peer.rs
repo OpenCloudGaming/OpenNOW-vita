@@ -27,11 +27,14 @@ use rtc::peer_connection::transport::{
     RTCIceServer,
 };
 use rtc::rtp_transceiver::RTCRtpReceiverId;
-use rtc::rtp_transceiver::rtp_sender::{RTCPFeedback, RtpCodecKind, TYPE_RTCP_FB_NACK};
+use rtc::rtp_transceiver::rtp_sender::{
+    RTCPFeedback, RtpCodecKind, TYPE_RTCP_FB_GOOG_REMB, TYPE_RTCP_FB_NACK,
+};
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rtc::statistics::StatsSelector;
 use rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,14 +43,15 @@ use tokio::sync::mpsc;
 
 use crate::log_stream;
 
-const DEFAULT_STREAM_WIDTH: u32 = 1280;
-const DEFAULT_STREAM_HEIGHT: u32 = 720;
-
 const NATIVE_OUTPUT_WIDTH: u32 = 960;
 const NATIVE_OUTPUT_HEIGHT: u32 = 544;
+const DEFAULT_STREAM_WIDTH: u32 = NATIVE_OUTPUT_WIDTH;
+const DEFAULT_STREAM_HEIGHT: u32 = NATIVE_OUTPUT_HEIGHT;
 
 const PLI_MIN_INTERVAL: Duration = Duration::from_millis(250);
 const QUEUE_FULL_RECOVERY_THRESHOLD: f32 = 5.0;
+const VIDEO_STALL_PLI: Duration = Duration::from_secs(4);
+const VIDEO_STALL_FAIL: Duration = Duration::from_secs(8);
 
 
 /// The resolution NVIDIA actually streams at, per the session response.
@@ -132,6 +136,7 @@ impl PeerEngine {
                 .collect(),
             stream_width,
             stream_height,
+            media_host: session.media_connection_info.clone(),
         };
 
         let thread_events = event_tx.clone();
@@ -233,7 +238,6 @@ impl PeerEngine {
         self.keyframe_requests.load(Ordering::Relaxed)
     }
 
-    // reapplies local desc with the new bitrate baked in
     pub fn set_max_bitrate(&self, kbps: u32) {
         let _ = self.command_tx.send(PeerCommand::SetMaxBitrate(kbps));
     }
@@ -261,6 +265,17 @@ struct PeerSetup {
     ice_servers: Vec<RTCIceServer>,
     stream_width: u32,
     stream_height: u32,
+    media_host: Option<crate::gfn::cloudmatch::MediaConnectionInfo>,
+}
+
+fn remote_host_ice(ip: &str, port: u16, ufrag: &str) -> RTCIceCandidateInit {
+    RTCIceCandidateInit {
+        candidate: crate::gfn::sdp::host_ice_candidate(ip, port),
+        sdp_mid: Some("0".to_owned()),
+        sdp_mline_index: Some(0),
+        username_fragment: Some(ufrag.to_owned()),
+        ..Default::default()
+    }
 }
 
 /// Discover the local IP the OS routes toward the server - classic connected-UDP trick.
@@ -361,6 +376,13 @@ async fn run_peer(
         },
         RtpCodecKind::Video,
     );
+    media_engine.register_feedback(
+        RTCPFeedback {
+            typ: TYPE_RTCP_FB_GOOG_REMB.to_owned(),
+            parameter: "".to_owned(),
+        },
+        RtpCodecKind::Video,
+    );
     let registry = Registry::new()
         .with(
             NackGeneratorBuilder::new()
@@ -390,10 +412,43 @@ async fn run_peer(
         .build()
         .context("failed to build peer connection")?;
 
+    let remote_ufrag = crate::gfn::sdp::extract_ice_credentials(&sanitized_offer).ufrag;
     let offer = RTCSessionDescription::offer(sanitized_offer)
         .context("NVIDIA offer SDP was rejected by the SDP parser")?;
     pc.set_remote_description(offer)
         .context("failed to apply NVIDIA offer")?;
+    if let Some(media) = &setup.media_host {
+        if !media.is_webrtc_ice_host_port() {
+            log_stream!(
+                "mediaConnectionInfo ICE skipped: {}:{} is signaling/control, not RTP",
+                media.ip,
+                media.port
+            );
+        } else {
+            let ice_ip = crate::gfn::sdp::extract_public_ip(&media.ip)
+                .or_else(|| crate::gfn::sdp::extract_public_ip(&setup.server_ip));
+            match ice_ip {
+                Some(ip) => {
+                    log_stream!(
+                        "injecting mediaConnectionInfo ICE {ip}:{} (from {}, remote ufrag={remote_ufrag})",
+                        media.port,
+                        media.ip
+                    );
+                    if let Err(error) =
+                        pc.add_remote_candidate(remote_host_ice(&ip, media.port, &remote_ufrag))
+                    {
+                        log_stream!("mediaConnectionInfo ICE rejected: {error}");
+                    }
+                }
+                None => {
+                    log_stream!(
+                        "mediaConnectionInfo ICE skipped: {} is not a dotted IPv4 or Alliance host",
+                        media.ip
+                    );
+                }
+            }
+        }
+    }
 
     let input_channel_id = match pc.create_data_channel("input_channel_v1", None) {
         Ok(channel) => Some(channel.id()),
@@ -457,7 +512,7 @@ async fn run_peer(
     let answer = pc.create_answer(None).context("failed to create answer")?;
     pc.set_local_description(answer.clone())
         .context("failed to set local description")?;
-    let stream_settings = crate::gfn::cloudmatch::StreamSettings::for_vita();
+    let mut stream_settings = crate::gfn::cloudmatch::StreamSettings::for_vita();
     let munged_answer_sdp = crate::gfn::sdp::munge_answer_sdp(
         &answer.sdp,
         stream_settings.max_bitrate_mbps * 1000,
@@ -482,6 +537,11 @@ async fn run_peer(
         stream_settings.max_bitrate_mbps,
     );
     let our_ufrag = crate::gfn::sdp::extract_ice_credentials(&answer_sdp).ufrag;
+    log_stream!(
+        "answer SDP nack={} goog-remb={}",
+        saved_answer_sdp.contains("nack"),
+        saved_answer_sdp.contains("goog-remb")
+    );
     let _ = event_tx.send(PeerEvent::LocalAnswer {
         answer_sdp: saved_answer_sdp.clone(),
         nvst_sdp,
@@ -509,6 +569,10 @@ async fn run_peer(
     let mut rtc_nack_last: u64 = 0;
     let mut rtc_rtx_last: u64 = 0;
     let mut rtc_lost_last: i64 = 0;
+    let mut packets_received_last: u64 = 0;
+    let mut media_bytes_last: u64 = 0;
+    let mut video_stall_since: Option<Instant> = None;
+    let mut video_stall_pli_sent = false;
     let mut in_stun: u64 = 0;
     let mut in_dtls: u64 = 0;
     let mut in_media: u64 = 0;
@@ -860,16 +924,41 @@ async fn run_peer(
                     .map(|s| s.received_rtp_stream_stats.packets_lost)
                     .unwrap_or(0);
                 let rtc_pli_stat = inbound.map(|s| u64::from(s.pli_count)).unwrap_or(0);
+                let packets_received = inbound
+                    .map(|s| s.received_rtp_stream_stats.packets_received)
+                    .unwrap_or(0);
                 let nack_rate = rate(rtc_nack, rtc_nack_last);
                 let rtx_rate = rate(rtc_rtx, rtc_rtx_last);
                 let lost_delta = rtc_lost.saturating_sub(rtc_lost_last);
+                let recv_delta = packets_received.saturating_sub(packets_received_last);
                 let rescue_rate = rate(reorder_rescued_total, reorder_rescued_last);
                 let expire_rate = rate(reorder_expired_total, reorder_expired_last);
                 rtc_nack_last = rtc_nack;
                 rtc_rtx_last = rtc_rtx;
                 rtc_lost_last = rtc_lost;
+                packets_received_last = packets_received;
                 reorder_rescued_last = reorder_rescued_total;
                 reorder_expired_last = reorder_expired_total;
+
+                let bytes_now = media_bytes.load(Ordering::Relaxed);
+                let kbps = (bytes_now.saturating_sub(media_bytes_last) as f32) * 8.0
+                    / elapsed
+                    / 1000.0;
+                media_bytes_last = bytes_now;
+                let lost_for_pct = lost_delta.max(0) as f32;
+                let loss_pct = if recv_delta + lost_delta.max(0) as u64 > 0 {
+                    lost_for_pct * 100.0 / (recv_delta as f32 + lost_for_pct)
+                } else {
+                    0.0
+                };
+                let rtt_ms = report
+                    .candidate_pairs()
+                    .filter(|pair| pair.nominated && pair.current_round_trip_time > 0.0)
+                    .map(|pair| pair.current_round_trip_time * 1000.0)
+                    .next();
+                let rtt_label = rtt_ms
+                    .map(|ms| format!("{ms:.0}"))
+                    .unwrap_or_else(|| "-".to_owned());
 
                 if qfull >= QUEUE_FULL_RECOVERY_THRESHOLD {
                     send_pli_if_needed(
@@ -886,12 +975,12 @@ async fn run_peer(
                 if lost_delta > 5 && nack_rate < 0.5 && drop_rate > 0.0 {
                     log_stream!(
                         "NACK suspicion: lost_delta={lost_delta} nack/s={nack_rate:.1} rtx/s={rtx_rate:.1} drop/s={drop_rate:.1} — \
-                         if this persists, the interceptor may not be delivering NACKs (custom rtc patch)"
+                         interceptor may not be delivering NACKs (rtc 0.20); more PLI would poison BWE"
                     );
                 }
 
                 let line = format!(
-                    "fps:{fps:.0} src:{src_rate:.0} sub:{sub:.0} qf:{qfull:.0} dec:{avg_decode_ms:.1}ms wait:{avg_wait_ms:.1}ms jit:{jitter_ms:.1}ms nof:{noframe:.0} err:{errs:.0} reb:{rebuilds} stall:{stalls:.0} rtp:{rtp_rate:.0} drop:{drop_rate:.0} pli:{pli_sent_count}/{rtc_pli_stat} nack:{rtc_nack}({nack_rate:.0}/s) rtx:{rtc_rtx}({rtx_rate:.0}/s) lost:{rtc_lost}(+{lost_delta}) rescue:{rescue_rate:.0}/s expire:{expire_rate:.0}/s wfk:{} in:{} pr:{}",
+                    "fps:{fps:.0} kbps:{kbps:.0} loss:{loss_pct:.1}% rtt:{rtt_label} src:{src_rate:.0} sub:{sub:.0} qf:{qfull:.0} dec:{avg_decode_ms:.1}ms wait:{avg_wait_ms:.1}ms jit:{jitter_ms:.1}ms nof:{noframe:.0} err:{errs:.0} reb:{rebuilds} stall:{stalls:.0} rtp:{rtp_rate:.0} drop:{drop_rate:.0} pli:{pli_sent_count}/{rtc_pli_stat} nack:{rtc_nack}({nack_rate:.0}/s) rtx:{rtc_rtx}({rtx_rate:.0}/s) lost:{rtc_lost}(+{lost_delta}) rescue:{rescue_rate:.0}/s expire:{expire_rate:.0}/s wfk:{} in:{} pr:{}",
                     u8::from(video_rtp.waiting_for_keyframe()),
                     u8::from(input_ready),
                     u8::from(partial_input_ready)
@@ -907,27 +996,32 @@ async fn run_peer(
                     let _ = event_tx.send(PeerEvent::Status(idle));
                 }
 
-                if fps == 0.0 {
-                    if is_connected.load(Ordering::Relaxed)
-                        && let (Some(receiver_id), Some(ssrc)) = (video_receiver_id, video_ssrc)
-                    {
-                        let now = Instant::now();
-                        let should_send = last_pli_sent
-                            .map(|last| now.duration_since(last) >= PLI_MIN_INTERVAL)
-                            .unwrap_or(true);
-                        if should_send
-                            && let Some(mut receiver) = pc.rtp_receiver(receiver_id)
-                            && receiver
-                                .write_rtcp(vec![Box::new(PictureLossIndication {
-                                    sender_ssrc: 0,
-                                    media_ssrc: ssrc,
-                                })])
-                                .is_ok()
-                        {
-                            last_pli_sent = Some(now);
-                            pli_sent_count += 1;
-                            keyframe_requests.fetch_add(1, Ordering::Relaxed);
-                        }
+                if fps > 0.0 {
+                    video_stall_since = None;
+                    video_stall_pli_sent = false;
+                } else if is_connected.load(Ordering::Relaxed) {
+                    let stalled_for = Instant::now().duration_since(
+                        *video_stall_since.get_or_insert_with(Instant::now),
+                    );
+                    if stalled_for >= VIDEO_STALL_FAIL {
+                        let message = "video stall: no decoded frames for 8s".to_owned();
+                        log_stream!("{message}");
+                        let _ = event_tx.send(PeerEvent::Disconnected(message));
+                        let _ = pc.close();
+                        return Ok(());
+                    }
+                    if stalled_for >= VIDEO_STALL_PLI && !video_stall_pli_sent {
+                        log_stream!("video stall watchdog: PLI after 4s with no frames");
+                        send_pli_if_needed(
+                            &mut pc,
+                            &mut last_pli_sent,
+                            &mut pli_sent_count,
+                            true,
+                            false,
+                            video_receiver_id,
+                            video_ssrc,
+                        );
+                        video_stall_pli_sent = true;
                     }
                 }
                 frames_decoded_last = frames;
@@ -1023,6 +1117,9 @@ async fn run_peer(
         for command in pending_commands.drain(..) {
             match command {
                 PeerCommand::RemoteIce(candidate) => {
+                    if crate::gfn::signaling::is_tcp_candidate(&candidate.candidate) {
+                        continue;
+                    }
                     let init = RTCIceCandidateInit {
                         candidate: candidate.candidate,
                         sdp_mid: candidate.sdp_mid,
@@ -1040,7 +1137,32 @@ async fn run_peer(
                 PeerCommand::Mouse(event) => mouse_events.push(event),
                 PeerCommand::Key { key, pressed } => key_events.push((key, pressed)),
                 PeerCommand::SetMaxBitrate(kbps) => {
-                    saved_answer_sdp = crate::gfn::sdp::replace_video_bitrate_in_sdp(&saved_answer_sdp, kbps);
+                    let kbps = kbps.max(1000);
+                    saved_answer_sdp =
+                        crate::gfn::sdp::replace_video_bitrate_in_sdp(&saved_answer_sdp, kbps);
+                    stream_settings.max_bitrate_mbps = (kbps / 1000).max(1);
+                    let nvst_sdp = crate::gfn::sdp::build_nvst_sdp_from_answer(
+                        &answer_sdp,
+                        &stream_settings,
+                        &ri_caps,
+                    );
+                    log_stream!("re-sending NVST bitrate ceiling {kbps} kbps");
+                    let _ = event_tx.send(PeerEvent::LocalAnswer {
+                        answer_sdp: saved_answer_sdp.clone(),
+                        nvst_sdp,
+                    });
+                    if let (Some(receiver_id), Some(ssrc)) = (video_receiver_id, video_ssrc)
+                        && let Some(mut receiver) = pc.rtp_receiver(receiver_id)
+                    {
+                        let remb = ReceiverEstimatedMaximumBitrate {
+                            sender_ssrc: 0,
+                            bitrate: kbps as f32 * 1000.0,
+                            ssrcs: vec![ssrc],
+                        };
+                        if receiver.write_rtcp(vec![Box::new(remb)]).is_ok() {
+                            log_stream!("sent REMB {kbps} kbps");
+                        }
+                    }
                 }
                 PeerCommand::Close => {
                     let _ = pc.close();

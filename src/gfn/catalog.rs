@@ -410,12 +410,8 @@ pub async fn resolve_vpc_id(client: &Client, token: &str, cache: &VpcIdCache) ->
     if let Some(cached) = cache.get() {
         return Ok(cached.clone());
     }
-    let base_url = crate::gfn::auth::load_tokens()
-        .and_then(|t| t.provider)
-        .map(|p| p.normalized_streaming_url())
-        .unwrap_or_else(|| CLOUDMATCH_BASE_URL.to_owned());
 
-    match fetch_vpc_id_with_base_url(client, token, &base_url).await {
+    match fetch_vpc_id_with_base_url(client, token, CLOUDMATCH_BASE_URL).await {
         Ok(vpc_id) => {
             let _ = cache.set(vpc_id.clone());
             Ok(vpc_id)

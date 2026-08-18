@@ -36,6 +36,8 @@ pub struct AppSettings {
     pub game_profiles: std::collections::BTreeMap<String, GameProfile>,
     #[serde(default)]
     pub trigger_swap_enabled: bool,
+    #[serde(default)]
+    pub ui_locale: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -138,6 +140,7 @@ impl Default for AppSettings {
             color_depth: ColorDepth::default().key().to_owned(),
             game_profiles: std::collections::BTreeMap::new(),
             trigger_swap_enabled: false,
+            ui_locale: String::new(),
         }
     }
 }
@@ -278,6 +281,10 @@ impl ColorDepth {
             "16" => Self::SixteenBit,
             _ => Self::ThirtyTwoBit,
         }
+    }
+
+    pub fn stream_bit_depth(self) -> u32 {
+        8
     }
 }
 
@@ -692,4 +699,40 @@ pub fn trigger_swap_enabled() -> bool {
 
 pub fn set_trigger_swap_enabled(enabled: bool) {
     update_settings(|s| s.trigger_swap_enabled = enabled);
+}
+
+pub fn ui_locale() -> crate::locale::Locale {
+    crate::locale::Locale::from_str(&load_or_init_settings().ui_locale)
+}
+
+pub fn set_ui_locale(locale: crate::locale::Locale) {
+    update_settings(|s| s.ui_locale = locale.as_str().to_owned());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppSettings;
+
+    #[test]
+    fn settings_json_without_ui_locale_still_loads() {
+        let json = r#"{
+            "fps": 60,
+            "trigger_intensity": 255,
+            "audio_boost_percent": 1200,
+            "controls_hint_seen": false,
+            "stick_zones": "hidden"
+        }"#;
+        let settings: AppSettings = serde_json::from_str(json).expect("0.3.1 settings should load");
+        assert!(settings.ui_locale.is_empty());
+        assert_eq!(
+            crate::locale::Locale::from_str(&settings.ui_locale),
+            crate::locale::Locale::EnUs
+        );
+    }
+
+    #[test]
+    fn color_depth_stream_bit_depth_is_h264_8bit() {
+        assert_eq!(super::ColorDepth::SixteenBit.stream_bit_depth(), 8);
+        assert_eq!(super::ColorDepth::ThirtyTwoBit.stream_bit_depth(), 8);
+    }
 }

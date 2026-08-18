@@ -5,6 +5,27 @@ All notable changes to OpenNOW Vita are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Streaming protocol aligned with OpenNOW desktop: CloudMatch `mediaConnectionInfo` is injected as a remote host ICE candidate, inbound TCP ICE is dropped, and signaling `peerRole` is 1. Keys and mouse stay on the reliable input channel; gamepad does too (the partial-reliable 0x26 path left Vita buttons dead — GFN was not consuming it). Decode fallback is 960x544. A video-stall watchdog sends PLI at 4s and fails the session at 8s. Overlay reports kbps, loss, and RTT. NVST advertises 8-bit depth; CloudMatch `bitDepth` stays `0` (8-bit SDR — NVIDIA's enum, not the bit count). Mid-session bitrate changes send REMB and a fresh NVST blob instead of rewriting a local SDP string. Answer SDP advertises nack/REMB so the rtc interceptor can request retransmits.
+
+### Fixed
+
+- Session create no longer sends CloudMatch `requestedStreamingFeatures.bitDepth: 8`. That value is invalid (`0` = 8-bit SDR, `10` = 10-bit HDR) and NVIDIA answers HTTP 400 with a stub session body.
+- Gamepad is sent on `input_channel_v1` again. Routing it exclusively through `input_channel_partially_reliable` (OpenNOW desktop 0x26 packets) made Vita face buttons and sticks a no-op.
+- CloudMatch `mediaConnectionInfo` hostnames like `66-22-133-156.cloudmatchbeta.nvidiagrid.net` are decoded to IPv4 before ICE inject. Passing the hostname made `rtc` reject the candidate (`failed to parse address`). Signaling ports (322/443, usage 14) are not injected: that candidate panicked tokio (`EINVAL`) and froze ICE at checking.
+
+- Catalog GraphQL now resolves `vpcId` from NVIDIA CloudMatch again
+  (`prod.cloudmatchbeta.nvidiagrid.net`), not the login provider's streaming URL.
+  A partner or regional `serverId` still succeeds against `games.geforce.com` but
+  returns a degenerate library of about four to seven titles — the same list on
+  every account. Session create still uses the provider URL.
+- UI language is written to `settings.json` and restored on launch. Changing it
+  in the App tab previously only lasted until the process exited, so every
+  relaunch was English.
+
 ## [0.3.1] - 2026-08-02
 
 Error handling pass on top of 0.3.0: launch failures now speak GeForce NOW's
