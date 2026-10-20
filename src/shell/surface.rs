@@ -55,6 +55,7 @@ impl VitaSurface {
         let mut canvas = window
             .into_canvas()
             .accelerated()
+            .present_vsync()
             .build()
             .map_err(anyhow::Error::msg)
             .context("failed to create SDL Vita renderer")?;
@@ -74,6 +75,11 @@ impl VitaSurface {
             egui_painter: SdlEguiPainter::default(),
             force_iyuv: false,
         })
+    }
+
+    /// Whether SDL is already pacing presentation to the display refresh.
+    pub fn uses_vsync(&self) -> bool {
+        self.canvas.info().flags & sdl2::sys::SDL_RendererFlags::SDL_RENDERER_PRESENTVSYNC as u32 != 0
     }
 
     /// Where the video quad lands on screen - accounts for letterboxing, see `fit_rect`.

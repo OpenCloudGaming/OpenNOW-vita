@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 /// Maximum simultaneous cover downloads.
-const MAX_CONCURRENT_COVER_DOWNLOADS: usize = 8;
+const MAX_CONCURRENT_COVER_DOWNLOADS: usize = 2;
+const MAX_CACHED_BACKDROPS: usize = 2;
+const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// How many decoded covers stay resident. At the 256px decode cap a cover is roughly 200 KB, so
 /// this budget is a few MB - cheap next to re-downloading one over the Vita's wifi.
@@ -147,6 +149,7 @@ pub struct CoverStore {
     /// Row thumbnails, cached separately from `inner` because they are decoded at a fraction of
     /// the size - see [`CoverSize`].
     icons: Arc<Mutex<CoverCache>>,
+    backdrops: Arc<Mutex<CoverCache>>,
     download_permits: Arc<Semaphore>,
 }
 
@@ -157,13 +160,14 @@ pub enum CoverSize {
     Cover,
     /// List-row thumbnail.
     Icon,
+    Backdrop,
 }
 
 impl CoverSize {
     /// Longest-edge cap applied at decode time.
     fn max_dimension(self) -> u32 {
         match self {
-            Self::Cover => 256,
+            Self::Cover | Self::Backdrop => 256,
             Self::Icon => 64,
         }
     }
@@ -173,6 +177,7 @@ impl CoverSize {
         match self {
             Self::Cover => MAX_CACHED_COVERS,
             Self::Icon => MAX_CACHED_ICONS,
+            Self::Backdrop => MAX_CACHED_BACKDROPS,
         }
     }
 
@@ -181,6 +186,7 @@ impl CoverSize {
         match self {
             Self::Cover => format!("gfn_cover_{app_id}"),
             Self::Icon => format!("gfn_icon_{app_id}"),
+            Self::Backdrop => format!("gfn_backdrop_{app_id}"),
         }
     }
 }
@@ -196,6 +202,7 @@ impl CoverStore {
         Self {
             inner: Arc::new(Mutex::new(CoverCache::default())),
             icons: Arc::new(Mutex::new(CoverCache::default())),
+            backdrops: Arc::new(Mutex::new(CoverCache::default())),
             download_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_COVER_DOWNLOADS)),
         }
     }
@@ -204,6 +211,7 @@ impl CoverStore {
         match size {
             CoverSize::Cover => &self.inner,
             CoverSize::Icon => &self.icons,
+            CoverSize::Backdrop => &self.backdrops,
         }
     }
 
@@ -222,6 +230,14 @@ impl CoverStore {
         url: String,
     ) {
         self.request_sized(http_client, ctx, app_id, url, CoverSize::Icon);
+    }
+
+    pub fn request_backdrop(&self, client: &Client, ctx: &egui::Context, key: String, url: String) {
+        self.request_sized(client, ctx, key, url, CoverSize::Backdrop);
+    }
+
+    pub fn get_backdrop(&self, key: &str) -> Option<CoverSnapshot> {
+        self.get_sized(key, CoverSize::Backdrop)
     }
 
     fn request_sized(
@@ -295,6 +311,7 @@ impl CoverStore {
             CoverSize::Icon.cache_capacity()
         };
         Self::prune_cache(&self.icons, keep, icon_budget);
+        Self::prune_cache(&self.backdrops, None, max_ready.min(MAX_CACHED_BACKDROPS));
     }
 
     fn prune_cache(cache: &Mutex<CoverCache>, keep: Option<&str>, max_ready: usize) {
@@ -361,7 +378,12 @@ async fn fetch_and_decode(
     if let Some(path) = disk_cache_path(app_id) {
         let cached = tokio::task::spawn_blocking({
             let path = path.clone();
-            move || std::fs::read(&path).ok()
+            move || {
+                if std::fs::metadata(&path).ok()?.len() > MAX_IMAGE_BYTES as u64 {
+                    return None;
+                }
+                std::fs::read(&path).ok()
+            }
         })
         .await
         .unwrap_or(None);
@@ -377,16 +399,18 @@ async fn fetch_and_decode(
         }
     }
 
-    let bytes = client
+    let mut response = client
         .get(url)
         .send()
         .await
         .context("cover request failed")?
         .error_for_status()
-        .context("cover request returned an error status")?
-        .bytes()
-        .await
-        .context("failed to read cover response body")?;
+        .context("cover request returned an error status")?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("failed to read cover response body")? {
+        anyhow::ensure!(chunk.len() <= MAX_IMAGE_BYTES.saturating_sub(bytes.len()), "cover exceeds 2 MiB receive budget");
+        bytes.extend_from_slice(&chunk);
+    }
 
     // The encoded original is stored rather than the decoded RGBA: it is an order of magnitude
     // smaller on the memory card, and both decode sizes for a title share the one file, so a
@@ -421,8 +445,16 @@ fn disk_cache_path(app_id: &str) -> Option<std::path::PathBuf> {
 
 /// Decodes JPEG/PNG bytes to RGBA.
 fn decode_rgba(bytes: &[u8], max_dim: u32) -> Result<TitleImage> {
-    let image = image::load_from_memory(bytes).context("failed to decode cover image")?;
-    let rgba = image.to_rgba8();
+    anyhow::ensure!(bytes.len() <= MAX_IMAGE_BYTES, "cached cover exceeds 2 MiB budget");
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format().context("unknown cover image format")?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(1024);
+    limits.max_image_height = Some(1024);
+    limits.max_alloc = Some(8 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().context("failed to decode cover image within memory budget")?;
+    let rgba = image.into_rgba8();
     let (width, height) = rgba.dimensions();
     let scale = (max_dim as f32 / width.max(height) as f32).min(1.0);
     let target_w = ((width as f32 * scale).round() as u32).max(1);
@@ -437,4 +469,35 @@ fn decode_rgba(bytes: &[u8], max_dim: u32) -> Result<TitleImage> {
         image::imageops::FilterType::Triangle,
     );
     Ok(TitleImage::new(resized.into_raw(), target_w, target_h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_decode_respects_vita_memory_limits() {
+        fn png(width: u32, height: u32) -> Vec<u8> {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(width, height)
+                .write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+            bytes.into_inner()
+        }
+        let image = decode_rgba(&png(1024, 512), CoverSize::Backdrop.max_dimension()).unwrap();
+        assert_eq!((image.width, image.height, image.rgba.len()), (256, 128, 256 * 128 * 4));
+        assert!(decode_rgba(&png(1025, 1), 256).is_err());
+        assert!(decode_rgba(&vec![0; MAX_IMAGE_BYTES + 1], 256).is_err());
+    }
+
+    #[test]
+    fn only_two_backgrounds_remain_resident() {
+        let mut cache = CoverCache::default();
+        for id in ["first", "second", "third"] {
+            cache.insert(id.into(), CoverState::Ready(Arc::new(TitleImage::new(vec![0; 16], 2, 2))));
+            cache.evict_to(Some(id), CoverSize::Backdrop.cache_capacity());
+        }
+        assert_eq!(cache.ready_count, 2);
+        assert!(cache.get("first").is_none());
+        assert!(matches!(cache.get("third"), Some(CoverState::Ready(_))));
+    }
 }

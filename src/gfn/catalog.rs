@@ -23,6 +23,7 @@ pub struct GameSummary {
     pub title: String,
     /// Best-effort poster-style cover URL (portrait box art).
     pub cover_url: Option<String>,
+    pub backdrop_url: Option<String>,
     /// Storefront the launchable variant belongs to (`"STEAM"`, `"EPIC"`, `"EA_APP"`, ...),
     /// straight from GFN's `variant.appStore` - mirrors OpenNOW's `appToVariants` (`games.ts`).
     pub store: Option<String>,
@@ -50,7 +51,15 @@ struct ServerInfoRequestStatus {
 /// The "VPC id" CloudMatch expects on catalog/session calls - not documented anywhere beyond
 /// `requestStatus.serverId` showing up in `serverInfo` responses (see protocol notes §2).
 pub async fn fetch_vpc_id(client: &Client, token: &str) -> Result<String> {
-    fetch_vpc_id_with_base_url(client, token, CLOUDMATCH_BASE_URL).await
+    let provider_url = super::auth::load_tokens()
+        .and_then(|tokens| tokens.provider)
+        .map(|provider| provider.normalized_streaming_url());
+    fetch_vpc_id_with_base_url(
+        client,
+        token,
+        provider_url.as_deref().unwrap_or(CLOUDMATCH_BASE_URL),
+    )
+    .await
 }
 
 pub async fn fetch_vpc_id_with_base_url(client: &Client, token: &str, base_url: &str) -> Result<String> {
@@ -156,6 +165,8 @@ impl CatalogAppVariant {
 
 #[derive(Debug, Deserialize, Default)]
 struct CatalogAppImages {
+    #[serde(default, rename = "HERO_IMAGE")]
+    hero_image: ImageField,
     /// Box art (portrait poster) - preferred for grid covers.
     #[serde(default, rename = "GAME_BOX_ART")]
     game_box_art: ImageField,
@@ -216,7 +227,7 @@ const CATALOG_PAGE_FIELDS: &str = r#"
       id
       title
       variants { id appStore gfn { library { lastPlayedDate } } }
-      images { GAME_BOX_ART KEY_IMAGE KEY_ART }
+      images { GAME_BOX_ART KEY_IMAGE KEY_ART HERO_IMAGE }
     }
     pageInfo { hasNextPage endCursor totalCount }
 "#;
@@ -390,6 +401,8 @@ fn to_game_summary(item: CatalogAppItem) -> GameSummary {
         .map(str::to_owned);
 
     GameSummary {
+        backdrop_url: item.images.as_ref().and_then(|images| images.hero_image.first()
+            .or_else(|| images.key_art.first()).map(optimize_image)),
         cover_url: item.images.as_ref().and_then(|images| images.poster_url()),
         app_id: numeric_app_id,
         search_key: item.title.to_lowercase(),
@@ -411,7 +424,7 @@ pub async fn resolve_vpc_id(client: &Client, token: &str, cache: &VpcIdCache) ->
         return Ok(cached.clone());
     }
 
-    match fetch_vpc_id_with_base_url(client, token, CLOUDMATCH_BASE_URL).await {
+    match fetch_vpc_id(client, token).await {
         Ok(vpc_id) => {
             let _ = cache.set(vpc_id.clone());
             Ok(vpc_id)
@@ -463,4 +476,23 @@ pub async fn fetch_catalog_page_for_account(
 ) -> Result<CatalogPage> {
     let vpc_id = resolve_vpc_id(client, token, cache).await?;
     fetch_catalog_page(client, token, &vpc_id, query, cursor, owned_only).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panorama_uses_hero_then_key_art_without_changing_the_poster() {
+        for (images, expected) in [
+            (json!({"HERO_IMAGE":["hero"],"KEY_ART":"wide","GAME_BOX_ART":"poster"}), Some("hero")),
+            (json!({"KEY_ART":"wide","GAME_BOX_ART":"poster"}), Some("wide")),
+            (json!({"GAME_BOX_ART":"poster"}), None),
+        ] {
+            let item = serde_json::from_value(json!({"id":"123","title":"Game","images":images})).unwrap();
+            let game = to_game_summary(item);
+            assert_eq!(game.backdrop_url.as_deref(), expected);
+            assert_eq!(game.cover_url.as_deref(), Some("poster"));
+        }
+    }
 }

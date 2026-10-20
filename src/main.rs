@@ -39,6 +39,9 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "vita")]
     streaming::video::reserve_decoder_cdram();
     let runtime = tokio::runtime::Builder::new_current_thread()
+        // Rendering yields once per VSync. Poll network/timers on every scheduling
+        // turn instead of making I/O wait through dozens of display frames.
+        .event_interval(1)
         .enable_all()
         .build()?;
 

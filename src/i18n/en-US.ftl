@@ -343,3 +343,9 @@ status-battery-low = Battery low ({ $percent }%) - the session will stop before 
 status-battery-critical = Battery critical - session stopped so it could be released cleanly.
 status-session-suspended = Session stopped because the console went to sleep.
 status-bitrate-lowered = Connection struggling - lowered the ceiling to { $mbps } Mbps.
+
+catalog-empty-owned-title = No games to show in My Games
+
+catalog-empty-owned-sync = If you own games on Steam, Epic Games or other stores, account linking or syncing may be missing. On your phone or computer, check your connected accounts and sync your library on the GeForce NOW website.
+
+catalog-empty-owned-browse = Browse all games

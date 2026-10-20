@@ -240,10 +240,15 @@ fn paint_stream_icon(painter: &egui::Painter, rect: egui::Rect, icon: StreamIcon
         StreamIcon::Power => {
             let c = rect.center();
             let r = rect.width().min(rect.height()) * 0.40_f32;
-            painter.circle_stroke(c, r, egui::Stroke::new(1.5_f32, tint));
+            let arc = (0..=24).map(|step| {
+                let angle = -std::f32::consts::FRAC_PI_2 + 0.55
+                    + step as f32 / 24.0 * (std::f32::consts::TAU - 1.1);
+                c + egui::vec2(angle.cos(), angle.sin()) * r
+            }).collect();
+            painter.line(arc, egui::Stroke::new(1.5_f32, tint));
             painter.line_segment(
                 [egui::pos2(c.x, c.y - r * 1.15_f32), egui::pos2(c.x, c.y - r * 0.15_f32)],
-                egui::Stroke::new(2.0_f32, tint),
+                egui::Stroke::new(1.5_f32, tint),
             );
         }
         StreamIcon::Mouse => {
@@ -309,13 +314,13 @@ fn paint_stream_icon(painter: &egui::Painter, rect: egui::Rect, icon: StreamIcon
             let center = rect.center();
             let radius = rect.width().min(rect.height()) * 0.42;
             painter.circle_stroke(center, radius, stroke);
-            let meridian: Vec<egui::Pos2> = (0..=8)
+            let meridian: Vec<egui::Pos2> = (0..16)
                 .map(|step| {
-                    let t = step as f32 / 8.0 * std::f32::consts::PI - std::f32::consts::FRAC_PI_2;
+                    let t = step as f32 / 16.0 * std::f32::consts::TAU;
                     egui::pos2(center.x + radius * 0.42 * t.sin(), center.y - radius * t.cos())
                 })
                 .collect();
-            painter.line(meridian, stroke);
+            painter.add(egui::Shape::closed_line(meridian, stroke));
             painter.line_segment(
                 [egui::pos2(center.x - radius, center.y), egui::pos2(center.x + radius, center.y)],
                 stroke,
@@ -349,9 +354,9 @@ fn paint_stream_icon(painter: &egui::Painter, rect: egui::Rect, icon: StreamIcon
             let head_r = rect.height() * 0.16;
             let head_c = egui::pos2(center.x, rect.min.y + rect.height() * 0.32);
             painter.circle_stroke(head_c, head_r, stroke);
-            let shoulders = egui::Rect::from_center_size(
-                egui::pos2(center.x, rect.max.y - rect.height() * 0.10),
-                egui::vec2(rect.width() * 0.62, rect.height() * 0.38),
+            let shoulders = egui::Rect::from_min_max(
+                rect.min + rect.size() * egui::vec2(0.19, 0.60),
+                rect.min + rect.size() * egui::vec2(0.81, 0.90),
             );
             painter.rect_stroke(
                 shoulders,
@@ -409,34 +414,41 @@ fn paint_stream_icon(painter: &egui::Painter, rect: egui::Rect, icon: StreamIcon
 /// A heart, drawn rather than typed: the bundled font has no heart glyph, exactly as it had no
 /// multiplication-X, and a tofu box is worse than no icon at all.
 fn paint_heart(painter: &egui::Painter, rect: egui::Rect, filled: bool, color: egui::Color32) {
-    let center = rect.center();
-    let width = rect.width();
-    let height = rect.height();
-    // Two lobes and a point. Coarse, but at 12 px anything finer is indistinguishable.
-    let lobe_radius = width * 0.26;
-    let left_lobe = egui::pos2(center.x - lobe_radius, center.y - height * 0.12);
-    let right_lobe = egui::pos2(center.x + lobe_radius, center.y - height * 0.12);
-    let tip = egui::pos2(center.x, center.y + height * 0.38);
-
-    if filled {
-        painter.circle_filled(left_lobe, lobe_radius, color);
-        painter.circle_filled(right_lobe, lobe_radius, color);
-        painter.add(egui::Shape::convex_polygon(
-            vec![
-                egui::pos2(left_lobe.x - lobe_radius, left_lobe.y),
-                egui::pos2(right_lobe.x + lobe_radius, right_lobe.y),
-                tip,
-            ],
-            color,
-            egui::Stroke::NONE,
-        ));
-    } else {
-        let stroke = egui::Stroke::new(1.2_f32, color);
-        painter.circle_stroke(left_lobe, lobe_radius, stroke);
-        painter.circle_stroke(right_lobe, lobe_radius, stroke);
-        painter.line_segment([egui::pos2(left_lobe.x - lobe_radius, left_lobe.y), tip], stroke);
-        painter.line_segment([egui::pos2(right_lobe.x + lobe_radius, right_lobe.y), tip], stroke);
+    // One continuous contour: complete circles leave crossed lines inside an outline.
+    const CURVES: [[(f32, f32); 4]; 4] = [
+        [(0.50, 0.90), (0.42, 0.82), (0.08, 0.58), (0.08, 0.32)],
+        [(0.08, 0.32), (0.08, 0.09), (0.36, 0.04), (0.50, 0.24)],
+        [(0.50, 0.24), (0.64, 0.04), (0.92, 0.09), (0.92, 0.32)],
+        [(0.92, 0.32), (0.92, 0.58), (0.58, 0.82), (0.50, 0.90)],
+    ];
+    let mut points = Vec::with_capacity(32);
+    for curve in CURVES {
+        for step in 0..8 {
+            let t = step as f32 / 8.0;
+            let u = 1.0 - t;
+            let weights = [u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t];
+            let mut point = egui::Vec2::ZERO;
+            for ((x, y), weight) in curve.into_iter().zip(weights) {
+                point += egui::vec2(x, y) * weight;
+            }
+            points.push(rect.min + rect.size() * point);
+        }
     }
+    if filled {
+        // A heart is concave at its notch, so convex_polygon would fill across it.
+        let mut mesh = egui::Mesh::default();
+        mesh.colored_vertex(rect.center(), color);
+        for &point in &points {
+            mesh.colored_vertex(point, color);
+        }
+        for index in 0..points.len() as u32 {
+            mesh.add_triangle(0, index + 1, (index + 1) % points.len() as u32 + 1);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+    painter.add(egui::Shape::closed_line(points, egui::Stroke::new(
+        if filled { 0.8 } else { 1.2 }, color,
+    )));
 }
 
 /// A streaming-overlay button: a painted glyph in a round-cornered square.
@@ -1153,6 +1165,7 @@ fn loading_catalog_screen(ctx: &egui::Context, i18n: &I18n, user: &GfnUser) {
 /// cover art and a PLAY button on the right.
 fn catalog_screen(ctx: &egui::Context, i18n: &I18n, view: &CatalogView<'_>) -> Vec<AppCommand> {
     let mut commands = Vec::new();
+    draw_catalog_backdrop(ctx, view);
 
     egui::TopBottomPanel::top("catalog_header")
         .frame(
@@ -1273,7 +1286,7 @@ fn catalog_screen(ctx: &egui::Context, i18n: &I18n, view: &CatalogView<'_>) -> V
         .resizable(false)
         .frame(
             egui::Frame::NONE
-                .fill(BG_DEEP)
+                .fill(BG_DEEP.gamma_multiply(0.85))
                 .inner_margin(egui::Margin::symmetric(8, 8)),
         )
         .show(ctx, |ui| {
@@ -1283,7 +1296,7 @@ fn catalog_screen(ctx: &egui::Context, i18n: &I18n, view: &CatalogView<'_>) -> V
     egui::CentralPanel::default()
         .frame(
             egui::Frame::NONE
-                .fill(BG_DEEP)
+                .fill(egui::Color32::TRANSPARENT)
                 .inner_margin(egui::Margin::symmetric(12, 10)),
         )
         .show(ctx, |ui| {
@@ -1377,20 +1390,29 @@ fn settings_modal(
     if gear.clicked() {
         commands.push(AppCommand::OpenSettings);
     }
+    let opacity = ui.ctx().animate_bool_with_time_and_easing(
+        egui::Id::new("settings_enter"),
+        settings.open,
+        if settings.open { ui.style().animation_time.min(0.16) } else { 0.0 },
+        egui::emath::easing::quadratic_out,
+    );
     if !settings.open {
         return commands;
     }
 
     let modal = egui::Modal::new(egui::Id::new("settings_modal"))
-        .backdrop_color(egui::Color32::from_black_alpha(180))
+        .area(egui::Modal::default_area(egui::Id::new("settings_modal"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 6.0 * (1.0 - opacity))))
+        .backdrop_color(egui::Color32::from_black_alpha((180.0 * opacity) as u8))
         .frame(
             egui::Frame::default()
-                .fill(BG_PANEL)
-                .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                .fill(BG_PANEL.gamma_multiply(opacity))
+                .stroke(egui::Stroke::new(1.0_f32, BORDER.gamma_multiply(opacity)))
                 .corner_radius(10.0)
                 .inner_margin(egui::Margin::symmetric(14, 12)),
         )
         .show(ui.ctx(), |ui| {
+            ui.multiply_opacity(opacity);
             let mut close_requested = false;
             ui.set_width(SETTINGS_MODAL_W);
             ui.set_min_height(SETTINGS_MODAL_H);
@@ -2612,7 +2634,9 @@ fn title_list(ui: &mut egui::Ui, i18n: &I18n, view: &CatalogView<'_>) -> Vec<App
         ui.add_space(20.0);
         ui.label(
             egui::RichText::new(
-                if view.games.is_empty() {
+                if empty_owned_library(view) {
+                    i18n.text("catalog-empty-owned-title")
+                } else if view.games.is_empty() {
                     i18n.text("catalog-no-games-api")
                 } else {
                     i18n.text("catalog-no-match")
@@ -2796,6 +2820,11 @@ fn title_list(ui: &mut egui::Ui, i18n: &I18n, view: &CatalogView<'_>) -> Vec<App
 
 /// Right-hand detail panel: big cover, title, metadata and the PLAY button for whichever game the
 /// list has highlighted.
+fn empty_owned_library(view: &CatalogView<'_>) -> bool {
+    view.filter == CatalogFilter::MyGames && view.games.is_empty()
+        && view.search_query.trim().is_empty() && !view.loading_more
+}
+
 fn detail_panel(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
@@ -2806,6 +2835,25 @@ fn detail_panel(
 
     let Some(game) = selected_game(view.games, view.filtered_indices, view.selected) else {
         ui.add_space(40.0);
+        if empty_owned_library(view) {
+            ui.set_max_width(390.0);
+            ui.heading(i18n.text("catalog-empty-owned-title").as_ref());
+            ui.add_space(10.0);
+            ui.label(i18n.text("catalog-empty-owned-sync").as_ref());
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("play.geforcenow.com").color(ACCENT));
+            ui.add_space(18.0);
+            if ui
+                .add_sized(
+                    [210.0, 36.0],
+                    egui::Button::new(i18n.text("catalog-empty-owned-browse").as_ref()),
+                )
+                .clicked()
+            {
+                commands.push(AppCommand::SetFilter(CatalogFilter::AllGames));
+            }
+            return commands;
+        }
         ui.vertical_centered(|ui| {
             ui.label(
                 egui::RichText::new(i18n.text("detail-empty").as_ref())
@@ -2823,127 +2871,133 @@ fn detail_panel(
             .request(view.http_client, ctx, game.app_id.clone(), url);
     }
 
-    draw_panel_backdrop(ui, ctx, view.covers, game);
+    const CART_HEIGHT: f32 = 202.0;
+    const DETAIL_GAP: f32 = 6.0;
+    let (row_rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 220.0),
+        egui::Sense::hover(),
+    );
+    let cart_rect = egui::Rect::from_min_size(
+        row_rect.min,
+        egui::vec2(CART_HEIGHT * CART_ASPECT, CART_HEIGHT),
+    );
+    let details_rect = egui::Rect::from_min_max(
+        egui::pos2(cart_rect.right() + DETAIL_GAP, row_rect.top()),
+        row_rect.max,
+    );
+    let mut cover_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(cart_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    draw_cover(&mut cover_ui, ctx, view.covers, game, CART_HEIGHT, false);
 
-    let cart_height = 226.0;
-
+    // Fixed columns avoid egui resizing the row from the previous title's content.
+    let mut details_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(details_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    let ui = &mut details_ui;
+    let mut title = egui::text::LayoutJob::single_section(
+        game.title.clone(),
+        egui::TextFormat::simple(egui::FontId::proportional(19.0), egui::Color32::WHITE),
+    );
+    title.wrap.max_width = (details_rect.width() - 36.0).max(1.0);
+    title.wrap.max_rows = 2;
+    let galley = ui.painter().layout_job(title);
+    let title_size = galley.size();
+    let (title_row, _) = ui.allocate_exact_size(
+        egui::vec2(details_rect.width(), title_size.y.max(24.0)),
+        egui::Sense::hover(),
+    );
+    let heart_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            (title_row.left() + title_size.x + 8.0).min(title_row.right() - 28.0),
+            title_row.top(),
+        ),
+        egui::vec2(28.0, 24.0),
+    );
+    ui.painter()
+        .galley(title_row.min, galley, egui::Color32::WHITE);
+    let is_favorite = view.favorites.contains(&game.app_id);
+    paint_heart(
+        ui.painter(),
+        egui::Rect::from_center_size(heart_rect.center(), egui::vec2(15.0, 15.0)),
+        is_favorite,
+        if is_favorite { DANGER } else { TEXT_DIM },
+    );
+    let favorite_toggled = ui
+        .interact(heart_rect, ui.id().with("favorite"), egui::Sense::click())
+        .clicked();
+    if favorite_toggled {
+        commands.push(AppCommand::ToggleFavorite(game.app_id.clone()));
+    }
+    ui.add_space(6.0);
+    let played = match &game.last_played {
+        Some(date) => text1(i18n, "detail-last-played", "date", short_date(date)),
+        None => i18n.text("detail-never-played"),
+    };
     ui.horizontal(|ui| {
-        draw_cover(ui, ctx, view.covers, game, cart_height, false);
-
-        ui.add_space(12.0);
-        ui.vertical(|ui| {
-            ui.set_width(ui.available_width());
-            let mut favorite_toggled = false;
-            // Height is pinned, not left to the layout. A bare `with_layout(right_to_left, ..)`
-            // here claimed the whole remaining height of the panel and centred itself in it,
-            // shoving the store badge, the app id and the PLAY button off the bottom.
-            //
-            // Right-to-left within that row so the heart takes its space first and the title
-            // truncates into what is left; the other way round, a long title pushed the heart off
-            // the edge.
-            const TITLE_ROW_HEIGHT: f32 = 28.0;
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), TITLE_ROW_HEIGHT),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    let is_favorite = view.favorites.contains(&game.app_id);
-                    let (heart_rect, heart_response) =
-                        ui.allocate_exact_size(egui::vec2(28.0, 24.0), egui::Sense::click());
-                    paint_heart(
-                        &ui.painter().clone(),
-                        egui::Rect::from_center_size(heart_rect.center(), egui::vec2(15.0, 15.0)),
-                        is_favorite,
-                        if is_favorite { DANGER } else { TEXT_DIM },
+        ui.spacing_mut().item_spacing.x = 8.0;
+        if let Some(store) = game.store.as_deref() {
+            let (label, color) = store_badge(store);
+            egui::Frame::NONE
+                .fill(color)
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(6, 3))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(label)
+                            .size(10.0)
+                            .color(egui::Color32::WHITE),
                     );
-                    if heart_response.clicked() {
-                        favorite_toggled = true;
-                    }
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&game.title)
-                                .size(19.0)
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                        )
-                        .truncate(),
-                    );
-                },
-            );
-            if favorite_toggled {
-                commands.push(AppCommand::ToggleFavorite(game.app_id.clone()));
-            }
-            ui.add_space(6.0);
-
-            ui.horizontal(|ui| {
-                if let Some(store) = game.store.as_deref() {
-                    let (label, color) = store_badge(store);
-                    egui::Frame::NONE
-                        .fill(color)
-                        .corner_radius(4.0)
-                        .inner_margin(egui::Margin::symmetric(6, 3))
-                        .show(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(label)
-                                    .size(10.0)
-                                    .color(egui::Color32::WHITE),
-                            );
-                        });
-                }
-            });
-            ui.add_space(4.0);
-
-            let played = match &game.last_played {
-                Some(date) => text1(i18n, "detail-last-played", "date", short_date(date)),
-                None => i18n.text("detail-never-played"),
-            };
-            ui.label(egui::RichText::new(played.as_ref()).size(11.0).color(TEXT_DIM));
-            ui.add_space(2.0);
-            ui.label(
-                egui::RichText::new(text1(i18n, "detail-app-id", "id", &game.app_id).as_ref())
+                });
+        }
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(played.as_ref())
                     .size(10.0)
-                    .monospace()
-                    .color(BORDER.gamma_multiply(3.0)),
+                    .color(TEXT_DIM),
+            )
+            .truncate(),
+        );
+    });
+    ui.add_space(14.0);
+    if play_button(ui, i18n) {
+        commands.push(AppCommand::Input(crate::input::InputCommand::Confirm));
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(i18n.text("detail-press").as_ref())
+                .size(11.0)
+                .color(TEXT_DIM),
+        );
+        if let Some(glyph) = ps_button(ui.ctx(), PsButton::Cross) {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
+            ui.painter().image(
+                glyph.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
             );
-
-            ui.add_space(14.0);
-            if play_button(ui, i18n) {
-                commands.push(AppCommand::Input(crate::input::InputCommand::Confirm));
-            }
-
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(i18n.text("detail-press").as_ref())
-                        .size(11.0)
-                        .color(TEXT_DIM),
-                );
-                if let Some(glyph) = ps_button(ui.ctx(), PsButton::Cross) {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::hover());
-                    ui.painter().image(
-                        glyph.id(),
-                        rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                }
-                ui.label(
-                    egui::RichText::new(i18n.text("detail-to-start").as_ref())
-                        .size(11.0)
-                        .color(TEXT_DIM),
-                );
-            });
-        });
+        }
+        ui.label(
+            egui::RichText::new(i18n.text("detail-to-start").as_ref())
+                .size(11.0)
+                .color(TEXT_DIM),
+        );
     });
 
     commands
 }
 
-/// The big green PLAY button, hand-painted so it can carry a vertical gradient - egui's `Button`
-/// only does flat fills.
+/// A single rounded shape keeps the PLAY button free of seams at its caps.
 fn play_button(ui: &mut egui::Ui, i18n: &I18n) -> bool {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(200.0, 44.0), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width().min(196.0), 38.0), egui::Sense::click());
     let painter = ui.painter();
 
     let boost = if response.is_pointer_button_down_on() {
@@ -2957,38 +3011,7 @@ fn play_button(ui: &mut egui::Ui, i18n: &I18n) -> bool {
         let apply = |c: u8| (c as i32 + delta).clamp(0, 255) as u8;
         egui::Color32::from_rgb(apply(base.r()), apply(base.g()), apply(base.b()))
     };
-    let top = shade(egui::Color32::from_rgb(0x9c, 0xd3, 0x2b), boost);
-    let bottom = shade(egui::Color32::from_rgb(0x6a, 0xa8, 0x00), boost);
-
-    let radius = rect.height() / 2.0;
-    let mid = egui::Color32::from_rgb(
-        ((top.r() as u16 + bottom.r() as u16) / 2) as u8,
-        ((top.g() as u16 + bottom.g() as u16) / 2) as u8,
-        ((top.b() as u16 + bottom.b() as u16) / 2) as u8,
-    );
-    painter.circle_filled(
-        egui::pos2(rect.min.x + radius, rect.center().y),
-        radius,
-        mid,
-    );
-    painter.circle_filled(
-        egui::pos2(rect.max.x - radius, rect.center().y),
-        radius,
-        mid,
-    );
-
-    let body = egui::Rect::from_min_max(
-        egui::pos2(rect.min.x + radius, rect.min.y),
-        egui::pos2(rect.max.x - radius, rect.max.y),
-    );
-    let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(body.left_top(), top);
-    mesh.colored_vertex(body.right_top(), top);
-    mesh.colored_vertex(body.left_bottom(), bottom);
-    mesh.colored_vertex(body.right_bottom(), bottom);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(1, 3, 2);
-    painter.add(egui::Shape::Mesh(mesh.into()));
+    painter.rect_filled(rect, 19.0, shade(ACCENT, boost));
 
     painter.text(
         rect.center(),
@@ -3002,24 +3025,59 @@ fn play_button(ui: &mut egui::Ui, i18n: &I18n) -> bool {
 }
 
 /// How strongly the backdrop art shows through.
-const BACKDROP_ALPHA: u8 = 58;
+const BACKDROP_ALPHA: u8 = 90;
 
-/// Paints the selected game's cover across the whole detail panel as a dimmed backdrop.
-fn draw_panel_backdrop(
-    ui: &egui::Ui,
-    ctx: &egui::Context,
-    covers: &CoverStore,
-    game: &GameSummary,
-) {
-    let Some(CoverSnapshot::Ready(image)) = covers.get(&game.app_id) else {
+/// A low-resolution, dimmed panorama behind the library. Rapid navigation does not
+/// queue one background download per title; wait for selection to settle first.
+fn draw_catalog_backdrop(ctx: &egui::Context, view: &CatalogView<'_>) {
+    let Some(game) = selected_game(view.games, view.filtered_indices, view.selected) else {
         return;
     };
-    let rect = ui.max_rect();
+    let key = format!("{}_backdrop", game.app_id);
+    let now = ctx.input(|input| input.time);
+    let settled_at = ctx.data_mut(|data| {
+        let selection = data.get_temp_mut_or_insert_with(
+            egui::Id::new("backdrop_selection"), || (game.app_id.clone(), now),
+        );
+        if selection.0 != game.app_id {
+            *selection = (game.app_id.clone(), now);
+        }
+        selection.1
+    });
+    if now - settled_at >= 0.15 && !view.covers.is_requested(&key, CoverSize::Backdrop) {
+        if let Some(url) = &game.backdrop_url {
+            view.covers.request_backdrop(view.http_client, ctx, key.clone(), url.clone());
+        }
+    }
+    let panorama = view.covers.get_backdrop(&key);
+    let use_cover = game.backdrop_url.is_none() || matches!(panorama, Some(CoverSnapshot::Failed));
+    let previous_id = egui::Id::new("displayed_catalog_backdrop");
+    let previous = ctx.data(|data| data.get_temp::<(String, CoverSize)>(previous_id));
+    let (image, texture_key, size) = if let Some(CoverSnapshot::Ready(image)) = panorama {
+        (image, key, CoverSize::Backdrop)
+    } else if use_cover && let Some(CoverSnapshot::Ready(image)) = view.covers.get(&game.app_id) {
+        (image, game.app_id.clone(), CoverSize::Cover)
+    } else if let Some((previous_key, previous_size, image)) = previous.and_then(|(key, size)| {
+        let image = if size == CoverSize::Backdrop { view.covers.get_backdrop(&key) } else { view.covers.get(&key) };
+        match image {
+            Some(CoverSnapshot::Ready(image)) => Some((key, size, image)),
+            _ => None,
+        }
+    }) {
+        // Keep touching the visible cache entry, so normal LRU eviction keeps it alive.
+        (image, previous_key, previous_size)
+    } else if let Some(CoverSnapshot::Ready(image)) = view.covers.get(&game.app_id) {
+        (image, game.app_id.clone(), CoverSize::Cover)
+    } else {
+        return;
+    };
+    ctx.data_mut(|data| data.insert_temp(previous_id, (texture_key.clone(), size)));
+    let rect = ctx.screen_rect();
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
         return;
     }
 
-    let tex = image.texture(ctx, || CoverStore::texture_key(&game.app_id, CoverSize::Cover));
+    let tex = image.texture(ctx, || CoverStore::texture_key(&texture_key, size));
     let tex_size = tex.size_vec2();
     let src_aspect = tex_size.x / tex_size.y.max(1.0);
     let dst_aspect = rect.width() / rect.height();
@@ -3031,7 +3089,7 @@ fn draw_panel_backdrop(
         egui::Rect::from_min_max(egui::pos2(0.0, inset), egui::pos2(1.0, 1.0 - inset))
     };
 
-    ui.painter()
+    ctx.layer_painter(egui::LayerId::background())
         .image(tex.id(), rect, uv, egui::Color32::from_white_alpha(BACKDROP_ALPHA));
 }
 
@@ -3406,6 +3464,10 @@ fn launch_stepper(ui: &mut egui::Ui, i18n: &I18n, stage: LaunchStage, queue_skip
         egui::Sense::hover(),
     );
     let painter = ui.painter();
+    let progress = ui.ctx().animate_value_with_time(
+        ui.id().with("launch_progress"), stage.index() as f32,
+        ui.style().animation_time.min(0.2),
+    );
     let dot_y = rect.top() + STEP_DOT_RADIUS;
     // Inset by the radius so the outer dots sit fully inside `rect` rather than half-clipped.
     let first_x = rect.left() + STEP_DOT_RADIUS + 24.0;
@@ -3424,7 +3486,9 @@ fn launch_stepper(ui: &mut egui::Ui, i18n: &I18n, stage: LaunchStage, queue_skip
                     egui::pos2(x - gap + STEP_DOT_RADIUS + 2.0, dot_y),
                     egui::pos2(x - STEP_DOT_RADIUS - 2.0, dot_y),
                 ],
-                egui::Stroke::new(2.0_f32, if reached { ACCENT } else { BORDER }),
+                egui::Stroke::new(2.0_f32, BORDER.lerp_to_gamma(
+                    ACCENT, (progress - (step - 1) as f32).clamp(0.0, 1.0),
+                )),
             );
         }
 

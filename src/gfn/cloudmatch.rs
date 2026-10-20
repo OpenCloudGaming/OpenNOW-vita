@@ -678,9 +678,22 @@ pub async fn poll_session(
         }
         consecutive_server_errors = 0;
 
-        let response = error_for_status_with_body(response)
-            .await
-            .with_context(|| format!("CloudMatch poll attempt {attempt} rejected"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            let description = describe_status(status, &body_text);
+            let payload = serde_json::from_str::<serde_json::Value>(&body_text).ok();
+            log_warn!(
+                "CloudMatch poll {attempt} rejected: {description}; session status={:?}",
+                payload.as_ref().and_then(|payload| payload["session"]["status"].as_u64())
+            );
+            let detail = format!("CloudMatch poll attempt {attempt} rejected: {description}");
+            if let Some(request_status) = response_request_status(&body_text) {
+                return Err(request_status.to_error(detail)
+                    .with_http_status(status.as_u16()).into());
+            }
+            bail!("{detail}");
+        }
 
         let body_text = response
             .text()
@@ -779,14 +792,20 @@ pub async fn poll_session(
 // e.g "HTTP 503 (41 APP_PATCHING_STATUS)", put first bc the error screen truncates the long
 // json body and this is the part ppl actually screenshot
 fn describe_status(status: reqwest::StatusCode, body_text: &str) -> String {
-    match serde_json::from_str::<CloudMatchResponse>(body_text) {
-        Ok(payload) => format!(
+    match response_request_status(body_text) {
+        Some(request_status) => format!(
             "HTTP {status} ({} {})",
-            payload.request_status.status_code,
-            payload.request_status.describe()
+            request_status.status_code,
+            request_status.describe()
         ),
-        Err(_) => format!("HTTP {status}"),
+        None => format!("HTTP {status}"),
     }
+}
+
+// Error responses can contain an incomplete session; read the reason independently of it.
+fn response_request_status(body_text: &str) -> Option<CloudMatchRequestStatus> {
+    let payload: serde_json::Value = serde_json::from_str(body_text).ok()?;
+    serde_json::from_value(payload.get("requestStatus")?.clone()).ok()
 }
 
 /// Best-effort GET of a session payload; `None` on any transport/decode/status failure so the
@@ -1802,6 +1821,17 @@ struct CloudMatchStreamingFeatures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_error_reason_survives_an_incomplete_session() {
+        let body = r#"{"session":{"sessionControlInfo":{"ip":null}},
+            "requestStatus":{"statusCode":4,"statusDescription":"SESSION_EXPIRED","unifiedErrorCode":123}}"#;
+        assert_eq!(
+            describe_status(reqwest::StatusCode::GONE, body),
+            "HTTP 410 Gone (4 SESSION_EXPIRED (#123))"
+        );
+        assert_eq!(describe_status(reqwest::StatusCode::GONE, "not JSON"), "HTTP 410 Gone");
+    }
 
     fn request_status(body: &str) -> CloudMatchRequestStatus {
         serde_json::from_str::<CloudMatchResponse>(body)

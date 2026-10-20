@@ -23,6 +23,8 @@ pub struct FavoriteGame {
     #[serde(default)]
     pub cover_url: Option<String>,
     #[serde(default)]
+    pub backdrop_url: Option<String>,
+    #[serde(default)]
     pub store: Option<String>,
 }
 
@@ -32,6 +34,7 @@ impl FavoriteGame {
             app_id: game.app_id.clone(),
             title: game.title.clone(),
             cover_url: game.cover_url.clone(),
+            backdrop_url: game.backdrop_url.clone(),
             store: game.store.clone(),
             // `last_played` is deliberately not kept: it changes with use, and the server's copy is
             // always the truthful one.
@@ -44,6 +47,7 @@ impl FavoriteGame {
             app_id: self.app_id.clone(),
             title: self.title.clone(),
             cover_url: self.cover_url.clone(),
+            backdrop_url: self.backdrop_url.clone(),
             store: self.store.clone(),
             last_played: None,
             search_key: self.title.to_lowercase(),

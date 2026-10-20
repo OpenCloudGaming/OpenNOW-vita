@@ -21,7 +21,7 @@ const UI_SCALE: f32 = 1.3;
 const DIRECTION_REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(200);
 const DIRECTION_REPEAT_INTERVAL: Duration = Duration::from_millis(70);
 
-pub(crate) const TARGET_FRAME_TIME: Duration = Duration::from_millis(16);
+pub(crate) const TARGET_FRAME_TIME: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
 const FRAME_STATS_INTERVAL: Duration = Duration::from_secs(2);
 const SLOW_FRAME_THRESHOLD: Duration = Duration::from_millis(20);
@@ -460,7 +460,7 @@ pub async fn run(mut app: App) -> Result<()> {
         frame_stats.record(tick_elapsed, build_ui_elapsed, tessellate_elapsed, paint_stats);
         let frame_deadline = loop_started_at + TARGET_FRAME_TIME;
         let remaining = frame_deadline.saturating_duration_since(Instant::now());
-        if !remaining.is_zero() {
+        if !surface.uses_vsync() && !remaining.is_zero() {
             tokio::time::sleep(remaining).await;
         } else {
             tokio::task::yield_now().await;

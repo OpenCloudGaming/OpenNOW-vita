@@ -277,9 +277,15 @@ impl AuthTokens {
         self.id_token.as_deref().unwrap_or(&self.access_token)
     }
 
-    /// Whether the access token is close enough to expiry to be worth replacing before use.
+    /// Renew before either the OAuth token or the JWT used by catalog/session calls expires.
     pub fn needs_refresh(&self) -> bool {
-        should_refresh(self.expires_at_unix, now_unix())
+        let service_expiry = self
+            .id_token
+            .as_deref()
+            .and_then(|token| decode_jwt_payload(token).ok())
+            .and_then(|payload| payload.get("exp").and_then(serde_json::Value::as_u64))
+            .unwrap_or(self.expires_at_unix);
+        should_refresh(self.expires_at_unix.min(service_expiry), now_unix())
     }
 
     /// Whether anything about the saved login is worth renewing before the next request.
@@ -523,14 +529,16 @@ pub async fn refresh_tokens(
                 eprintln!("Client-token refresh rejected ({message}); trying OAuth refresh");
             }
             Err(RefreshError::Temporary(error)) => {
-                eprintln!("Client-token refresh failed ({error:#}); trying OAuth refresh");
+                // A network failure says nothing about this credential. Falling back to
+                // OAuth can report "no refresh token" and make callers erase a valid login.
+                return Err(RefreshError::Temporary(error));
             }
         }
     }
     refresh_with_refresh_token(client, tokens).await
 }
 
-/// Returns tokens good for immediate use, refreshing and re-saving them only when needed.
+/// Returns renewed tokens. The caller persists them after checking the account is still current.
 ///
 /// Called before work that authenticates, so an idle Vita picks up where it left off instead of
 /// sending the player back to the QR code.
@@ -550,10 +558,6 @@ pub async fn ensure_fresh_tokens(
     };
     if refreshed.client_token_needs_refresh() {
         request_client_token(client, &mut refreshed).await;
-    }
-    if let Err(error) = save_tokens(&refreshed) {
-        // Losing the write is survivable - the tokens in memory are still good for this session.
-        eprintln!("Could not persist refreshed GFN tokens: {error:#}");
     }
     Ok(refreshed)
 }
@@ -899,6 +903,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn refresh_checks_the_jwt_used_by_the_catalog() {
+        let mut tokens = saved_tokens();
+        tokens.expires_at_unix = now_unix() + 3_600;
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"exp":1}"#);
+        tokens.id_token = Some(format!("header.{payload}.signature"));
+        assert!(tokens.needs_refresh());
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({"exp": now_unix() + 7_200})).unwrap(),
+        );
+        tokens.id_token = Some(format!("header.{payload}.signature"));
+        assert!(!tokens.needs_refresh());
+        tokens.expires_at_unix = 1;
+        assert!(tokens.needs_refresh());
+    }
+
     /// The bug this guards against is subtle and total: `bearer()` prefers `id_token`, so dropping
     /// an omitted one swaps the JWT CloudMatch requires for a token it refuses.
     #[test]
@@ -966,6 +986,23 @@ mod tests {
         assert!(is_temporary_status(Some(503)));
         assert!(!is_temporary_status(Some(400)));
         assert!(!is_temporary_status(Some(401)));
+    }
+
+    #[test]
+    fn offline_client_token_refresh_does_not_require_a_new_login() {
+        // No OAuth fallback is available for some saved device logins. An unreachable
+        // client-token endpoint must still be temporary, not invalidate that login.
+        let mut tokens = saved_tokens();
+        tokens.refresh_token = None;
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:0").unwrap())
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(refresh_tokens(&client, &tokens, "saved-user"));
+        assert!(matches!(result, Err(RefreshError::Temporary(_))), "{result:?}");
+        assert_eq!(tokens.client_token.as_deref(), Some("old-client"));
     }
 
     #[test]

@@ -411,6 +411,7 @@ pub struct App {
     /// When the last token refresh was attempted, so a failing refresh backs off instead of
     /// retrying on every one of the 60 ticks a second.
     last_refresh_attempt: Option<Instant>,
+    maintenance_job: Option<(String, PollJob<Result<AuthTokens, auth::RefreshError>>)>,
     /// Keyframe requests seen in the running session, sampled while the peer is still alive.
     link_keyframe_requests: u64,
     /// Whether the streaming diagnostics panel is showing. Off by default - it covers the game and
@@ -582,6 +583,7 @@ impl App {
             http_client,
             tokens,
             last_refresh_attempt: None,
+            maintenance_job: None,
             show_stream_stats: false,
             link_keyframe_requests: 0,
             favorites: crate::gfn::favorites::ids(&favorite_games),
@@ -1449,6 +1451,7 @@ impl App {
         ) {
             (Some(game), Some(token)) => {
                 let app_id = game.app_id.clone();
+                crate::log_info!("Launching app {app_id}, store={:?}, region={zone_base_url:?}", game.store);
                 let queue_tracker =
                     Arc::new(std::sync::Mutex::new(cloudmatch::QueueStatus::default()));
                 let tracker_clone = queue_tracker.clone();
@@ -1821,8 +1824,7 @@ impl App {
                         covers,
                     }
                 } else {
-                    self.open_server_picker();
-                    AppState::Catalog {
+                    self.start_launch(AppState::Catalog {
                         user,
                         games,
                         selected,
@@ -1830,7 +1832,7 @@ impl App {
                         search_query,
                         search_requested,
                         covers,
-                    }
+                    }, crate::gfn::stream_prefs::region(), bearer_token, http_client)
                 }
             }
             (
@@ -2922,6 +2924,38 @@ impl App {
     /// Rate-limited rather than attempted every tick: `tick` runs 60 times a second, and a failing
     /// refresh must not turn into a request storm against NVIDIA's token endpoint.
     async fn maintain_session(&mut self) {
+        if let Some((bearer, job)) = self.maintenance_job.take() {
+            if self.tokens.as_ref().map(|tokens| tokens.bearer()) != Some(bearer.as_str()) {
+                if let PollJob::Pending(handle) = job {
+                    handle.abort();
+                }
+                return;
+            }
+            let job = match job {
+                PollJob::Pending(handle) => poll_job(handle).await,
+                done => done,
+            };
+            match job {
+                pending @ PollJob::Pending(_) => {
+                    self.maintenance_job = Some((bearer, pending));
+                }
+                PollJob::Done(Ok(Ok(refreshed))) => {
+                    if let Err(error) = auth::save_tokens(&refreshed) {
+                        eprintln!("Could not persist refreshed GFN tokens: {error:#}");
+                    }
+                    self.tokens = Some(refreshed);
+                }
+                PollJob::Done(Ok(Err(auth::RefreshError::ReauthenticationRequired(message)))) => {
+                    eprintln!("Saved GFN login can no longer be refreshed: {message}");
+                    auth::clear_tokens();
+                    self.tokens = None;
+                }
+                PollJob::Done(result) => {
+                    eprintln!("Deferring GFN token refresh: {result:?}");
+                }
+            }
+            return;
+        }
         let Some(tokens) = self.tokens.as_ref() else {
             return;
         };
@@ -2940,22 +2974,11 @@ impl App {
         self.last_refresh_attempt = Some(Instant::now());
 
         let tokens = tokens.clone();
-        // `ensure_fresh_tokens` covers both halves of maintenance: renewing the access token, and
-        // acquiring a client token for a login saved before this build knew to ask for one.
-        match crate::gfn::auth::ensure_fresh_tokens(&self.http_client, &tokens, &user_id).await {
-            Ok(refreshed) => self.tokens = Some(refreshed),
-            Err(crate::gfn::auth::RefreshError::ReauthenticationRequired(message)) => {
-                eprintln!("Saved GFN login can no longer be refreshed: {message}");
-                // Nothing to do here beyond dropping the dead credential; the next authenticated
-                // request surfaces the sign-in prompt through the usual error path.
-                crate::gfn::auth::clear_tokens();
-                self.tokens = None;
-            }
-            Err(crate::gfn::auth::RefreshError::Temporary(error)) => {
-                // Keep the saved login and try again after the backoff.
-                eprintln!("Deferring GFN token refresh: {error:#}");
-            }
-        }
+        let client = self.http_client.clone();
+        let bearer = tokens.bearer().to_owned();
+        self.maintenance_job = Some((bearer, PollJob::Pending(tokio::spawn(async move {
+            Ok(auth::ensure_fresh_tokens(&client, &tokens, &user_id).await)
+        }))));
     }
 
     /// How long to wait before retrying a refresh that did not succeed.
@@ -3171,6 +3194,34 @@ impl App {
 }
 
 #[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    #[test]
+    fn pending_refresh_keeps_the_frame_loop_responsive() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let mut app = App::new().unwrap();
+            app.tokens = Some(AuthTokens {
+                access_token: "test-access".into(), refresh_token: None, id_token: None,
+                expires_at_unix: 0, client_token: None, client_token_expires_at_unix: 0,
+                membership_tier: None, provider: None,
+            });
+            app.maintenance_job = Some(("test-access".into(), PollJob::Pending(tokio::spawn(
+                std::future::pending(),
+            ))));
+            tokio::time::timeout(Duration::from_millis(100), app.maintain_session()).await
+                .expect("a pending network request must not block a UI tick");
+            assert!(app.maintenance_job.is_some());
+            // Changing accounts must cancel the old request before it can overwrite the login.
+            app.tokens = None;
+            app.maintain_session().await;
+            assert!(app.maintenance_job.is_none());
+        });
+    }
+}
+
+#[cfg(test)]
 mod catalog_order_tests {
     use super::*;
     use std::collections::BTreeSet;
@@ -3180,6 +3231,7 @@ mod catalog_order_tests {
             app_id: app_id.to_owned(),
             title: title.to_owned(),
             cover_url: None,
+            backdrop_url: None,
             store: None,
             last_played: played.then(|| "2026-07-30T00:00:00Z".to_owned()),
             search_key: title.to_lowercase(),
@@ -3255,6 +3307,7 @@ mod catalog_order_tests {
             app_id: "unpaged".to_owned(),
             title: "Unpaged".to_owned(),
             cover_url: None,
+            backdrop_url: None,
             store: None,
         }];
         let merged = merge_favorites(games, &stored);
@@ -3269,6 +3322,7 @@ mod catalog_order_tests {
             app_id: "loaded".to_owned(),
             title: "Loaded".to_owned(),
             cover_url: None,
+            backdrop_url: None,
             store: None,
         }];
         assert_eq!(merge_favorites(games, &stored).len(), 1);
