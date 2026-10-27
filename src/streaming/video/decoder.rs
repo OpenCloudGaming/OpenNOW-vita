@@ -145,17 +145,22 @@ mod vita {
             unsafe {
                 let loaded_before = sceSysmoduleIsLoaded(SCE_SYSMODULE_AVCDEC);
                 let ret = sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC);
+                // 0 is SCE_SYSMODULE_LOADED (success). Negative codes indicate errors,
+                // but some firmware versions / sysmodule states return 0x805a1000 or 0xc05a1000
+                // (module already resident / invalid value / built-in). In those cases we continue.
+                let ret_u32 = ret as u32;
                 if ret >= 0 {
                     Ok(true)
-                } else if ret as u32 == SCE_SYSMODULE_ERROR_INVALID_VALUE {
+                } else if ret_u32 == SCE_SYSMODULE_ERROR_INVALID_VALUE || ret_u32 == 0xc05a1000 {
                     eprintln!(
                         "sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC) returned {ret:#x}; continuing with SceVideodec imports; is_loaded_before={loaded_before:#x}",
                     );
                     Ok(false)
                 } else {
-                    bail!(
-                        "sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC) failed: {ret:#x}; is_loaded_before={loaded_before:#x}",
+                    eprintln!(
+                        "sceSysmoduleLoadModule(SCE_SYSMODULE_AVCDEC) failed with {ret:#x} (is_loaded_before={loaded_before:#x}); continuing with SceVideodec imports anyway",
                     );
+                    Ok(false)
                 }
             }
         }

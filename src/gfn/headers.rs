@@ -21,8 +21,8 @@ pub async fn error_for_status_with_body(response: Response) -> Result<Response> 
 }
 
 pub const CLIENT_ID: &str = "ec7e38d4-03af-4b58-b131-cfb0495903ab";
-pub const CLIENT_VERSION: &str = "2.0.80.173";
-pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 NVIDIACEFClient/HEAD/debb5919f6 GFN-PC/2.0.80.173";
+pub const CLIENT_VERSION: &str = "2.0.89.154";
+pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 pub const PLAY_ORIGIN: &str = "https://play.geforcenow.com";
 pub const PLAY_REFERER: &str = "https://play.geforcenow.com/";
 
@@ -64,8 +64,8 @@ pub fn apply_cloudmatch_headers(
         .header("Referer", PLAY_REFERER)
         .header("nv-browser-type", "CHROME")
         .header("nv-client-id", client_id)
-        .header("nv-client-streamer", "NVIDIA-CLASSIC")
-        .header("nv-client-type", "NATIVE")
+        .header("nv-client-streamer", "WEBRTC")
+        .header("nv-client-type", "BROWSER")
         .header("nv-client-version", CLIENT_VERSION)
         .header("nv-device-make", "UNKNOWN")
         .header("nv-device-model", "UNKNOWN")

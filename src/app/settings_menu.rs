@@ -154,7 +154,7 @@ pub fn option_count(tab: SettingsTab, row: usize, regions_len: usize) -> usize {
             (SettingsTab::App, 0) => Locale::ALL.len(),
             _ => 0,
         },
-        Some(RowKind::Region) => 1 + regions_len,
+        Some(RowKind::Region) => 2 + regions_len,
         _ => 0,
     }
 }
@@ -200,14 +200,16 @@ pub fn current_option_index(
             .unwrap_or(0),
         (SettingsTab::Stream, 0) => {
             let selected = crate::gfn::stream_prefs::region();
-            if selected.is_empty() {
+            if crate::gfn::stream_prefs::ask_server() {
                 0
+            } else if selected.is_empty() {
+                1
             } else {
                 regions
                     .iter()
                     .position(|region| region.url == selected)
-                    .map(|index| index + 1)
-                    .unwrap_or(0)
+                    .map(|index| index + 2)
+                    .unwrap_or(1)
             }
         }
         _ => 0,
@@ -255,10 +257,10 @@ pub fn option_label(
             .map(|c| c.label().to_owned())
             .unwrap_or_default(),
         (SettingsTab::Stream, 0) => {
-            if index == 0 {
-                i18n.text("settings-region-auto").to_string()
-            } else {
-                match regions.get(index - 1) {
+            match index {
+                0 => i18n.text("settings-region-ask").to_string(),
+                1 => i18n.text("settings-region-auto").to_string(),
+                _ => match regions.get(index - 2) {
                     Some(region) => match region.ping_ms {
                         Some(ms) => format!("{} · {ms} ms", region.name),
                         None => region.name.clone(),
@@ -313,10 +315,10 @@ pub fn command_for(
         (SettingsTab::Controls, 3) => Some(AppCommand::ToggleGameProfile),
         (SettingsTab::Controls, 4) => Some(AppCommand::ToggleTriggerSwap),
         (SettingsTab::Stream, 0) => {
-            if index == 0 {
-                Some(AppCommand::SetRegion(String::new()))
-            } else {
-                regions.get(index - 1).map(|region| AppCommand::SetRegion(region.url.clone()))
+            match index {
+                0 => Some(AppCommand::AskServerEachGame),
+                1 => Some(AppCommand::SetRegion(String::new())),
+                _ => regions.get(index - 2).map(|region| AppCommand::SetRegion(region.url.clone()))
             }
         }
         _ => None,

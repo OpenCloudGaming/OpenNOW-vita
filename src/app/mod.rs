@@ -694,8 +694,15 @@ impl App {
                 }
                 current_state
             }
+            AppCommand::AskServerEachGame => {
+                crate::gfn::stream_prefs::set_ask_server(true);
+                crate::log_info!("Region set to ask each game");
+                self.status_note = Some(self.tr("settings-region-note-ask"));
+                current_state
+            }
             AppCommand::SetRegion(base_url) => {
                 crate::gfn::stream_prefs::set_region(&base_url);
+                crate::gfn::stream_prefs::set_ask_server(false);
                 let pinned = crate::gfn::stream_prefs::region();
                 crate::log_info!(
                     "Region set to {}",
@@ -1821,8 +1828,8 @@ impl App {
                         covers,
                     }
                 } else {
-                    self.open_server_picker();
-                    AppState::Catalog {
+                    // Settings decide: ask each game, or launch on the saved region ("" = automatic).
+                    let state = AppState::Catalog {
                         user,
                         games,
                         selected,
@@ -1830,7 +1837,13 @@ impl App {
                         search_query,
                         search_requested,
                         covers,
+                    };
+                    if !crate::gfn::stream_prefs::ask_server() {
+                        let zone = crate::gfn::stream_prefs::region();
+                        return Ok(self.start_launch(state, zone, bearer_token, http_client));
                     }
+                    self.open_server_picker();
+                    state
                 }
             }
             (

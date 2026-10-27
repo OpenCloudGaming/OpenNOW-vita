@@ -2402,14 +2402,14 @@ fn settings_item(
                             );
                             paint_stream_icon(ui.painter(), check_rect, StreamIcon::Check, ACCENT);
                         }
-                        if info.kind == RowKind::Region && option > 0 {
+                        if info.kind == RowKind::Region && option > 1 {
                             if let Some(best) = regions
                                 .list
                                 .iter()
                                 .filter_map(|r| r.ping_ms)
                                 .min()
                             {
-                                if regions.list.get(option - 1).and_then(|r| r.ping_ms) == Some(best) {
+                                if regions.list.get(option - 2).and_then(|r| r.ping_ms) == Some(best) {
                                     ui.painter().text(
                                         egui::pos2(rect.max.x - 46.0, rect.center().y),
                                         egui::Align2::RIGHT_CENTER,

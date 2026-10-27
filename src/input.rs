@@ -85,6 +85,7 @@ pub enum AppCommand {
     /// bumps the bitrate mid session, kbps
     SetMaxBitrate(u32),
     SetRegion(String),
+    AskServerEachGame,
     LoadRegions,
     TestRegionLatency,
     OpenSettings,

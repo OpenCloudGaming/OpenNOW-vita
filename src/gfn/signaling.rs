@@ -138,7 +138,7 @@ fn build_sign_in_url(signaling_url: &str, session_id: &str, peer_name: &str) -> 
         url_str.truncate(url_str.len() - "sign_in".len());
     }
     let base = url_str.trim_end_matches('/');
-    format!("{base}/sign_in?peer_id={peer_name}&version=2&peer_role=1&pairing_id={session_id}")
+    format!("{base}/sign_in?peer_id={peer_name}&version=3.0&peer_role=1&pairing_id={session_id}")
 }
 
 fn random_peer_suffix() -> u64 {

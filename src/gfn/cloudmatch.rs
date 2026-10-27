@@ -137,7 +137,7 @@ pub async fn report_session_ad(
     request: &PollSessionRequest<'_>,
     ad_id: &str,
     action: AdAction,
-    watched_ms: Option<u64>,
+    _watched_ms: Option<u64>,
 ) -> Result<()> {
     const SESSION_MODIFY_ACTION_AD_UPDATE: u32 = 6;
     let base_url = request.session.streaming_base_url.trim_end_matches('/');
@@ -148,22 +148,22 @@ pub async fn report_session_ad(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let mut ad_update = json!({
+    let ad_update = json!({
         "adId": ad_id,
-        "adAction": action.code(),
+        "adAction": 5, // FAILED_TO_REQUEST_ADS / Cancel
         "clientTimestamp": client_timestamp,
+        "cancelReason": "FAILED_TO_REQUEST_ADS",
+        "watchedTimeInMs": 0,
+        "pausedTimeInMs": 0,
+        "adDurationInMs": 0,
     });
-    if let Some(watched_ms) = watched_ms {
-        ad_update["watchedTimeInMs"] = json!(watched_ms);
-        ad_update["pausedTimeInMs"] = json!(0);
-    }
     let body = json!({
         "action": SESSION_MODIFY_ACTION_AD_UPDATE,
         "adUpdates": [ad_update],
     });
 
     log_info!(
-        "reportSessionAd: adId={ad_id} action={action:?} watchedMs={watched_ms:?} sessionId={}",
+        "reportSessionAd: canceling ad {ad_id} (FAILED_TO_REQUEST_ADS) on sessionId={}",
         request.session_id
     );
 
@@ -176,7 +176,7 @@ pub async fn report_session_ad(
     .json(&body)
     .send()
     .await
-    .with_context(|| format!("failed to send ad {action:?} for {ad_id}"))?;
+    .with_context(|| format!("failed to send ad cancellation for {ad_id}"))?;
 
     let response = error_for_status_with_body(response)
         .await
@@ -276,47 +276,16 @@ impl QueueAdRunner {
             return;
         };
 
-        match self.states.get(&ad.ad_id).copied() {
-            None => {
-                match report_session_ad(client, request, &ad.ad_id, AdAction::Start, None).await {
-                    Ok(()) => {
-                        self.states.insert(
-                            ad.ad_id.clone(),
-                            AdPlayback::Playing {
-                                started_at: Instant::now(),
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        log_warn!("QueueAds: failed to start ad {}: {error:#}", ad.ad_id);
-                    }
+        if self.states.get(&ad.ad_id).is_none() {
+            match report_session_ad(client, request, &ad.ad_id, AdAction::Cancel, None).await {
+                Ok(()) => {
+                    log_info!("QueueAds: successfully reported ad cancellation for {}", ad.ad_id);
+                    self.states.insert(ad.ad_id.clone(), AdPlayback::Finished);
+                }
+                Err(error) => {
+                    log_warn!("QueueAds: failed to answer ad {}: {error:#}", ad.ad_id);
                 }
             }
-            Some(AdPlayback::Playing { started_at }) => {
-                let length_ms = ad.length_ms.unwrap_or(15_000);
-                let elapsed_ms = started_at.elapsed().as_millis() as u64;
-                if elapsed_ms < length_ms {
-                    return;
-                }
-                match report_session_ad(
-                    client,
-                    request,
-                    &ad.ad_id,
-                    AdAction::Finish,
-                    Some(elapsed_ms),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        log_info!("QueueAds: finished ad after {elapsed_ms}ms");
-                        self.states.insert(ad.ad_id.clone(), AdPlayback::Finished);
-                    }
-                    Err(error) => {
-                        log_warn!("QueueAds: failed to finish ad {}: {error:#}", ad.ad_id);
-                    }
-                }
-            }
-            Some(AdPlayback::Finished) => {}
         }
     }
 }
@@ -1299,7 +1268,7 @@ fn build_session_request_body(
             "clientVersion": "30.0",
             "sdkVersion": "1.0",
             "streamerVersion": 1,
-            "clientPlatformName": "windows",
+            "clientPlatformName": "browser",
             "clientRequestMonitorSettings": [
                 {
                     "monitorId": 0,
@@ -1323,7 +1292,7 @@ fn build_session_request_body(
             "remoteControllersBitmap": 0,
             "clientTimezoneOffset": 0,
             "enhancedStreamMode": 1,
-            "appLaunchMode": 2,
+            "appLaunchMode": 1,
             "secureRTSPSupported": false,
             "partnerCustomData": "",
             "accountLinked": true,

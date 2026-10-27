@@ -28,6 +28,8 @@ pub struct AppSettings {
     pub session_timer_enabled: bool,
     #[serde(default)]
     pub region: String,
+    #[serde(default = "default_true")]
+    pub ask_server: bool,
     #[serde(default)]
     pub game_language: String,
     #[serde(default = "default_color_depth")]
@@ -136,6 +138,7 @@ impl Default for AppSettings {
             catalog_filter: "my_games".to_owned(),
             session_timer_enabled: true,
             region: String::new(),
+            ask_server: true,
             game_language: GameLanguage::default().code().to_owned(),
             color_depth: ColorDepth::default().key().to_owned(),
             game_profiles: std::collections::BTreeMap::new(),
@@ -569,6 +572,15 @@ pub fn region() -> String {
 pub fn set_region(base_url: &str) {
     let normalized = crate::gfn::regions::normalize_base_url(base_url).unwrap_or_default();
     update_settings(|s| s.region = normalized);
+}
+
+/// Show the server picker before every launch instead of using the saved region.
+pub fn ask_server() -> bool {
+    load_or_init_settings().ask_server
+}
+
+pub fn set_ask_server(ask: bool) {
+    update_settings(|s| s.ask_server = ask);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
