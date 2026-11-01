@@ -497,6 +497,12 @@ pub struct App {
     pub(crate) battery: Option<crate::power::BatteryStatus>,
     battery_checked_at: Option<Instant>,
     bitrate_ceiling_mbps: u32,
+    /// Sign-in providers for the login screen; starts as NVIDIA only, the rest is fetched on demand.
+    pub(crate) login_providers: Vec<crate::gfn::providers::GfnProvider>,
+    pub(crate) login_provider_index: usize,
+    /// Provider code NVIDIA recommends for the player's country, marked on the login screen.
+    pub(crate) login_recommended: String,
+    login_providers_loaded: bool,
     bitrate_keyframes_seen: u64,
     bitrate_checked_at: Option<Instant>,
     last_tick_wall_clock: Option<std::time::SystemTime>,
@@ -627,6 +633,10 @@ impl App {
             battery: None,
             battery_checked_at: None,
             bitrate_ceiling_mbps: 0,
+            login_providers: vec![crate::gfn::providers::GfnProvider::default()],
+            login_provider_index: 0,
+            login_recommended: String::new(),
+            login_providers_loaded: false,
             bitrate_keyframes_seen: 0,
             bitrate_checked_at: None,
             last_tick_wall_clock: None,
@@ -1308,18 +1318,17 @@ impl App {
             return;
         }
 
-        let current = self.bitrate_ceiling_mbps;
-        let lowered = (current * 3 / 4).max(crate::gfn::link_estimate::MIN_CEILING_MBPS);
-        if lowered >= current {
-            return;
-        }
-        self.bitrate_ceiling_mbps = lowered;
-        peer.set_max_bitrate(lowered * 1000);
+        // Log only. Lowering or raising the ceiling here used to call `peer.set_max_bitrate`,
+        // which re-sends the NVST description mid-stream, and the server answers that by
+        // restarting the stream: video stalled within a second of every adjustment ("no decoded
+        // frames for 8s"). It stayed hidden while the saved ceiling sat on the 5 Mbps floor, where
+        // `lowered >= current` returned early. The strain still reaches `link_estimate::record`
+        // when the session ends, so the next session asks for a better ceiling.
         crate::log_warn!(
-            "Link stressed ({in_window} keyframe request(s) in {}s), lowering the ceiling {current} -> {lowered} Mbps",
-            Self::BITRATE_ADAPT_INTERVAL.as_secs()
+            "Link stressed ({in_window} keyframe request(s) in {}s); ceiling stays {} Mbps until the next session",
+            Self::BITRATE_ADAPT_INTERVAL.as_secs(),
+            self.bitrate_ceiling_mbps
         );
-        self.status_note = Some(self.tr1("status-bitrate-lowered", "mbps", lowered));
     }
 
     const BATTERY_POLL_INTERVAL: Duration = Duration::from_secs(20);
@@ -1732,6 +1741,36 @@ impl App {
                 http_client,
             ));
         }
+        if matches!(current_state, AppState::Login)
+            && matches!(input, InputCommand::MoveLeft | InputCommand::MoveRight)
+        {
+            // the partner list costs a network call, so it is only fetched once the player asks
+            if !self.login_providers_loaded {
+                self.login_providers_loaded = true;
+                // cached list first so the picker works offline, then refresh it from NVIDIA
+                let mut fetched = crate::gfn::providers::load_cached()
+                    .map(|(list, recommended)| (recommended, list));
+                if let Ok((preferred, list)) =
+                    crate::gfn::providers::discover_providers(&self.http_client).await
+                {
+                    fetched = Some((preferred.code, list));
+                }
+                if let Some((recommended, list)) = fetched {
+                    // stay on NVIDIA unless the player moves: a partner login only helps where
+                    // that partner serves the country, and the recommended one is just marked
+                    self.login_provider_index = list.iter().position(|p| p.is_nvidia()).unwrap_or(0);
+                    self.login_recommended = recommended;
+                    self.login_providers = list;
+                }
+            }
+            let count = self.login_providers.len();
+            self.login_provider_index = if input == InputCommand::MoveRight {
+                (self.login_provider_index + 1) % count
+            } else {
+                (self.login_provider_index + count - 1) % count
+            };
+            return Ok(AppState::Login);
+        }
         Ok(match (current_state, input) {
             (AppState::Login, InputCommand::Confirm) => self.start_login_state(),
             (AppState::WaitingForDeviceAuthorization { .. }, InputCommand::Back) => AppState::Login,
@@ -2048,8 +2087,14 @@ impl App {
 
     fn start_login_state(&self) -> AppState {
         let client = self.http_client.clone();
-        let handle: JoinHandle<Result<DeviceCodeChallenge>> =
-            tokio::spawn(async move { auth::start_device_login(&client).await });
+        let provider = self
+            .login_providers
+            .get(self.login_provider_index)
+            .cloned()
+            .unwrap_or_default();
+        let handle: JoinHandle<Result<DeviceCodeChallenge>> = tokio::spawn(async move {
+            auth::start_device_login_with_provider(&client, provider).await
+        });
         AppState::StartingDeviceLogin(PollJob::Pending(handle))
     }
 

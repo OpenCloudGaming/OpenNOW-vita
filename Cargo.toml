@@ -17,6 +17,7 @@ h264-reader = "0.8"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 qrcode = { version = "0.14", default-features = false }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+libc = "0.2"
 ring = "0.17"
 rtc = "0.20.0-rc.2"
 rtc-media = "0.20.0-rc.2"

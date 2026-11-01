@@ -28,7 +28,8 @@ pub struct AppSettings {
     pub session_timer_enabled: bool,
     #[serde(default)]
     pub region: String,
-    #[serde(default = "default_true")]
+    // off by default: servers are picked automatically unless the player asks to be prompted
+    #[serde(default)]
     pub ask_server: bool,
     #[serde(default)]
     pub game_language: String,
@@ -138,7 +139,7 @@ impl Default for AppSettings {
             catalog_filter: "my_games".to_owned(),
             session_timer_enabled: true,
             region: String::new(),
-            ask_server: true,
+            ask_server: false,
             game_language: GameLanguage::default().code().to_owned(),
             color_depth: ColorDepth::default().key().to_owned(),
             game_profiles: std::collections::BTreeMap::new(),

@@ -102,11 +102,7 @@ pub async fn discover_providers(client: &Client) -> Result<(GfnProvider, Vec<Gfn
         .gfn_service_endpoints
         .into_iter()
         .map(|ep| GfnProvider {
-            display_name: if ep.login_provider_code == "BPC" {
-                "bro.game".to_owned()
-            } else {
-                ep.login_provider_display_name
-            },
+            display_name: friendly_name(&ep.login_provider_code, ep.login_provider_display_name),
             code: ep.login_provider_code,
             idp_id: ep.idp_id,
             streaming_service_url: if ep.streaming_service_url.ends_with('/') {
@@ -116,6 +112,7 @@ pub async fn discover_providers(client: &Client) -> Result<(GfnProvider, Vec<Gfn
             },
             priority: ep.login_provider_priority.unwrap_or(100),
         })
+        .filter(is_valid)
         .collect();
 
     providers.sort_by_key(|p| p.priority);
@@ -139,5 +136,76 @@ pub async fn discover_providers(client: &Client) -> Result<(GfnProvider, Vec<Gfn
     }
     .unwrap_or_else(|| providers[0].clone());
 
+    save_cached(&preferred, &providers);
     Ok((preferred, providers))
+}
+
+// the same display fixes OpenNOW and Kasumi apply: a partner's own name hides where it serves,
+// so "au" read as Australia to players there while it is KDDI in Japan
+fn friendly_name(code: &str, name: String) -> String {
+    match code {
+        "BPC" => "bro.game",
+        "KDD" => "au (KDDI, Japan)",
+        "PNT" => "Cloud.GG (Australia)",
+        "TWM" => "Taiwan Mobile (Taiwan)",
+        "STR" => "StarHub (Singapore)",
+        "GKR" => "GFN Korea",
+        "RAN" => "rain (South Africa)",
+        "DIG" => "Digevo (Latin America)",
+        _ => return name,
+    }
+    .to_owned()
+}
+
+// these values come from the network and end up in a form body and a request URL. same policy as
+// OpenNOW's trusted_cloudmatch_base: https on 443, no credentials, a public host. Kasumi's
+// "*.nvidiagrid.net only" is stricter and would hide a partner hosted elsewhere
+fn is_valid(provider: &GfnProvider) -> bool {
+    let Some(rest) = provider.streaming_service_url.trim().strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let (host, port) = authority.rsplit_once(':').unwrap_or((authority, "443"));
+    let public_host = match host.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => {
+            !(ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified())
+        }
+        Err(_) => host.contains('.') && !host.ends_with(".local") && !host.contains(['[', ']']),
+    };
+    !provider.code.is_empty()
+        && port == "443"
+        && !authority.contains('@')
+        && public_host
+        && !provider.idp_id.is_empty()
+        && provider
+            .idp_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+const CACHE_PATH: &str = "ux0:data/opennow-vita/providers.json";
+
+#[derive(Serialize, Deserialize)]
+struct ProviderCache {
+    recommended: String,
+    providers: Vec<GfnProvider>,
+}
+
+fn save_cached(recommended: &GfnProvider, providers: &[GfnProvider]) {
+    let cache = ProviderCache {
+        recommended: recommended.code.clone(),
+        providers: providers.to_vec(),
+    };
+    if let Ok(json) = serde_json::to_string(&cache) {
+        let _ = std::fs::write(CACHE_PATH, json);
+    }
+}
+
+/// Last provider list fetched, so the login screen has a picker without waiting on the network.
+/// Returns the list and the code NVIDIA recommends for this country.
+pub fn load_cached() -> Option<(Vec<GfnProvider>, String)> {
+    let cache: ProviderCache =
+        serde_json::from_str(&std::fs::read_to_string(CACHE_PATH).ok()?).ok()?;
+    let providers: Vec<_> = cache.providers.into_iter().filter(is_valid).collect();
+    (!providers.is_empty()).then_some((providers, cache.recommended))
 }

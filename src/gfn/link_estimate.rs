@@ -16,6 +16,11 @@ const STORE_DIR: &str = "ux0:data/opennow-vita";
 pub const MIN_CEILING_MBPS: u32 = 5;
 pub const MAX_CEILING_MBPS: u32 = 12;
 pub const DEFAULT_CEILING_MBPS: u32 = 8;
+/// What a *saved* ceiling can fall to. Keyframe requests are the strain signal, but on Wi-Fi they
+/// come every session (a Vita logged ~1 per second), so each session ratcheted the file down to
+/// MIN and it stayed there: 5 Mbps for good. Within one session the ceiling may still dip to MIN
+/// and climb back; only what carries over between sessions is held up.
+const PERSISTED_FLOOR_MBPS: u32 = DEFAULT_CEILING_MBPS;
 
 /// Ignore the opening moments: the stream ramps up, so an early sample understates the link.
 const WARMUP: Duration = Duration::from_secs(5);
@@ -127,7 +132,7 @@ pub fn record(measured_mbps: u32, stressed: bool) {
         // NVIDIA's own bandwidth estimation decide whether to use it.
         previous + previous / 4 + 1
     }
-    .clamp(MIN_CEILING_MBPS, MAX_CEILING_MBPS);
+    .clamp(PERSISTED_FLOOR_MBPS, MAX_CEILING_MBPS);
 
     if std::fs::create_dir_all(STORE_DIR).is_err() {
         return;
@@ -148,7 +153,7 @@ pub fn ceiling_mbps() -> u32 {
     let Some(raw) = stored_ceiling() else {
         return DEFAULT_CEILING_MBPS;
     };
-    let clamped = raw.clamp(MIN_CEILING_MBPS, MAX_CEILING_MBPS);
+    let clamped = raw.clamp(PERSISTED_FLOOR_MBPS, MAX_CEILING_MBPS);
     if clamped != raw {
         let _ = std::fs::create_dir_all(STORE_DIR);
         let _ = std::fs::write(STORE_PATH, clamped.to_string());
@@ -168,7 +173,7 @@ mod tests {
         } else {
             previous + previous / 4 + 1
         }
-        .clamp(MIN_CEILING_MBPS, MAX_CEILING_MBPS)
+        .clamp(PERSISTED_FLOOR_MBPS, MAX_CEILING_MBPS)
     }
 
     /// The regression this replaces: a quiet session used to drag the ceiling down, and repeating
@@ -188,7 +193,7 @@ mod tests {
 
     #[test]
     fn an_unstressed_link_climbs_toward_the_maximum() {
-        let mut ceiling = MIN_CEILING_MBPS;
+        let mut ceiling = PERSISTED_FLOOR_MBPS;
         for _ in 0..40 {
             ceiling = next_ceiling(ceiling, 5, false);
         }
@@ -200,7 +205,7 @@ mod tests {
         let lowered = next_ceiling(20, 8, true);
         assert!(lowered < 20, "a struggling link should give ground");
         assert!(
-            lowered >= MIN_CEILING_MBPS,
+            lowered >= PERSISTED_FLOOR_MBPS,
             "but never below the floor, got {lowered}"
         );
     }
@@ -212,6 +217,6 @@ mod tests {
         for _ in 0..20 {
             ceiling = next_ceiling(ceiling, 1, true);
         }
-        assert_eq!(ceiling, MIN_CEILING_MBPS);
+        assert_eq!(ceiling, PERSISTED_FLOOR_MBPS);
     }
 }

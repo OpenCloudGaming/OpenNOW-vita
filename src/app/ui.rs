@@ -1069,6 +1069,14 @@ fn login_screen(ctx: &egui::Context, i18n: &I18n, app: &App) {
             ui.heading(egui::RichText::new("OpenNOW Vita").size(32.0).strong().color(ACCENT));
             ui.label(i18n.text("login-subtitle").as_ref());
             ui.add_space(24.0);
+            if let Some(provider) = app.login_providers.get(app.login_provider_index) {
+                let mut name = provider.display_name.clone();
+                if provider.code == app.login_recommended {
+                    name = format!("{name} ({})", i18n.text("login-recommended"));
+                }
+                ui.label(text1(i18n, "login-provider", "provider", name).as_ref());
+                ui.add_space(8.0);
+            }
             button_hint(ui, &i18n.text("login-hint"), 13.0, TEXT_DIM, true);
             ui.add_space(24.0);
             if let Some(last_input) = app.last_input {

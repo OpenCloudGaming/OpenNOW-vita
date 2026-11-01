@@ -370,9 +370,6 @@ pub fn munge_answer_sdp(sdp: &str, kbps: u32) -> String {
                     lines.push("a=rtcp-fb:* nack".to_owned());
                     lines.push("a=rtcp-fb:* nack pli".to_owned());
                 }
-                if !sdp.contains("goog-remb") {
-                    lines.push("a=rtcp-fb:* goog-remb".to_owned());
-                }
             } else if current_section == "audio" {
                 lines.push("b=AS:256".to_owned());
             }
@@ -483,7 +480,7 @@ mod tests {
         let munged = munge_answer_sdp(answer, 15000);
         assert!(munged.contains("m=video 9 UDP/TLS/RTP/SAVPF 96\r\nb=AS:15000"));
         assert!(munged.contains("a=rtcp-fb:* nack"));
-        assert!(munged.contains("a=rtcp-fb:* goog-remb"));
+        assert!(!munged.contains("goog-remb"));
         assert!(munged.contains("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\nb=AS:256"));
         assert!(munged.contains("a=fmtp:111 useinbandfec=1;stereo=1;minptime=10"));
     }

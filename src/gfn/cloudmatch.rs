@@ -319,8 +319,12 @@ pub async fn create_session(
         client_id: uuid::Uuid::new_v4().to_string(),
         device_id: super::auth::device_id(),
     };
+    // NVIDIA accounts use the global endpoint like 0.3.1: the url saved at sign-in sent fresh
+    // installs to crowded regional queues (#32). only a partner login the player picked keeps
+    // its own endpoint. a pinned zone still overrides both below
     let provider_url = super::auth::load_tokens()
         .and_then(|t| t.provider)
+        .filter(|p| !p.is_nvidia())
         .map(|p| p.normalized_streaming_url());
     let default_url = provider_url.as_deref().unwrap_or(DEFAULT_CLOUDMATCH_BASE_URL);
     let global_base_url = default_url.trim_end_matches('/');
@@ -447,7 +451,12 @@ pub async fn create_session(
                     // (`REQUEST_LIMIT_EXCEEDED`), and sheds load with 5xx while a zone is busy.
                     // Both clear on their own, so they get honoured with a backoff instead of
                     // failing the launch on the first reply.
-                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                    if matches!(
+                        status,
+                        reqwest::StatusCode::TOO_MANY_REQUESTS
+                            | reqwest::StatusCode::REQUEST_TIMEOUT
+                            | reqwest::StatusCode::TOO_EARLY
+                    ) || status.is_server_error()
                     {
                         throttled += 1;
                         let wait = retry_after(&headers)
@@ -576,7 +585,9 @@ pub async fn poll_session(
             }
         };
 
-        if response.status().is_server_error() {
+        if response.status().is_server_error()
+            || response.status() == reqwest::StatusCode::REQUEST_TIMEOUT
+        {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
             // check for patching before it counts against the 5xx budget, its not really an error
