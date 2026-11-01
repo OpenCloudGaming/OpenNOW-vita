@@ -1,5 +1,7 @@
 # Login / device-code flow
 login-subtitle = Неофициальный клиент GeForce NOW для PS Vita
+login-provider = Войти через: { $provider }  (◄ ► — сменить)
+login-recommended = рекомендуется
 login-hint = Нажмите «Подтвердить» (X), чтобы войти в аккаунт NVIDIA.
 login-last-input = Последний обнаруженный способ ввода: { $input }
 login-requesting-code = Запрос кода доступа от NVIDIA...

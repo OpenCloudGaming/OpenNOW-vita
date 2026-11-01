@@ -77,11 +77,9 @@ struct DeviceAuthorizationResponse {
 }
 
 pub async fn start_device_login(client: &Client) -> Result<DeviceCodeChallenge> {
-    let (provider, _) = match crate::gfn::providers::discover_providers(client).await {
-        Ok((provider, list)) => (provider, list),
-        Err(_) => (crate::gfn::providers::GfnProvider::default(), vec![]),
-    };
-    start_device_login_with_provider(client, provider).await
+    // always the NVIDIA IdP like 0.3.1: the country-preferred partner IdP made NVIDIA accounts
+    // time out, and the extra serviceUrls round trip was one more way for login to fail (#28)
+    start_device_login_with_provider(client, crate::gfn::providers::GfnProvider::default()).await
 }
 
 pub async fn start_device_login_with_idp(client: &Client, idp_id: &str) -> Result<DeviceCodeChallenge> {
@@ -190,7 +188,7 @@ pub async fn poll_device_login(
     client: &Client,
     challenge: &DeviceCodeChallenge,
 ) -> Result<DevicePollOutcome> {
-    let response = client
+    let response = match client
         .post(TOKEN_ENDPOINT)
         .header("Accept", "application/json, text/plain, */*")
         .header("Origin", "https://play.geforcenow.com")
@@ -202,7 +200,14 @@ pub async fn poll_device_login(
         ])
         .send()
         .await
-        .context("device token poll request failed")?;
+    {
+        Ok(response) => response,
+        // a dropped packet or slow reply must not kill a login the user is still scanning
+        Err(error) => {
+            eprintln!("Device token poll failed, will retry: {error}");
+            return Ok(DevicePollOutcome::Pending);
+        }
+    };
 
     if response.status().is_success() {
         let payload: TokenResponse = response
@@ -226,10 +231,17 @@ pub async fn poll_device_login(
         return Ok(DevicePollOutcome::Authorized(tokens));
     }
 
-    let error: TokenErrorResponse = response
-        .json()
-        .await
-        .context("failed to decode device token error response")?;
+    let status = response.status();
+    let error: TokenErrorResponse = match response.json().await {
+        Ok(error) => error,
+        Err(_) if is_temporary_status(Some(status.as_u16())) => {
+            eprintln!("Device token poll got HTTP {status}, will retry");
+            return Ok(DevicePollOutcome::Pending);
+        }
+        Err(error) => {
+            return Err(error).context("failed to decode device token error response");
+        }
+    };
     Ok(match error.error.as_str() {
         "authorization_pending" => DevicePollOutcome::Pending,
         "slow_down" => DevicePollOutcome::SlowDown,
@@ -515,6 +527,7 @@ pub async fn refresh_tokens(
     tokens: &AuthTokens,
     user_id: &str,
 ) -> Result<AuthTokens, RefreshError> {
+    let mut client_failure = None;
     if tokens.client_token.is_some() {
         match refresh_with_client_token(client, tokens, user_id).await {
             Ok(refreshed) => return Ok(refreshed),
@@ -524,8 +537,16 @@ pub async fn refresh_tokens(
             }
             Err(RefreshError::Temporary(error)) => {
                 eprintln!("Client-token refresh failed ({error:#}); trying OAuth refresh");
+                client_failure = Some(error);
             }
         }
+    }
+    // offline with only a client token saved: say "temporary", not "sign in again", or the
+    // caller wipes a perfectly good login (#26)
+    if tokens.refresh_token.is_none()
+        && let Some(error) = client_failure
+    {
+        return Err(RefreshError::Temporary(error));
     }
     refresh_with_refresh_token(client, tokens).await
 }

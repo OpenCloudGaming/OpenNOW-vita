@@ -1428,6 +1428,7 @@ dependencies = [
  "futures-util",
  "h264-reader",
  "image",
+ "libc",
  "qrcode",
  "reqwest",
  "ring",

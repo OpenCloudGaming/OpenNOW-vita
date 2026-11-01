@@ -12,8 +12,15 @@ const MAX_H264_ACCESS_UNIT_BYTES: usize = 2 * 1024 * 1024;
 const VIDEO_RTP_CLOCK_RATE: u32 = 90_000;
 const LOW_FPS_DAMAGE_LIMIT: u8 = 8;
 const HIGH_FPS_DAMAGE_LIMIT: u8 = 3;
-const MIN_REORDER_GRACE_US: u64 = 2_000;
-const MAX_REORDER_GRACE_US: u64 = 12_000;
+// a frame missing a packet waits this long before it is dropped and a keyframe requested. the old
+// 2-12 ms was shorter than the bursts a busy Wi-Fi delivers (lost:0 yet frames "expired"), and every
+// drop cost a PLI plus a keyframe several times a normal frame, which then caused the next drop.
+// the wait is only paid when a packet is actually late
+const MIN_REORDER_GRACE_US: u64 = 4_000;
+const MAX_REORDER_GRACE_US: u64 = 30_000;
+// where the learned cap starts: the old fixed maximum. waiting that long has always been accepted,
+// the cap then moves on evidence (see `learn_from_hold`)
+const GRACE_CAP_START_US: u64 = 12_000;
 
 #[derive(Default)]
 pub struct VideoSampleStats {
@@ -62,9 +69,16 @@ impl JitterEstimator {
         if let (Some(last_arrival), Some(last_rtp)) =
             (self.last_arrival_us, self.last_rtp_timestamp)
         {
+            // jitter is judged per frame, on its first packet: later packets of a frame share the
+            // timestamp and only measure how the burst was spread. a signed difference also
+            // ignores a late packet of an older frame, which as u32 read ~4.3e9 ticks and sent
+            // the estimate (and the reorder grace built on it) to nonsense values
+            let ticks = rtp_timestamp.wrapping_sub(last_rtp) as i32;
+            if ticks <= 0 {
+                return (self.jitter_us / 1000.0) as f32;
+            }
             let arrival_diff_us = arrival_us.saturating_sub(last_arrival) as f64;
-            let rtp_diff_us = (rtp_timestamp.wrapping_sub(last_rtp) as f64 * 1_000_000.0)
-                / f64::from(VIDEO_RTP_CLOCK_RATE);
+            let rtp_diff_us = (f64::from(ticks) * 1_000_000.0) / f64::from(VIDEO_RTP_CLOCK_RATE);
             let transit_diff_us = (arrival_diff_us - rtp_diff_us).abs();
             // RFC 3550 EWMA smoother: J = J + (|D| - J) / 16
             self.jitter_us += (transit_diff_us - self.jitter_us) / 16.0;
@@ -90,6 +104,9 @@ pub struct VideoRtp {
     reorder_hold: Option<PendingVideoFrame>,
     reorder_hold_started_at_us: u64,
     reorder_hold_grace_us: u64,
+    /// Upper bound on the wait, learned: raised when waiting rescued a packet, cut when frames
+    /// expired anyway, so the added latency is only paid on links where waiting actually helps.
+    grace_cap_us: u64,
     reorder_hold_expected_sequence: Option<u16>,
     parked_au: Option<AssembledVideoFrame>,
     assemble_order: Vec<usize>,
@@ -237,6 +254,7 @@ impl VideoRtp {
             decode_height,
             stream_too_large: false,
             waiting_for_keyframe: false,
+            grace_cap_us: GRACE_CAP_START_US,
             jitter_estimator: JitterEstimator::default(),
         }
     }
@@ -247,6 +265,10 @@ impl VideoRtp {
 
     pub fn current_jitter_ms(&self) -> f32 {
         self.jitter_estimator.current_jitter_ms()
+    }
+
+    pub fn grace_cap_ms(&self) -> f32 {
+        self.grace_cap_us as f32 / 1000.0
     }
 
     pub fn reorder_deadline_us(&self) -> Option<u64> {
@@ -326,7 +348,8 @@ impl VideoRtp {
                 return stats;
             }
             if let Some(incomplete) = self.pending.take() {
-                let grace = reorder_grace_us_from_jitter(self.jitter_estimator.current_jitter_ms());
+                let grace = reorder_grace_us_from_jitter(self.jitter_estimator.current_jitter_ms())
+                    .min(self.grace_cap_us);
                 self.reorder_hold_expected_sequence = self.next_sequence;
                 self.reorder_hold_grace_us = grace;
                 self.reorder_hold_started_at_us = arrival_us;
@@ -408,6 +431,18 @@ impl VideoRtp {
         stats
     }
 
+    /// Waiting for a late packet only pays if it then arrives. Rescued: allow a little longer.
+    /// Expired anyway (a real loss): cut sharply, since the wait delayed every newer frame for
+    /// nothing. Multiplicative decrease beats additive increase, so a lossy link settles near the
+    /// 4 ms floor within a handful of drops and costs almost no latency.
+    fn learn_from_hold(&mut self, rescued: bool) {
+        self.grace_cap_us = if rescued {
+            (self.grace_cap_us + 3_000).min(MAX_REORDER_GRACE_US)
+        } else {
+            (self.grace_cap_us * 3 / 4).max(MIN_REORDER_GRACE_US)
+        };
+    }
+
     fn expire_reorder_grace<S: VideoAuSink>(
         &mut self,
         sink: &S,
@@ -424,6 +459,7 @@ impl VideoRtp {
             return;
         };
         stats.reorder_expired = stats.reorder_expired.saturating_add(1);
+        self.learn_from_hold(false);
         stats.dropped = stats.dropped.saturating_add(1);
         *keyframe_requested = true;
         self.record_damage(sink);
@@ -463,6 +499,7 @@ impl VideoRtp {
         self.reorder_hold_expected_sequence = None;
         self.depacketizer = H264Packet::default();
         stats.reorder_rescued = stats.reorder_rescued.saturating_add(1);
+        self.learn_from_hold(true);
         self.process_assembled(
             AssembledVideoFrame {
                 data,
@@ -686,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn reorder_grace_clamps_to_2_12_ms() {
+    fn reorder_grace_clamps_to_min_and_max() {
         assert_eq!(reorder_grace_us_from_jitter(0.0), MIN_REORDER_GRACE_US);
         assert_eq!(reorder_grace_us_from_jitter(0.5), MIN_REORDER_GRACE_US);
         assert_eq!(reorder_grace_us_from_jitter(3.0), 6_000);
@@ -707,6 +744,7 @@ mod tests {
 
         let stats = rtp.receive_into(&sink, pkt(2, 90000, true), &mut pli, 2_000);
         assert_eq!(stats.reorder_rescued, 1);
+        assert!(rtp.grace_cap_us > GRACE_CAP_START_US, "a rescue should allow a longer wait");
         assert!(rtp.reorder_hold.is_none());
         assert_eq!(sink.submitted.borrow().len(), 2);
     }
@@ -724,6 +762,7 @@ mod tests {
         let deadline = rtp.reorder_deadline_us().expect("reorder hold active");
         let stats = rtp.expire_reorder_grace_if_due(&sink, &mut pli, deadline);
         assert_eq!(stats.reorder_expired, 1);
+        assert!(rtp.grace_cap_us < GRACE_CAP_START_US, "an expiry should shorten the wait");
         assert!(rtp.reorder_hold.is_none());
         assert_eq!(sink.submitted.borrow().len(), 1);
         assert!(pli);

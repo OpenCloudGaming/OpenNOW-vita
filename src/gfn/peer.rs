@@ -28,7 +28,7 @@ use rtc::peer_connection::transport::{
 };
 use rtc::rtp_transceiver::RTCRtpReceiverId;
 use rtc::rtp_transceiver::rtp_sender::{
-    RTCPFeedback, RtpCodecKind, TYPE_RTCP_FB_GOOG_REMB, TYPE_RTCP_FB_NACK,
+    RTCPFeedback, RtpCodecKind, TYPE_RTCP_FB_NACK,
 };
 use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
@@ -278,6 +278,23 @@ fn remote_host_ice(ip: &str, port: u16, ufrag: &str) -> RTCIceCandidateInit {
     }
 }
 
+// the default Vita UDP receive buffer is tiny, a burst of video packets between two loop wakeups
+// overflows it and shows up as loss/keyframe requests. best effort, the stream works without it
+fn grow_udp_recv_buffer(socket: &tokio::net::UdpSocket) {
+    use std::os::fd::AsRawFd;
+    const WANTED: libc::c_int = 512 * 1024;
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &WANTED as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    crate::log_info!("UDP SO_RCVBUF {WANTED} -> rc={rc}");
+}
+
 /// Discover the local IP the OS routes toward the server - classic connected-UDP trick.
 fn local_ip_toward(server_ip: &str) -> IpAddr {
     let target = crate::gfn::sdp::extract_public_ip(server_ip)
@@ -373,13 +390,6 @@ async fn run_peer(
         RTCPFeedback {
             typ: TYPE_RTCP_FB_NACK.to_owned(),
             parameter: "pli".to_owned(),
-        },
-        RtpCodecKind::Video,
-    );
-    media_engine.register_feedback(
-        RTCPFeedback {
-            typ: TYPE_RTCP_FB_GOOG_REMB.to_owned(),
-            parameter: "".to_owned(),
         },
         RtpCodecKind::Video,
     );
@@ -487,6 +497,7 @@ async fn run_peer(
     let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
         .await
         .context("failed to bind media UDP socket")?;
+    grow_udp_recv_buffer(&socket);
     let bound_port = socket.local_addr()?.port();
     let local_ip = local_ip_toward(&setup.server_ip);
     let local_addr = SocketAddr::new(local_ip, bound_port);
@@ -910,6 +921,7 @@ async fn run_peer(
                 metrics_last = MetricsSnapshot::capture(&decoder_metrics);
 
                 let jitter_ms = video_rtp.current_jitter_ms();
+                let grace_cap_ms = video_rtp.grace_cap_ms();
                 let report = pc.get_stats(Instant::now(), StatsSelector::None);
                 let inbound = report.inbound_rtp_streams().find(|stream| {
                     video_ssrc
@@ -980,7 +992,7 @@ async fn run_peer(
                 }
 
                 let line = format!(
-                    "fps:{fps:.0} kbps:{kbps:.0} loss:{loss_pct:.1}% rtt:{rtt_label} src:{src_rate:.0} sub:{sub:.0} qf:{qfull:.0} dec:{avg_decode_ms:.1}ms wait:{avg_wait_ms:.1}ms jit:{jitter_ms:.1}ms nof:{noframe:.0} err:{errs:.0} reb:{rebuilds} stall:{stalls:.0} rtp:{rtp_rate:.0} drop:{drop_rate:.0} pli:{pli_sent_count}/{rtc_pli_stat} nack:{rtc_nack}({nack_rate:.0}/s) rtx:{rtc_rtx}({rtx_rate:.0}/s) lost:{rtc_lost}(+{lost_delta}) rescue:{rescue_rate:.0}/s expire:{expire_rate:.0}/s wfk:{} in:{} pr:{}",
+                    "fps:{fps:.0} kbps:{kbps:.0} loss:{loss_pct:.1}% rtt:{rtt_label} src:{src_rate:.0} sub:{sub:.0} qf:{qfull:.0} dec:{avg_decode_ms:.1}ms wait:{avg_wait_ms:.1}ms jit:{jitter_ms:.1}ms gc:{grace_cap_ms:.0}ms nof:{noframe:.0} err:{errs:.0} reb:{rebuilds} stall:{stalls:.0} rtp:{rtp_rate:.0} drop:{drop_rate:.0} pli:{pli_sent_count}/{rtc_pli_stat} nack:{rtc_nack}({nack_rate:.0}/s) rtx:{rtc_rtx}({rtx_rate:.0}/s) lost:{rtc_lost}(+{lost_delta}) rescue:{rescue_rate:.0}/s expire:{expire_rate:.0}/s wfk:{} in:{} pr:{}",
                     u8::from(video_rtp.waiting_for_keyframe()),
                     u8::from(input_ready),
                     u8::from(partial_input_ready)
