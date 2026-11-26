@@ -150,7 +150,25 @@ impl VitaSurface {
         };
         let want_32_bit = crate::gfn::stream_prefs::color_depth()
             == crate::gfn::stream_prefs::ColorDepth::ThirtyTwoBit;
-        let mut textures = if force_iyuv {
+        // NV12 first: the decoder skips RGB conversion and the GPU does colour + scaling
+        // (turbo-green-vita measured this as its biggest decode-throughput win)
+        let nv12 = (!force_iyuv
+            && self.canvas.info().texture_formats.contains(&PixelFormatEnum::NV12))
+        .then(|| create_targets(PixelFormatEnum::NV12))
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("NV12 video textures unavailable ({error:#}); using RGB");
+            None
+        });
+        let mut textures = if let Some(textures) = nv12 {
+            unsafe {
+                sdl2::sys::SDL_SetYUVConversionMode(
+                    sdl2::sys::SDL_YUV_CONVERSION_MODE::SDL_YUV_CONVERSION_BT709,
+                );
+            }
+            format = VideoPixelFormat::Nv12;
+            textures
+        } else if force_iyuv {
             format = VideoPixelFormat::Iyuv;
             create_targets(PixelFormatEnum::IYUV)?
         } else {
@@ -200,11 +218,11 @@ impl VitaSurface {
 
         let mut targets = record_targets(&mut textures)?;
         if !force_iyuv
-            && format == VideoPixelFormat::Iyuv
+            && matches!(format, VideoPixelFormat::Iyuv | VideoPixelFormat::Nv12)
             && targets.iter().any(|target| target.pitch != width)
         {
             eprintln!(
-                "IYUV texture pitch {} != width {width}; using BGR565",
+                "{format:?} texture pitch {} != width {width}; using BGR565",
                 targets[0].pitch
             );
             format = VideoPixelFormat::Bgr565;

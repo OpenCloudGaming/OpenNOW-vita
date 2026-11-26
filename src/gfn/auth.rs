@@ -42,6 +42,7 @@ pub fn client() -> Client {
     Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(USER_AGENT)
+        .dns_resolver(std::sync::Arc::new(crate::gfn::dns::VitaResolver))
         .pool_max_idle_per_host(0)
         .build()
         .unwrap_or_default()

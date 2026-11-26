@@ -72,6 +72,8 @@ pub enum AppCommand {
     /// Emitted by the volume-boost section of the account popup.
     SetAudioBoost(crate::gfn::stream_prefs::AudioBoost),
     SetColorDepth(crate::gfn::stream_prefs::ColorDepth),
+    /// Emitted when a provider row in the login dropdown is tapped.
+    SelectLoginProvider(usize),
     /// Emitted when a row in the catalog list is tapped/clicked.
     SelectGame(usize),
     /// Toggles the streaming toolbar between expanded and collapsed.

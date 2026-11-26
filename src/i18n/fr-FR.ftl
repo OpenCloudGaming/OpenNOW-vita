@@ -1,6 +1,6 @@
 # Login / device-code flow
 login-subtitle = Client non officiel GeForce NOW pour PS Vita
-login-provider = Se connecter avec : { $provider }  (◄ ► pour changer)
+login-provider-label = Se connecter avec
 login-recommended = recommandé
 login-hint = Appuyez sur Confirmer (X) pour vous connecter avec votre compte NVIDIA.
 login-last-input = Dernière entrée détectée : { $input }

@@ -131,7 +131,10 @@ async fn connect_once(host: &str, port: u16) -> Option<u32> {
     let started = Instant::now();
     let stream = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        tokio::net::TcpStream::connect((host, port)),
+        async {
+            let addr = crate::gfn::dns::resolve(host, port).await?;
+            tokio::net::TcpStream::connect(addr).await
+        },
     )
     .await
     .ok()?

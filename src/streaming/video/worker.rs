@@ -56,6 +56,8 @@ pub struct VideoDecodeWorker {
     generation: Arc<AtomicU64>,
     metrics: Arc<VideoMetrics>,
     preferred_fps: u32,
+    /// decode_errors already reported to the RTP side via take_decode_failure.
+    acked_decode_errors: AtomicU64,
 }
 
 impl VideoDecodeWorker {
@@ -85,6 +87,13 @@ impl VideoDecodeWorker {
                     crate::thread_affinity::VitaCore::Media,
                     "video decode",
                 );
+                // decode is the latency-critical producer: outrank the UI thread on its core
+                #[cfg(target_os = "vita")]
+                unsafe {
+                    sdl2::sys::SDL_SetThreadPriority(
+                        sdl2::sys::SDL_ThreadPriority::SDL_THREAD_PRIORITY_HIGH,
+                    );
+                }
                 run_decode_loop(
                     worker_access_units,
                     worker_commands,
@@ -105,6 +114,7 @@ impl VideoDecodeWorker {
             generation,
             metrics,
             preferred_fps,
+            acked_decode_errors: AtomicU64::new(0),
         })
     }
 
@@ -171,6 +181,12 @@ impl VideoDecodeWorker {
 
     pub fn begin_resync(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// True once per batch of new decode errors since the last call.
+    pub fn take_decode_failure(&self) -> bool {
+        let errors = self.metrics.decode_errors.load(Ordering::Relaxed);
+        self.acked_decode_errors.swap(errors, Ordering::Relaxed) != errors
     }
 }
 
@@ -351,7 +367,7 @@ fn drain_picture(
             if output_state.blank_check_active
                 && matches!(
                     pixel_format,
-                    VideoPixelFormat::Bgr565 | VideoPixelFormat::Rgba8888
+                    VideoPixelFormat::Bgr565 | VideoPixelFormat::Rgba8888 | VideoPixelFormat::Nv12
                 )
             {
                 if output_looks_blank(direct_target.target()) {

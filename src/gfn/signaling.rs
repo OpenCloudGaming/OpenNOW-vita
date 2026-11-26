@@ -154,7 +154,23 @@ async fn run(
     mut command_rx: mpsc::UnboundedReceiver<SignalingCommand>,
 ) {
     let uri = request.uri().clone();
-    let (ws_stream, _response) = match tokio_tungstenite::connect_async(request).await {
+    // resolve through the Vita resolver (gfn::dns), then let tungstenite do TLS + handshake
+    let host = uri.host().unwrap_or_default().to_owned();
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("ws") { 80 } else { 443 });
+    let tcp = match crate::gfn::dns::resolve(&host, port).await {
+        Ok(addr) => tokio::net::TcpStream::connect(addr).await,
+        Err(error) => Err(error),
+    };
+    let tcp = match tcp {
+        Ok(tcp) => tcp,
+        Err(error) => {
+            let _ = event_tx.send(SignalingEvent::Disconnected(format!(
+                "signaling connect failed: {error} (url: {uri})"
+            )));
+            return;
+        }
+    };
+    let (ws_stream, _response) = match tokio_tungstenite::client_async_tls(request, tcp).await {
         Ok(pair) => pair,
         Err(error) => {
             let _ = event_tx.send(SignalingEvent::Disconnected(format!(

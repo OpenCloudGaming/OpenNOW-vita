@@ -755,7 +755,7 @@ pub fn build_ui(ctx: &egui::Context, app: &App) -> Vec<AppCommand> {
     let mut commands = Vec::new();
 
     match &app.state {
-        AppState::Login => login_screen(ctx, &i18n, app),
+        AppState::Login => commands.extend(login_screen(ctx, &i18n, app)),
         AppState::StartingDeviceLogin(_) => starting_login_screen(ctx, &i18n),
         AppState::WaitingForDeviceAuthorization { challenge, .. } => {
             device_code_screen(ctx, &i18n, challenge)
@@ -1062,21 +1062,16 @@ fn splash_overlay(ctx: &egui::Context) {
     }
 }
 
-fn login_screen(ctx: &egui::Context, i18n: &I18n, app: &App) {
+fn login_screen(ctx: &egui::Context, i18n: &I18n, app: &App) -> Vec<AppCommand> {
+    let mut commands = Vec::new();
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(80.0);
             ui.heading(egui::RichText::new("OpenNOW Vita").size(32.0).strong().color(ACCENT));
             ui.label(i18n.text("login-subtitle").as_ref());
             ui.add_space(24.0);
-            if let Some(provider) = app.login_providers.get(app.login_provider_index) {
-                let mut name = provider.display_name.clone();
-                if provider.code == app.login_recommended {
-                    name = format!("{name} ({})", i18n.text("login-recommended"));
-                }
-                ui.label(text1(i18n, "login-provider", "provider", name).as_ref());
-                ui.add_space(8.0);
-            }
+            login_provider_dropdown(ui, i18n, app, &mut commands);
+            ui.add_space(8.0);
             button_hint(ui, &i18n.text("login-hint"), 13.0, TEXT_DIM, true);
             ui.add_space(24.0);
             if let Some(last_input) = app.last_input {
@@ -1084,6 +1079,109 @@ fn login_screen(ctx: &egui::Context, i18n: &I18n, app: &App) {
             }
         });
     });
+    commands
+}
+
+/// Gamepad dropdown: closed shows the chosen provider, a direction opens the list, X/O close it.
+fn login_provider_dropdown(
+    ui: &mut egui::Ui,
+    i18n: &I18n,
+    app: &App,
+    commands: &mut Vec<AppCommand>,
+) {
+    let Some(provider) = app.login_providers.get(app.login_provider_index) else {
+        return;
+    };
+    let name_of = |p: &crate::gfn::providers::GfnProvider| {
+        if p.code == app.login_recommended {
+            format!("{} ({})", p.display_name, i18n.text("login-recommended"))
+        } else {
+            p.display_name.clone()
+        }
+    };
+    ui.label(i18n.text("login-provider-label").as_ref());
+    ui.add_space(4.0);
+    let width = 360.0;
+    let row = 32.0;
+    let stroke = egui::Stroke::new(1.5, if app.login_provider_open { ACCENT } else { TEXT_DIM });
+    let (rect, header) = ui.allocate_exact_size(egui::vec2(width, row), egui::Sense::click());
+    if header.clicked() {
+        // reuse the gamepad path: MoveDown opens (and lazily loads), Confirm closes
+        let input = if app.login_provider_open { crate::input::InputCommand::Confirm } else { crate::input::InputCommand::MoveDown };
+        commands.push(AppCommand::Input(input));
+    }
+    let painter = ui.painter();
+    painter.rect(rect, 6.0, BG_RAISED, stroke, egui::StrokeKind::Inside);
+    painter.text(
+        rect.left_center() + egui::vec2(12.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        name_of(provider),
+        egui::FontId::proportional(16.0),
+        ui.visuals().strong_text_color(),
+    );
+    // drawn caret: the bundled fonts have no arrow glyphs (they render as boxes)
+    let c = rect.right_center() - egui::vec2(18.0, 0.0);
+    let (a, b, tip) = if app.login_provider_open {
+        (c + egui::vec2(-6.0, 3.0), c + egui::vec2(6.0, 3.0), c + egui::vec2(0.0, -4.0))
+    } else {
+        (c + egui::vec2(-6.0, -3.0), c + egui::vec2(6.0, -3.0), c + egui::vec2(0.0, 4.0))
+    };
+    painter.add(egui::Shape::convex_polygon(vec![a, b, tip], ACCENT, egui::Stroke::NONE));
+
+    if !app.login_provider_open {
+        return;
+    }
+    // show a window of rows around the selection so long partner lists fit the 544px screen
+    const VISIBLE: usize = 5;
+    let count = app.login_providers.len();
+    let start = app
+        .login_provider_index
+        .saturating_sub(VISIBLE / 2)
+        .min(count.saturating_sub(VISIBLE));
+    let end = (start + VISIBLE).min(count);
+    let (list, response) = ui.allocate_exact_size(
+        egui::vec2(width, row * (end - start) as f32 + 4.0),
+        egui::Sense::click_and_drag(),
+    );
+    if let Some(pos) = response.interact_pointer_pos().filter(|_| response.clicked()) {
+        let slot = ((pos.y - list.min.y - 2.0) / row).floor().max(0.0) as usize;
+        if start + slot < end {
+            commands.push(AppCommand::SelectLoginProvider(start + slot));
+        }
+    }
+    // touch drag or wheel moves the selection one row per `row` px, which scrolls the window
+    if response.hovered() || response.dragged() {
+        let id = egui::Id::new("login_provider_scroll");
+        let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+        let mut acc: f32 = ui.data(|d| d.get_temp(id).unwrap_or(0.0));
+        acc += response.drag_delta().y + wheel;
+        while acc.abs() >= row {
+            // dragging up (negative) reveals rows below, like a native list
+            let input = if acc < 0.0 { crate::input::InputCommand::MoveDown } else { crate::input::InputCommand::MoveUp };
+            commands.push(AppCommand::Input(input));
+            acc -= row * acc.signum();
+        }
+        ui.data_mut(|d| d.insert_temp(id, acc));
+    }
+    let painter = ui.painter();
+    painter.rect(list, 6.0, BG_RAISED, stroke, egui::StrokeKind::Inside);
+    for (slot, index) in (start..end).enumerate() {
+        let r = egui::Rect::from_min_size(
+            list.min + egui::vec2(2.0, 2.0 + row * slot as f32),
+            egui::vec2(width - 4.0, row),
+        );
+        let selected = index == app.login_provider_index;
+        if selected {
+            painter.rect_filled(r, 4.0, ACCENT.gamma_multiply(0.35));
+        }
+        painter.text(
+            r.left_center() + egui::vec2(10.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            name_of(&app.login_providers[index]),
+            egui::FontId::proportional(15.0),
+            if selected { ui.visuals().strong_text_color() } else { TEXT_DIM },
+        );
+    }
 }
 
 fn starting_login_screen(ctx: &egui::Context, i18n: &I18n) {
