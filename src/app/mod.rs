@@ -500,6 +500,8 @@ pub struct App {
     /// Sign-in providers for the login screen; starts as NVIDIA only, the rest is fetched on demand.
     pub(crate) login_providers: Vec<crate::gfn::providers::GfnProvider>,
     pub(crate) login_provider_index: usize,
+    /// provider dropdown on the login screen is expanded
+    pub(crate) login_provider_open: bool,
     /// Provider code NVIDIA recommends for the player's country, marked on the login screen.
     pub(crate) login_recommended: String,
     login_providers_loaded: bool,
@@ -635,6 +637,7 @@ impl App {
             bitrate_ceiling_mbps: 0,
             login_providers: vec![crate::gfn::providers::GfnProvider::default()],
             login_provider_index: 0,
+            login_provider_open: false,
             login_recommended: String::new(),
             login_providers_loaded: false,
             bitrate_keyframes_seen: 0,
@@ -824,6 +827,13 @@ impl App {
                     self.state = current_state;
                     return Box::pin(self.handle_command(cmd)).await;
                 }
+                current_state
+            }
+            AppCommand::SelectLoginProvider(index) => {
+                if index < self.login_providers.len() {
+                    self.login_provider_index = index;
+                }
+                self.login_provider_open = false;
                 current_state
             }
             AppCommand::DismissControlsHint => {
@@ -1741,8 +1751,25 @@ impl App {
                 http_client,
             ));
         }
+        if matches!(current_state, AppState::Login) && self.login_provider_open {
+            let count = self.login_providers.len().max(1);
+            match input {
+                InputCommand::MoveDown | InputCommand::MoveRight => {
+                    self.login_provider_index = (self.login_provider_index + 1) % count;
+                }
+                InputCommand::MoveUp | InputCommand::MoveLeft => {
+                    self.login_provider_index = (self.login_provider_index + count - 1) % count;
+                }
+                InputCommand::Confirm | InputCommand::Back => self.login_provider_open = false,
+                _ => {}
+            }
+            return Ok(AppState::Login);
+        }
         if matches!(current_state, AppState::Login)
-            && matches!(input, InputCommand::MoveLeft | InputCommand::MoveRight)
+            && matches!(
+                input,
+                InputCommand::MoveLeft | InputCommand::MoveRight | InputCommand::MoveDown
+            )
         {
             // the partner list costs a network call, so it is only fetched once the player asks
             if !self.login_providers_loaded {
@@ -1763,12 +1790,7 @@ impl App {
                     self.login_providers = list;
                 }
             }
-            let count = self.login_providers.len();
-            self.login_provider_index = if input == InputCommand::MoveRight {
-                (self.login_provider_index + 1) % count
-            } else {
-                (self.login_provider_index + count - 1) % count
-            };
+            self.login_provider_open = true;
             return Ok(AppState::Login);
         }
         Ok(match (current_state, input) {

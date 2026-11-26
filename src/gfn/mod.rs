@@ -3,6 +3,7 @@ pub mod auth;
 pub mod catalog;
 pub mod cloudmatch;
 pub mod covers;
+pub mod dns;
 pub mod error_codes;
 pub mod favorites;
 pub mod headers;

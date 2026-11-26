@@ -20,6 +20,14 @@ mod vita {
     const CODEC_MEMORY_ALIGNMENT: u32 = 1024 * 1024;
     const CODEC_VADDR_ALIGNMENT: u32 = 256 * 1024;
 
+    // lives in SceVideodecLowDelayUser, not SceVideodecUser; the SDK stub resolves to NULL and
+    // crashes. build.rs assembles vita-stubs/ under a renamed symbol (turbo-green-vita/vita-moonlight)
+    unsafe extern "C" {
+        #[link_name = "sceAvcdecSetLowDelayModeNongameapp_ld"]
+        fn sceAvcdecSetLowDelayModeNongameapp(codec_type: SceVideodecType, mode: i32) -> i32;
+    }
+    const AVCDEC_DELAY_MODE_LOW: i32 = 0;
+
     #[link(name = "SceAvcodec_stub", kind = "static")]
     unsafe extern "C" {
         fn sceVideodecSetConfigInternal(codec_type: SceVideodecType, config: i32) -> i32;
@@ -189,6 +197,13 @@ mod vita {
                 unsafe { sceAvcdecSetDecodeMode(SCE_VIDEODEC_TYPE_HW_AVCDEC, AVCDEC_MODE_EXTENDED) };
             if mode_ret < 0 {
                 bail!("sceAvcdecSetDecodeMode failed: {mode_ret:#x}");
+            }
+            // shrinks the decoder's reorder queue so pictures come out without buffering several AUs
+            let low_delay_ret = unsafe {
+                sceAvcdecSetLowDelayModeNongameapp(SCE_VIDEODEC_TYPE_HW_AVCDEC, AVCDEC_DELAY_MODE_LOW)
+            };
+            if low_delay_ret < 0 {
+                eprintln!("sceAvcdecSetLowDelayModeNongameapp failed: {low_delay_ret:#x}; continuing");
             }
 
             let mut codec_size = 0;
@@ -469,6 +484,11 @@ mod vita {
                     direct_target.pitch,
                     self.width.saturating_mul(self.height) * 3 / 2,
                 ),
+                VideoPixelFormat::Nv12 => (
+                    SCE_AVCDEC_PIXELFORMAT_YUV420_PACKED_RASTER as u32,
+                    direct_target.pitch,
+                    self.width.saturating_mul(self.height) * 3 / 2,
+                ),
                 VideoPixelFormat::Rgba8888 => (
                     SCE_AVCDEC_PIXELFORMAT_RGBA8888 as u32,
                     direct_target.pitch / 4,
@@ -520,7 +540,7 @@ mod vita {
                         VideoPixelFormat::Bgr565 | VideoPixelFormat::Rgba8888 => {
                             [output_ptr.cast(), std::ptr::null_mut()]
                         }
-                        VideoPixelFormat::Iyuv => [output_ptr.cast(), unsafe {
+                        VideoPixelFormat::Iyuv | VideoPixelFormat::Nv12 => [output_ptr.cast(), unsafe {
                             output_ptr.add((self.width * self.height) as usize).cast()
                         }],
                     },

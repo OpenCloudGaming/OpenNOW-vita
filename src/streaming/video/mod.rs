@@ -29,6 +29,7 @@ pub enum VideoPixelFormat {
     Bgr565,
     Iyuv,
     Rgba8888,
+    Nv12,
 }
 
 const MAX_PENDING_TEXTURE_WAIT: Duration = Duration::from_millis(34);
@@ -123,6 +124,7 @@ impl DirectVideoOutput {
             VideoPixelFormat::Bgr565 => 1,
             VideoPixelFormat::Iyuv => 2,
             VideoPixelFormat::Rgba8888 => 3,
+            VideoPixelFormat::Nv12 => 4,
         };
         self.pixel_format.store(value, Ordering::Release);
     }
@@ -132,6 +134,7 @@ impl DirectVideoOutput {
             1 => Some(VideoPixelFormat::Bgr565),
             2 => Some(VideoPixelFormat::Iyuv),
             3 => Some(VideoPixelFormat::Rgba8888),
+            4 => Some(VideoPixelFormat::Nv12),
             _ => None,
         }
     }

@@ -1,6 +1,6 @@
 # Login / device-code flow
 login-subtitle = Unofficial GeForce NOW client for PS Vita
-login-provider = Sign in with: { $provider }  (◄ ► to change)
+login-provider-label = Sign in with
 login-recommended = recommended
 login-hint = Press Confirm (X) to sign in with your NVIDIA account.
 login-last-input = Last input detected: { $input }

@@ -580,8 +580,20 @@ pub async fn poll_session(
         {
             Ok(response) => response,
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("CloudMatch poll attempt {attempt} failed"));
+                // a flaky Vita wifi hop or slow server shouldn't kill a launch that's queued
+                // for minutes; retry transient transport errors on the same budget as 5xx
+                consecutive_server_errors += 1;
+                if consecutive_server_errors > MAX_CONSECUTIVE_SERVER_ERRORS
+                    || !(error.is_timeout() || error.is_connect() || error.is_request())
+                {
+                    return Err(error)
+                        .with_context(|| format!("CloudMatch poll attempt {attempt} failed"));
+                }
+                let backoff = POLL_INTERVAL
+                    .saturating_mul(1 << (consecutive_server_errors - 1).min(3) as u32)
+                    .min(SERVER_ERROR_BACKOFF_CAP);
+                sleep(backoff).await;
+                continue;
             }
         };
 

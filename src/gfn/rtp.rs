@@ -35,6 +35,9 @@ pub struct VideoSampleStats {
 pub(crate) trait VideoAuSink {
     fn submit_access_unit(&self, data: Vec<u8>, source_frame_duration_us: Option<u64>) -> bool;
     fn begin_resync(&self);
+    fn take_decode_failure(&self) -> bool {
+        false
+    }
 }
 
 impl VideoAuSink for VideoDecodeWorker {
@@ -44,6 +47,10 @@ impl VideoAuSink for VideoDecodeWorker {
 
     fn begin_resync(&self) {
         VideoDecodeWorker::begin_resync(self);
+    }
+
+    fn take_decode_failure(&self) -> bool {
+        VideoDecodeWorker::take_decode_failure(self)
     }
 }
 
@@ -569,6 +576,11 @@ impl VideoRtp {
             }
             self.stream_too_large = false;
         }
+        // the hw decoder rebuilt after an error: P-frames would decode against nothing (Kasumi does the same)
+        if sink.take_decode_failure() && !self.waiting_for_keyframe {
+            sink.begin_resync();
+            self.waiting_for_keyframe = true;
+        }
         if self.waiting_for_keyframe {
             if !unit.has_idr {
                 *keyframe_requested = true;
@@ -668,6 +680,7 @@ mod tests {
         submitted: RefCell<Vec<Vec<u8>>>,
         resyncs: AtomicU64,
         accept: RefCell<bool>,
+        decode_failed: RefCell<bool>,
     }
 
     impl FakeSink {
@@ -676,6 +689,7 @@ mod tests {
                 submitted: RefCell::new(Vec::new()),
                 resyncs: AtomicU64::new(0),
                 accept: RefCell::new(true),
+                decode_failed: RefCell::new(false),
             }
         }
     }
@@ -695,6 +709,10 @@ mod tests {
 
         fn begin_resync(&self) {
             self.resyncs.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn take_decode_failure(&self) -> bool {
+            self.decode_failed.replace(false)
         }
     }
 
@@ -804,5 +822,18 @@ mod tests {
         let stats = rtp.receive_into(&sink, pkt(1, 90000, true), &mut pli, 1_000);
         assert_eq!(stats.dropped, 1);
         assert!(!pli);
+    }
+
+    #[test]
+    fn decode_failure_drops_p_frames_until_idr() {
+        let sink = FakeSink::new();
+        *sink.decode_failed.borrow_mut() = true;
+        let mut rtp = VideoRtp::new(960, 544);
+        let mut pli = false;
+        rtp.receive_into(&sink, pkt(1, 90000, true), &mut pli, 1_000);
+        assert!(pli);
+        assert!(rtp.waiting_for_keyframe());
+        assert_eq!(sink.submitted.borrow().len(), 0);
+        assert_eq!(sink.resyncs.load(Ordering::Relaxed), 1);
     }
 }

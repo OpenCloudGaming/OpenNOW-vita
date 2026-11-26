@@ -45,10 +45,13 @@ use crate::log_stream;
 
 const NATIVE_OUTPUT_WIDTH: u32 = 960;
 const NATIVE_OUTPUT_HEIGHT: u32 = 544;
+const MAX_OUTPUT_WIDTH: u32 = 1280;
+const MAX_OUTPUT_HEIGHT: u32 = 720;
 const DEFAULT_STREAM_WIDTH: u32 = NATIVE_OUTPUT_WIDTH;
 const DEFAULT_STREAM_HEIGHT: u32 = NATIVE_OUTPUT_HEIGHT;
 
-const PLI_MIN_INTERVAL: Duration = Duration::from_millis(250);
+// 250ms made keyframe requests pile up on a lossy vita link (#35); 500ms matches OpenNOW desktop
+const PLI_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const QUEUE_FULL_RECOVERY_THRESHOLD: f32 = 5.0;
 const VIDEO_STALL_PLI: Duration = Duration::from_secs(4);
 const VIDEO_STALL_FAIL: Duration = Duration::from_secs(8);
@@ -114,9 +117,11 @@ impl PeerEngine {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let is_connected = Arc::new(AtomicBool::new(false));
         let (stream_width, stream_height) = stream_dimensions(session);
+        // decode at the stream's own size and let the GPU scale to the screen; the decoder's
+        // 720p->544p downscale was the slow part (turbo-green-vita). 720p is the decoder's ceiling.
         let video_output = Arc::new(DirectVideoOutput::new(
-            NATIVE_OUTPUT_WIDTH,
-            NATIVE_OUTPUT_HEIGHT,
+            stream_width.min(MAX_OUTPUT_WIDTH),
+            stream_height.min(MAX_OUTPUT_HEIGHT),
         ));
         let latest_frame: Arc<Mutex<Option<(u64, DecodedFrame)>>> = Arc::new(Mutex::new(None));
         let media_bytes = Arc::new(AtomicU64::new(0));
